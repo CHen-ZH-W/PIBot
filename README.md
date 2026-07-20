@@ -3,7 +3,8 @@
 pibot is a local-first coding-agent runtime for real repository work. It brings
 an OpenAI-compatible model client together with workspace tools, persistent
 memory, reusable Skills, Plan/Coordinator/Reflection workflows, Slack and WebUI
-entry points, and Linux-native or Docker command sandboxes.
+entry points, a WebUI self-evolution control plane, and Linux-native or Docker
+command sandboxes.
 
 The fastest local entry point is the WebUI:
 
@@ -13,17 +14,27 @@ npm run webui
 
 Open `http://127.0.0.1:8787`.
 
+## Screenshots
+
+![pibot WebUI chat workbench](docs/images/webui-chat.png)
+
+![pibot self-evolution control plane](docs/images/webui-self-evolution.png)
+
 ## What Works
 
 - **WebUI workbench**: streamed conversations, file uploads, session storage,
-  self-evolution tickets, runtime activation, and per-session repo binding.
+  Skills browsing, run-mode controls, and per-session repo binding.
+- **Self-evolution control plane**: WebUI-created tickets, isolated ticket
+  context, proposal editing, approval/rejection, implementation runs,
+  self-instruction and runtime-code versions, runtime activation, and audit
+  history.
 - **Slack agent**: app mentions and DMs, in-flight steering, queued follow-ups,
   Slack approvals, attachment download/upload, and long-task status updates.
-- **Coding tools**: read, grep, TypeScript LSP lookup, bash, edit/write, repo
+- **Coding tools**: read, grep, LSP, bash, edit/write, repo
   checks, and generated file attachment.
-- **Controlled memory**: global Codex-like memory summaries, detailed topics,
+- **Controlled memory**: global memory summaries, detailed topics,
   rollout summaries, extension notes, and append-only audit logs.
-- **Skills**: OpenAI-aligned workspace Skills plus pibot-wide Skills loaded only
+- **Skills**: workspace Skills plus pibot-wide Skills loaded only
   when the current task matches them.
 - **Agent workflows**: Execute, Plan, Coordinator, optional Reflection, and
   tmux-backed child agents with isolated run artifacts.
