@@ -1,0 +1,11 @@
+services:
+  pibot-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox
+    container_name: pibot-sandbox
+    command: ["sleep", "infinity"]
+    init: true
+    tty: true
+    volumes:
+      - .:/workspace

@@ -1,0 +1,9 @@
+.pibot/
+.pibot-evolution-workspaces/
+dist/
+node_modules/
+native/bin/
+.env
+.env.*
+!.env.example
+docs/roadmap.md

@@ -1,0 +1,34 @@
+{
+  "type": "commonjs",
+  "scripts": {
+    "build:native": "node scripts/build-linux-sandbox.js",
+    "build": "tsc && npm run build:native",
+    "typecheck": "tsc --noEmit",
+    "migrate:evolution-contexts": "node scripts/migrate-evolution-contexts.js",
+    "test:production": "node scripts/test-production.js",
+    "test:acceptance": "node scripts/accept-agent-loop.js && node scripts/accept-tools-agent.js && node scripts/accept-repo-workflow.js && node scripts/accept-memory.js && node scripts/accept-compaction.js && node scripts/accept-skills.js && node scripts/accept-runtime.js && node scripts/accept-workflows.js && node scripts/accept-experience.js && node scripts/accept-multi-agent.js && node scripts/accept-sandbox.js",
+    "accept:agent-loop": "npm run build && node scripts/accept-agent-loop.js",
+    "accept:tools-agent": "npm run build && node scripts/accept-tools-agent.js",
+    "accept:repo-workflow": "npm run build && node scripts/accept-repo-workflow.js",
+    "accept:compaction": "npm run build && node scripts/accept-compaction.js",
+    "accept:memory": "npm run build && node scripts/accept-memory.js",
+    "accept:skills": "npm run build && node scripts/accept-skills.js",
+    "accept:workflows": "npm run build && node scripts/accept-workflows.js",
+    "accept:experience": "npm run build && node scripts/accept-experience.js",
+    "accept:multi-agent": "npm run build && node scripts/accept-multi-agent.js",
+    "accept:sandbox": "npm run build && node scripts/accept-sandbox.js",
+    "validate:skills": "npm run build && node scripts/validate-skills.js",
+    "test": "npm run build && npm run test:production && npm run test:acceptance",
+    "prestart": "npm run build",
+    "start": "node dist/main.js",
+    "webui": "node scripts/run-webui.js"
+  },
+  "dependencies": {
+    "@slack/socket-mode": "^2.0.4",
+    "@slack/web-api": "^7.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "typescript": "^5.8.3"
+  }
+}

@@ -1,0 +1,2598 @@
+import { randomUUID } from "node:crypto";
+import * as path from "node:path";
+import { MinimalAgentLoop } from "../agent/agent-loop";
+import { RetryingModelClient } from "../agent/model";
+import {
+  buildCodingAgentSystemPrompt,
+  formatChannelWorkspacePrompt,
+} from "../agent/system-prompt";
+import type { AgentLoopEvent } from "../agent/events";
+import type { LlmMessage, LlmToolSchema } from "../core/agent";
+import type { ChannelSessionKey } from "../core/session";
+import type {
+  ToolApprovalDecision,
+  ToolApprovalPromptRequest,
+  ToolCall,
+  ToolResult,
+} from "../core/tools";
+import type {
+  AgentId,
+  AgentRunId,
+  SlackChannelId,
+  SlackTeamId,
+  SlackUserId,
+  ToolCallId,
+} from "../core/ids";
+import {
+  createAgentRunContext,
+  type AgentRunContext,
+} from "../runtime/context";
+import type { RuntimeHook } from "../runtime/hooks";
+import {
+  addSteeringMessage,
+  configureAgentRuntimeState,
+  createToolPlanApprovalRequester,
+  RuntimeModeHook,
+} from "../runtime/mode";
+import { ChildAgentRuntime } from "../runtime/child-agents";
+import { FileChildAgentApprovalResponder } from "../runtime/child-agent-approvals";
+import type { ChildAgentSupervisor } from "../runtime/tmux-agents";
+import {
+  applyModeSwitch,
+  isAgentStopCommand,
+  parseFollowUpMessage,
+  parseModeSwitchMessage,
+  parseSteeringMessage,
+  renderInlineSteering,
+  renderModeSwitchSteering,
+} from "../runtime/run-control";
+import { scanWorkspaceSkills } from "../workspace/skills";
+import type { ChannelWorkspaceStore } from "../workspace/store";
+import { FileTaskStore } from "../workspace/tasks";
+import {
+  formatRepoRunPrompt,
+  type ChannelRepoWorkflow,
+  type RepoRunStartSnapshot,
+} from "../workspace/repo";
+import {
+  createCodingToolExecutor,
+  type CodingToolExecutorOptions,
+  type ToolApprovalMode,
+} from "../tools";
+import { createToolApprovalGate } from "../tools/approval";
+import type { SandboxExecutor } from "../workspace/sandbox";
+import type {
+  ChannelContextMessage,
+  WorkspaceSessionStore,
+} from "../workspace/session";
+import type { ChildAgentRunStore } from "../workspace/child-agents";
+import type { EvolutionController } from "../evolution/controller";
+import {
+  evolutionContextTopic,
+  evolutionTicketChannelKey,
+} from "../evolution/channel-context";
+import {
+  createRuntimeCodeStagingWorkspace,
+  publishRuntimeCodeWorkspace,
+  validateRuntimeCodeWorkspace,
+  type RuntimeCodePublishReport,
+  type RuntimeCodeValidationReport,
+} from "../evolution/runtime-code";
+import {
+  createSelfInstructionsStagingWorkspace,
+  readStagedSelfInstructions,
+  selfInstructionsFileName,
+  validateStagedSelfInstructions,
+  type SelfInstructionsStagingWorkspace,
+  type SelfInstructionsValidationReport,
+} from "../evolution/self-instructions";
+import {
+  EVOLUTION_CHANNEL_NAME,
+  type EvolutionScope,
+  type EvolutionSeverity,
+  type EvolutionTarget,
+  type EvolutionTicket,
+  type RuntimeCodeVersion,
+} from "../evolution/types";
+import type {
+  FileWebConversationStore,
+  WebConversation,
+  WebConversationMessage,
+} from "./conversations";
+
+export interface WebAgentRunnerOptions {
+  readonly conversations: FileWebConversationStore;
+  readonly workspaceRoot: string;
+  readonly store: ChannelWorkspaceStore;
+  readonly sessions: WorkspaceSessionStore;
+  readonly repoWorkflow?: ChannelRepoWorkflow;
+  readonly model: RetryingModelClient;
+  readonly tools: readonly LlmToolSchema[];
+  readonly sandboxExecutor: SandboxExecutor;
+  readonly toolApprovalMode: ToolApprovalMode;
+  readonly toolLimits: Required<Pick<
+    CodingToolExecutorOptions,
+    | "maxReadChars"
+    | "maxFileBytes"
+    | "maxCommandOutputChars"
+    | "maxGrepMatches"
+    | "maxGrepOutputChars"
+    | "defaultShellTimeoutMs"
+    | "maxShellTimeoutMs"
+  >>;
+  readonly evolution: EvolutionController;
+  readonly modelName?: string;
+  readonly temperature?: number;
+  readonly maxOutputTokens?: number;
+  readonly maxTurns: number;
+  readonly disabledSkills?: readonly string[];
+  readonly maxSkills?: number;
+  readonly maxSkillFileBytes?: number;
+  readonly pibotSkillsRoot?: string;
+  readonly thinkingLanguage?: string;
+  readonly maxFollowUpQueueSize?: number;
+  readonly approvalTimeoutMs?: number;
+  readonly memoryKey?: {
+    readonly teamId: SlackTeamId;
+    readonly channelId: SlackChannelId;
+  };
+  readonly childAgents?: WebChildAgentOptions;
+}
+
+export interface WebChildAgentOptions {
+  readonly store: ChildAgentRunStore;
+  readonly supervisor: ChildAgentSupervisor;
+  readonly maxConcurrent?: number;
+  readonly defaultTimeoutMs?: number;
+  readonly maxTimeoutMs?: number;
+  readonly defaultMaxToolCalls?: number;
+  readonly defaultMaxTokens?: number;
+  readonly approvalRootDir?: string;
+  readonly approvalPollIntervalMs?: number;
+  readonly onApprovalError?: (error: unknown) => void;
+}
+
+export interface WebAgentTurnResult {
+  readonly conversationId: string;
+  readonly runId: AgentRunId;
+  readonly reason: string;
+  readonly errorCode?: string;
+  readonly evolutionTicketId?: string;
+}
+
+export type WebAgentStreamLoopEvent =
+  | {
+      readonly type: "agent_start";
+      readonly maxTurns: number;
+    }
+  | {
+      readonly type: "turn_start";
+      readonly turn: number;
+    }
+  | {
+      readonly type: "message_delta";
+      readonly turn: number;
+      readonly text: string;
+    }
+  | {
+      readonly type: "reasoning_delta";
+      readonly turn: number;
+      readonly text: string;
+    }
+  | {
+      readonly type: "message_completed";
+      readonly turn: number;
+      readonly role: LlmMessage["role"];
+    }
+  | {
+      readonly type: "tool_start";
+      readonly turn: number;
+      readonly call: {
+        readonly id: string;
+        readonly name: string;
+        readonly summary: string;
+      };
+    }
+  | {
+      readonly type: "tool_end";
+      readonly turn: number;
+      readonly call: {
+        readonly id: string;
+        readonly name: string;
+      };
+      readonly result: {
+        readonly ok: boolean;
+        readonly summary: string;
+        readonly error?: {
+          readonly code: string;
+          readonly message: string;
+        };
+      };
+    }
+  | {
+      readonly type: "turn_end";
+      readonly turn: number;
+      readonly reason: string;
+    }
+  | {
+      readonly type: "agent_end";
+      readonly reason: string;
+      readonly error?: {
+        readonly code: string;
+        readonly message: string;
+      };
+    };
+
+export type WebAgentRunnerEvent =
+  | {
+      readonly type: "run_start";
+      readonly conversationId: string;
+      readonly runId: AgentRunId;
+    }
+  | {
+      readonly type: "conversation";
+      readonly conversation: WebConversation;
+    }
+  | {
+      readonly type: "agent_event";
+      readonly conversationId: string;
+      readonly runId: AgentRunId;
+      readonly event: WebAgentStreamLoopEvent;
+    }
+  | {
+      readonly type: "status";
+      readonly conversationId: string;
+      readonly runId?: AgentRunId;
+      readonly message: string;
+    }
+  | {
+      readonly type: "approval_requested";
+      readonly conversationId: string;
+      readonly runId: AgentRunId;
+      readonly approval: WebApprovalView;
+    }
+  | {
+      readonly type: "approval_resolved";
+      readonly conversationId: string;
+      readonly runId: AgentRunId;
+      readonly approval: WebApprovalView;
+    };
+
+export interface WebAgentRunOptions {
+  readonly signal?: AbortSignal;
+  readonly onEvent?: (event: WebAgentRunnerEvent) => void | Promise<void>;
+}
+
+interface QueuedWebFollowUp {
+  readonly text: string;
+}
+
+export interface WebApprovalView {
+  readonly id: string;
+  readonly conversationId: string;
+  readonly runId: AgentRunId;
+  readonly toolName: string;
+  readonly risk: string;
+  readonly title: string;
+  readonly summary: string;
+  readonly details: readonly string[];
+  readonly status: "pending" | "approved" | "rejected" | "cancelled" | "expired";
+  readonly expiresAt: string;
+  readonly resolvedMessage?: string;
+}
+
+type ActiveWebRun = ActiveWebConversationRun | ActiveWebEvolutionRun;
+
+interface ActiveWebConversationRun {
+  readonly kind: "conversation";
+  readonly conversationId: string;
+  readonly controller: AbortController;
+  readonly followUps: QueuedWebFollowUp[];
+  readonly onEvent?: (event: WebAgentRunnerEvent) => void | Promise<void>;
+  controlMessageReady: Promise<void>;
+  resolveControlMessageReady: () => void;
+  runContext: AgentRunContext;
+  cancelled: boolean;
+}
+
+interface ActiveWebEvolutionRun {
+  readonly kind: "evolution";
+  readonly runId: AgentRunId;
+}
+
+interface PendingWebApproval {
+  readonly request: ToolApprovalPromptRequest;
+  readonly conversationId: string;
+  readonly runId: AgentRunId;
+  readonly expiresAt: string;
+  readonly resolve: (decision: ToolApprovalDecision) => void;
+  readonly timeout: ReturnType<typeof setTimeout>;
+  readonly abort: () => void;
+  readonly onEvent?: (event: WebAgentRunnerEvent) => void | Promise<void>;
+  readonly signal?: AbortSignal;
+  settled: boolean;
+}
+
+export class WebAgentRunner {
+  private readonly activeByConversation = new Map<string, ActiveWebRun>();
+  private readonly pendingApprovals = new Map<string, PendingWebApproval>();
+  private readonly migratedContextByConversation = new Set<string>();
+  private readonly maxFollowUpQueueSize: number;
+  private readonly approvalTimeoutMs: number;
+  private readonly childApprovalResponder: FileChildAgentApprovalResponder | undefined;
+
+  constructor(private readonly options: WebAgentRunnerOptions) {
+    this.maxFollowUpQueueSize = options.maxFollowUpQueueSize ?? 5;
+    this.approvalTimeoutMs = options.approvalTimeoutMs ?? 300000;
+    const childApprovalRootDir = options.childAgents?.approvalRootDir;
+    if (childApprovalRootDir !== undefined) {
+      this.childApprovalResponder = new FileChildAgentApprovalResponder({
+        rootDir: childApprovalRootDir,
+        prompter: {
+          requestToolApproval: (request, signal) =>
+            this.requestChildToolApproval(request, signal),
+        },
+        pollIntervalMs: options.childAgents?.approvalPollIntervalMs ?? 1000,
+        shouldHandleRequest: (request) =>
+          this.activeConversationForApproval(request.context.conversation) !==
+          undefined,
+        ...(options.childAgents?.onApprovalError === undefined
+          ? {}
+          : { onError: options.childAgents.onApprovalError }),
+      });
+      this.childApprovalResponder.start();
+    }
+  }
+
+  async listConversations(): Promise<readonly WebConversation[]> {
+    const conversations = await this.options.conversations.list();
+    return Promise.all(
+      conversations.map((conversation) =>
+        this.conversationWithChannelContext(conversation)),
+    );
+  }
+
+  async getConversation(conversationId: string): Promise<WebConversation> {
+    return this.conversationWithChannelContext(
+      await this.options.conversations.get(conversationId),
+    );
+  }
+
+  async decideApproval(
+    approvalId: string,
+    approved: boolean,
+  ): Promise<{ readonly ok: true; readonly approval: WebApprovalView } | {
+    readonly ok: false;
+    readonly error: string;
+  }> {
+    const pending = this.pendingApprovals.get(approvalId);
+    if (pending === undefined || pending.settled) {
+      return {
+        ok: false,
+        error: "Unknown or completed approval request",
+      };
+    }
+
+    const decision = approved
+      ? { approved: true as const }
+      : deniedApproval("Tool call was rejected in WebUI");
+    const status = approved ? "approved" : "rejected";
+    const resolvedMessage = approvalDecisionStatus(pending.request, approved);
+    const approval = await this.finishApproval(
+      approvalId,
+      decision,
+      status,
+      resolvedMessage,
+    );
+    return {
+      ok: true,
+      approval,
+    };
+  }
+
+  async runUserMessage(
+    conversationId: string,
+    text: string,
+    runOptions: WebAgentRunOptions = {},
+  ): Promise<WebAgentTurnResult> {
+    const existing = this.activeByConversation.get(conversationId);
+    if (existing !== undefined) {
+      if (existing.kind !== "conversation") {
+        throw new Error(`Conversation ${conversationId} already has an active run`);
+      }
+      return this.handleActiveConversationInput(existing, text);
+    }
+
+    const key = this.memoryKeyFor(conversationId);
+    const runtimeState = await this.options.sessions.readRuntimeState(key);
+    const active: ActiveWebConversationRun = {
+      kind: "conversation",
+      conversationId,
+      controller: new AbortController(),
+      followUps: [],
+      ...(runOptions.onEvent === undefined
+        ? {}
+        : { onEvent: runOptions.onEvent }),
+      controlMessageReady: Promise.resolve(),
+      resolveControlMessageReady: () => {},
+      runContext: createAgentRunContext({
+        agentId: "webui" as AgentId,
+        state: runtimeState,
+      }),
+      cancelled: false,
+    };
+    this.activeByConversation.set(conversationId, active);
+
+    const abortExternal = () => {
+      active.cancelled = true;
+      active.controller.abort();
+    };
+    runOptions.signal?.addEventListener("abort", abortExternal, { once: true });
+
+    let nextText: string | undefined = text;
+    let result: WebAgentTurnResult | undefined;
+    let firstTurn = true;
+
+    try {
+      while (nextText !== undefined) {
+        resetActiveControlMessageBoundary(active);
+        if (!firstTurn) {
+          active.runContext = createAgentRunContext({
+            agentId: "webui" as AgentId,
+            state: active.runContext.state,
+          });
+        }
+        firstTurn = false;
+        result = await this.runConversationTurn(conversationId, nextText, active);
+        if (active.cancelled) {
+          break;
+        }
+        const followUp = active.followUps.shift();
+        nextText = followUp?.text;
+        if (nextText !== undefined) {
+          await emitWebEvent(active.onEvent, {
+            type: "status",
+            conversationId,
+            runId: active.runContext.runId,
+            message: "Starting queued follow-up...",
+          });
+        }
+      }
+
+      return result ?? {
+        conversationId,
+        runId: active.runContext.runId,
+        reason: active.cancelled ? "aborted" : "completed",
+      };
+    } finally {
+      resolveActiveControlMessageBoundary(active);
+      runOptions.signal?.removeEventListener("abort", abortExternal);
+      this.activeByConversation.delete(conversationId);
+    }
+  }
+
+  private async runConversationTurn(
+    conversationId: string,
+    text: string,
+    active: ActiveWebConversationRun,
+  ): Promise<WebAgentTurnResult> {
+    const runContext = active.runContext;
+    const key = this.memoryKeyFor(conversationId);
+    let reason = "unknown";
+    let errorCode: string | undefined;
+    const startedAtMs = Date.now();
+
+    await this.ensureConversationContextMigrated(conversationId);
+    const selfEvolutionRequest = detectWebUiSelfEvolutionRequest(text);
+    let prepared = await this.options.sessions.prepareChannelRun(key, {
+      signal: active.controller.signal,
+    });
+    const repoStart = await this.prepareRepoWorkflow(
+      key,
+      active.controller.signal,
+    );
+    const runWorkspaceRoot = await this.resolveRunWorkspaceRoot(key, repoStart);
+    const runToolSchemas =
+      selfEvolutionRequest === undefined
+        ? this.options.tools
+        : selfEvolutionToolSchemas(this.options.tools);
+    await emitWebEvent(active.onEvent, {
+      type: "run_start",
+      conversationId,
+      runId: runContext.runId,
+    });
+    await this.options.sessions.appendContextMessage(key, {
+      message: {
+        role: "user",
+        content: text,
+      },
+      source: "webui",
+    });
+    await emitWebEvent(active.onEvent, {
+      type: "conversation",
+      conversation: await this.getConversation(conversationId),
+    });
+    resolveActiveControlMessageBoundary(active);
+    if (selfEvolutionRequest !== undefined) {
+      await emitWebEvent(active.onEvent, {
+        type: "status",
+        conversationId,
+        runId: runContext.runId,
+        message: "Asking the model to classify the self-evolution ticket...",
+      });
+    }
+
+      const workspaceSkills = await scanWorkspaceSkills(runWorkspaceRoot, {
+        ...(this.options.pibotSkillsRoot === undefined
+          ? {}
+          : { pibotSkillsRoot: this.options.pibotSkillsRoot }),
+        ...(this.options.disabledSkills === undefined
+          ? {}
+          : { disabledSkills: this.options.disabledSkills }),
+        ...(this.options.maxSkills === undefined
+          ? {}
+          : { maxSkills: this.options.maxSkills }),
+        ...(this.options.maxSkillFileBytes === undefined
+          ? {}
+          : { maxSkillFileBytes: this.options.maxSkillFileBytes }),
+      });
+      const selfInstructions =
+        await this.options.evolution.readCurrentSelfInstructions();
+      const taskStore = new FileTaskStore({
+        workspaceRoot: runWorkspaceRoot,
+      });
+      const approvalContext = {
+        conversation: this.memoryKeyFor(conversationId),
+        requestedByUserId: "webui" as SlackUserId,
+      };
+      const approvalPrompter = {
+        requestToolApproval: (
+          request: ToolApprovalPromptRequest,
+          signal?: AbortSignal,
+        ) => this.requestActiveApproval(active, request, signal),
+      };
+      configureAgentRuntimeState(runContext.state, {
+        taskStore,
+        planApproval: createToolPlanApprovalRequester({
+          prompter: approvalPrompter,
+          context: approvalContext,
+          timeoutMs: this.approvalTimeoutMs,
+        }),
+      });
+      const childAgents = this.createChildAgentRuntime({
+        key,
+        runContext,
+        workspaceRoot: runWorkspaceRoot,
+        approvalContext,
+      });
+      const runTools = createCodingToolExecutor({
+        workspaceRoot: runWorkspaceRoot,
+        ...(this.options.pibotSkillsRoot === undefined
+          ? {}
+          : { pibotSkillsRoot: this.options.pibotSkillsRoot }),
+        skills: workspaceSkills.skills,
+        sandboxExecutor: this.options.sandboxExecutor,
+        approvalGate: createToolApprovalGate(this.options.toolApprovalMode, {
+          prompter: approvalPrompter,
+          context: approvalContext,
+          timeoutMs: this.approvalTimeoutMs,
+        }),
+        runtime: runContext.state,
+        tasks: taskStore,
+        ...(childAgents === undefined ? {} : { childAgents }),
+        memory: {
+          store: this.options.store,
+          key,
+          source: {
+            type: "user",
+            runId: runContext.runId,
+            userId: "webui" as SlackUserId,
+          },
+        },
+        evolution: {
+          submitManualSignal: (input) =>
+            this.options.evolution.submitManualSignal(input),
+          source: "webui_user",
+          actor: "webui",
+        },
+        ...this.options.toolLimits,
+      });
+      const agentLoop = new MinimalAgentLoop({
+        model: this.options.model,
+        tools: runTools,
+        hooks: [
+          ...(repoStart === undefined
+            ? [
+                new ChannelWorkspaceBoundaryHook({
+                  workspaceRoot: runWorkspaceRoot,
+                }),
+              ]
+            : []),
+          new RuntimeModeHook({
+            state: runContext.state,
+            describeTool: (name) => runTools.describeTool(name),
+          }),
+        ],
+      });
+      let systemPrompt = buildCodingAgentSystemPrompt({
+        tools: runToolSchemas,
+        memories: prepared.memories,
+        workspaceSkills: workspaceSkills.skills,
+        repoPrompt: formatRepoRunPrompt(repoStart),
+        channelWorkspacePrompt: formatChannelWorkspacePrompt(
+          runWorkspaceRoot,
+          repoStart,
+        ),
+        workspaceRoot: runWorkspaceRoot,
+        mode: runContext.state.mode,
+        reflectionEnabled: false,
+        ...(selfInstructions === undefined
+          ? {}
+          : { agentSelfInstructions: selfInstructions }),
+        ...(this.options.thinkingLanguage === undefined
+          ? {}
+          : { thinkingLanguage: this.options.thinkingLanguage }),
+      });
+
+      let result;
+      let contextOverflowRetries = 0;
+      while (true) {
+        const runHistory = historyWithoutCurrentUser(prepared.history, text);
+        const runPrepared = {
+          ...prepared,
+          history: runHistory,
+          generatedMessageStartIndex: runHistory.length + 2,
+        };
+        result = await agentLoop.run(
+          {
+            userText:
+              selfEvolutionRequest === undefined
+                ? text
+                : formatSelfEvolutionTicketPrompt(text),
+            systemPrompt,
+            history: runHistory,
+            tools: runToolSchemas,
+            maxTurns: this.options.maxTurns,
+            runContext,
+            ...(this.options.modelName === undefined
+              ? {}
+              : { model: this.options.modelName }),
+            ...(this.options.temperature === undefined
+              ? {}
+              : { temperature: this.options.temperature }),
+            ...(this.options.maxOutputTokens === undefined
+              ? {}
+              : { maxOutputTokens: this.options.maxOutputTokens }),
+            onEvent: async (event) => {
+              await emitWebEvent(active.onEvent, {
+                type: "agent_event",
+                conversationId,
+                runId: runContext.runId,
+                event: toWebAgentStreamLoopEvent(event),
+              });
+            },
+          },
+          active.controller.signal,
+        );
+        if (
+          result.error?.code !== "context_overflow" ||
+          contextOverflowRetries >= 1
+        ) {
+          prepared = runPrepared;
+          break;
+        }
+
+        await this.options.sessions.appendRunMessages(runPrepared, result.messages);
+        await emitWebEvent(active.onEvent, {
+          type: "status",
+          conversationId,
+          runId: runContext.runId,
+          message: "Context is too large. Compacting history before retry...",
+        });
+        const compaction = await this.options.sessions.forceCompact(
+          key,
+          active.controller.signal,
+        );
+        if (compaction?.triggered !== true) {
+          prepared = runPrepared;
+          break;
+        }
+
+        contextOverflowRetries += 1;
+        await emitWebEvent(active.onEvent, {
+          type: "status",
+          conversationId,
+          runId: runContext.runId,
+          message: "Context compacted. Retrying the run...",
+        });
+        prepared = await this.options.sessions.prepareChannelRun(key, {
+          signal: active.controller.signal,
+        });
+        systemPrompt = buildCodingAgentSystemPrompt({
+          tools: runToolSchemas,
+          memories: prepared.memories,
+          workspaceSkills: workspaceSkills.skills,
+          repoPrompt: formatRepoRunPrompt(repoStart),
+          channelWorkspacePrompt: formatChannelWorkspacePrompt(
+            runWorkspaceRoot,
+            repoStart,
+          ),
+          workspaceRoot: runWorkspaceRoot,
+          mode: runContext.state.mode,
+          reflectionEnabled: false,
+          ...(selfInstructions === undefined
+            ? {}
+            : { agentSelfInstructions: selfInstructions }),
+          ...(this.options.thinkingLanguage === undefined
+            ? {}
+            : { thinkingLanguage: this.options.thinkingLanguage }),
+        });
+      }
+
+      reason = result.reason;
+      errorCode = result.error?.code;
+      await this.options.sessions.appendRunMessages(prepared, result.messages);
+      await this.recordRunRolloutSummaryBestEffort({
+        key,
+        runId: runContext.runId,
+        userText: text,
+        reason,
+        turns: result.turns,
+        messages: result.messages,
+        ...(result.error === undefined
+          ? {}
+          : {
+              errorCode: result.error.code,
+              errorMessage: result.error.message,
+            }),
+        durationMs: Date.now() - startedAtMs,
+      });
+      if (result.error !== undefined) {
+        await this.options.sessions.appendContextMessage(key, {
+          message: {
+            role: "assistant",
+            content: `Agent error (${result.error.code}). ${result.error.message}`,
+          },
+          source: "agent",
+        });
+        await this.reportEvolutionFailureIfNeeded({
+          runId: runContext.runId,
+          key,
+          reason,
+          errorCode: result.error.code,
+          durationMs: Date.now() - startedAtMs,
+        });
+      }
+      await emitWebEvent(active.onEvent, {
+        type: "conversation",
+        conversation: await this.getConversation(conversationId),
+      });
+      const evolutionTicketId =
+        selfEvolutionRequest === undefined
+          ? undefined
+          : findCreatedEvolutionTicketId(result.messages);
+
+    await this.options.sessions.writeRuntimeState(key, runContext.state);
+    return {
+      conversationId,
+      runId: runContext.runId,
+      reason,
+      ...(errorCode === undefined ? {} : { errorCode }),
+      ...(evolutionTicketId === undefined ? {} : { evolutionTicketId }),
+    };
+  }
+
+  private async handleActiveConversationInput(
+    active: ActiveWebConversationRun,
+    text: string,
+  ): Promise<WebAgentTurnResult> {
+    const trimmed = text.trim();
+    if (isAgentStopCommand(trimmed)) {
+      await this.appendActiveControlMessage(active, trimmed);
+      active.cancelled = true;
+      active.controller.abort();
+      active.followUps.splice(0, active.followUps.length);
+      await emitWebEvent(active.onEvent, {
+        type: "status",
+        conversationId: active.conversationId,
+        runId: active.runContext.runId,
+        message: "Cancellation requested. Stopping the active run...",
+      });
+      return {
+        conversationId: active.conversationId,
+        runId: active.runContext.runId,
+        reason: "aborted",
+        errorCode: "aborted",
+      };
+    }
+
+    const modeSwitch = parseModeSwitchMessage(trimmed);
+    if (modeSwitch !== undefined) {
+      applyModeSwitch(active.runContext.state, modeSwitch);
+      addSteeringMessage(
+        active.runContext.state,
+        renderModeSwitchSteering(modeSwitch),
+      );
+      await this.appendActiveControlMessage(active, trimmed);
+      await emitWebEvent(active.onEvent, {
+        type: "status",
+        conversationId: active.conversationId,
+        runId: active.runContext.runId,
+        message: `Mode switched to ${modeSwitch.mode} for the active run.`,
+      });
+      return {
+        conversationId: active.conversationId,
+        runId: active.runContext.runId,
+        reason: "steering",
+      };
+    }
+
+    const steering = parseSteeringMessage(trimmed);
+    if (steering !== undefined) {
+      addSteeringMessage(active.runContext.state, steering);
+      await this.appendActiveControlMessage(active, trimmed);
+      await emitWebEvent(active.onEvent, {
+        type: "status",
+        conversationId: active.conversationId,
+        runId: active.runContext.runId,
+        message: "Steering added to the active run.",
+      });
+      return {
+        conversationId: active.conversationId,
+        runId: active.runContext.runId,
+        reason: "steering",
+      };
+    }
+
+    const followUp = parseFollowUpMessage(trimmed);
+    if (followUp !== undefined) {
+      if (active.followUps.length >= this.maxFollowUpQueueSize) {
+        await emitWebEvent(active.onEvent, {
+          type: "status",
+          conversationId: active.conversationId,
+          runId: active.runContext.runId,
+          message: "The follow-up queue is full.",
+        });
+        return {
+          conversationId: active.conversationId,
+          runId: active.runContext.runId,
+          reason: "busy",
+        };
+      }
+      active.followUps.push({ text: followUp });
+      await emitWebEvent(active.onEvent, {
+        type: "status",
+        conversationId: active.conversationId,
+        runId: active.runContext.runId,
+        message: `Follow-up queued at position ${active.followUps.length}.`,
+      });
+      return {
+        conversationId: active.conversationId,
+        runId: active.runContext.runId,
+        reason: "queued",
+      };
+    }
+
+    addSteeringMessage(active.runContext.state, renderInlineSteering(trimmed));
+    await this.appendActiveControlMessage(active, trimmed);
+    await emitWebEvent(active.onEvent, {
+      type: "status",
+      conversationId: active.conversationId,
+      runId: active.runContext.runId,
+      message: "Steering added to the active run.",
+    });
+    return {
+      conversationId: active.conversationId,
+      runId: active.runContext.runId,
+      reason: "steering",
+    };
+  }
+
+  private async appendActiveControlMessage(
+    active: ActiveWebConversationRun,
+    content: string,
+  ): Promise<void> {
+    await active.controlMessageReady;
+    const key = this.memoryKeyFor(active.conversationId);
+    await this.options.sessions.appendContextMessage(key, {
+      message: {
+        role: "user",
+        content,
+      },
+      source: "webui",
+    });
+    await emitWebEvent(active.onEvent, {
+      type: "conversation",
+      conversation: await this.getConversation(active.conversationId),
+    });
+  }
+
+  private async requestActiveApproval(
+    active: ActiveWebConversationRun,
+    request: ToolApprovalPromptRequest,
+    signal?: AbortSignal,
+  ): Promise<ToolApprovalDecision> {
+    if (Boolean(signal?.aborted) || active.controller.signal.aborted) {
+      return deniedApproval("Tool approval was cancelled before it was requested");
+    }
+
+    const approvalId = randomUUID();
+    const expiresAt = new Date(Date.now() + request.timeoutMs).toISOString();
+    let resolveDecision!: (decision: ToolApprovalDecision) => void;
+    const decisionPromise = new Promise<ToolApprovalDecision>((resolve) => {
+      resolveDecision = resolve;
+    });
+    const abort = () => {
+      void this.finishApproval(
+        approvalId,
+        deniedApproval("Tool approval was cancelled"),
+        "cancelled",
+        "Tool approval was cancelled.",
+      );
+    };
+    const timeout = setTimeout(() => {
+      void this.finishApproval(
+        approvalId,
+        deniedApproval("Tool approval timed out"),
+        "expired",
+        "Tool approval expired before execution.",
+      );
+    }, request.timeoutMs);
+    const pending: PendingWebApproval = {
+      request,
+      conversationId: active.conversationId,
+      runId: active.runContext.runId,
+      expiresAt,
+      resolve: resolveDecision,
+      timeout,
+      abort,
+      ...(active.onEvent === undefined ? {} : { onEvent: active.onEvent }),
+      ...(signal === undefined ? {} : { signal }),
+      settled: false,
+    };
+    this.pendingApprovals.set(approvalId, pending);
+    signal?.addEventListener("abort", abort, { once: true });
+    active.controller.signal.addEventListener("abort", abort, { once: true });
+
+    const approval = webApprovalView(
+      approvalId,
+      pending,
+      "pending",
+      undefined,
+    );
+    await emitWebEvent(active.onEvent, {
+      type: "approval_requested",
+      conversationId: active.conversationId,
+      runId: active.runContext.runId,
+      approval,
+    });
+
+    if (signal?.aborted === true || active.controller.signal.aborted) {
+      await this.finishApproval(
+        approvalId,
+        deniedApproval("Tool approval was cancelled"),
+        "cancelled",
+        "Tool approval was cancelled.",
+      );
+    }
+
+    return decisionPromise;
+  }
+
+  private async requestChildToolApproval(
+    request: ToolApprovalPromptRequest,
+    signal?: AbortSignal,
+  ): Promise<ToolApprovalDecision> {
+    const active = this.activeConversationForApproval(request.context.conversation);
+    if (active === undefined) {
+      return deniedApproval("No active WebUI run is available for child-agent approval");
+    }
+
+    return this.requestActiveApproval(active, request, signal);
+  }
+
+  private activeConversationForApproval(
+    conversation: {
+      readonly teamId: SlackTeamId;
+      readonly channelId: SlackChannelId;
+    },
+  ): ActiveWebConversationRun | undefined {
+    for (const active of this.activeByConversation.values()) {
+      if (active.kind !== "conversation") {
+        continue;
+      }
+      const key = this.memoryKeyFor(active.conversationId);
+      if (
+        key.teamId === conversation.teamId &&
+        key.channelId === conversation.channelId
+      ) {
+        return active;
+      }
+    }
+
+    return undefined;
+  }
+
+  private createChildAgentRuntime(options: {
+    readonly key: ChannelSessionKey;
+    readonly runContext: AgentRunContext;
+    readonly workspaceRoot: string;
+    readonly approvalContext?: ToolApprovalPromptRequest["context"];
+  }): ChildAgentRuntime | undefined {
+    const childOptions = this.options.childAgents;
+    if (childOptions === undefined) {
+      return undefined;
+    }
+
+    return new ChildAgentRuntime({
+      key: options.key,
+      parentRunId: options.runContext.runId,
+      workspaceRoot: options.workspaceRoot,
+      store: childOptions.store,
+      supervisor: childOptions.supervisor,
+      ...(options.approvalContext === undefined
+        ? {}
+        : { approvalContext: options.approvalContext }),
+      ...(childOptions.maxConcurrent === undefined
+        ? {}
+        : { maxConcurrent: childOptions.maxConcurrent }),
+      ...(childOptions.defaultTimeoutMs === undefined
+        ? {}
+        : { defaultTimeoutMs: childOptions.defaultTimeoutMs }),
+      ...(childOptions.maxTimeoutMs === undefined
+        ? {}
+        : { maxTimeoutMs: childOptions.maxTimeoutMs }),
+      ...(childOptions.defaultMaxToolCalls === undefined
+        ? {}
+        : { defaultMaxToolCalls: childOptions.defaultMaxToolCalls }),
+      ...(childOptions.defaultMaxTokens === undefined
+        ? {}
+        : { defaultMaxTokens: childOptions.defaultMaxTokens }),
+    });
+  }
+
+  private async finishApproval(
+    approvalId: string,
+    decision: ToolApprovalDecision,
+    status: WebApprovalView["status"],
+    resolvedMessage: string,
+  ): Promise<WebApprovalView> {
+    const pending = this.pendingApprovals.get(approvalId);
+    if (pending === undefined) {
+      return completedMissingApproval(approvalId, decision, status, resolvedMessage);
+    }
+    if (pending.settled) {
+      return webApprovalView(approvalId, pending, status, resolvedMessage);
+    }
+
+    pending.settled = true;
+    this.pendingApprovals.delete(approvalId);
+    clearTimeout(pending.timeout);
+    pending.signal?.removeEventListener("abort", pending.abort);
+    pending.resolve(decision);
+
+    const approval = webApprovalView(
+      approvalId,
+      pending,
+      status,
+      resolvedMessage,
+    );
+    await emitWebEvent(pending.onEvent, {
+      type: "approval_resolved",
+      conversationId: pending.conversationId,
+      runId: pending.runId,
+      approval,
+    });
+    return approval;
+  }
+
+  async runEvolutionTicketImplementation(
+    ticketId: string,
+    runOptions: WebAgentRunOptions = {},
+  ): Promise<WebAgentTurnResult> {
+    if (this.activeByConversation.has(EVOLUTION_CHANNEL_NAME)) {
+      throw new Error("The self-evolution channel already has an active run");
+    }
+
+    const runContext = createAgentRunContext({
+      agentId: "evolution" as AgentId,
+    });
+    this.activeByConversation.set(EVOLUTION_CHANNEL_NAME, {
+      kind: "evolution",
+      runId: runContext.runId,
+    });
+    const startedAtMs = Date.now();
+    let reason = "unknown";
+    let errorCode: string | undefined;
+    let implementationStarted = false;
+
+    try {
+      const evolutionSnapshot = await this.options.evolution.readSnapshot();
+      const ticket = this.requireEvolutionTicketForImplementation(
+        evolutionSnapshot.tickets,
+        ticketId,
+      );
+      const key = evolutionTicketChannelKey(ticket.id);
+      const selfInstructionsTicket = ticket.target === "self_instructions";
+      await emitWebEvent(runOptions.onEvent, {
+        type: "status",
+        conversationId: EVOLUTION_CHANNEL_NAME,
+        runId: runContext.runId,
+        message: selfInstructionsTicket
+          ? "Creating isolated self-instructions workspace..."
+          : "Creating isolated implementation workspace...",
+      });
+      const selfInstructionsStaging: SelfInstructionsStagingWorkspace | undefined =
+        selfInstructionsTicket
+          ? await createSelfInstructionsStagingWorkspace({
+              sourceRoot: this.options.workspaceRoot,
+              ticketId: ticket.id,
+              runId: runContext.runId,
+              ...(evolutionSnapshot.selfInstructions === undefined
+                ? {}
+                : { currentInstructions: evolutionSnapshot.selfInstructions }),
+              ...(ticket.proposal.proposedSelfInstructions === undefined
+                ? {}
+                : { proposalDraft: ticket.proposal.proposedSelfInstructions }),
+            })
+          : undefined;
+      const runtimeStaging = selfInstructionsTicket
+        ? undefined
+        : await createRuntimeCodeStagingWorkspace({
+            sourceRoot: this.options.workspaceRoot,
+            ticketId: ticket.id,
+            runId: runContext.runId,
+          });
+      const implementationWorkspaceRoot =
+        selfInstructionsStaging?.root ?? runtimeStaging?.root;
+      if (implementationWorkspaceRoot === undefined) {
+        throw new Error("Failed to create implementation workspace");
+      }
+      this.options.sandboxExecutor.assertWorkspaceAccess(implementationWorkspaceRoot);
+      const prompt = formatEvolutionImplementationPrompt(
+        ticket,
+        implementationWorkspaceRoot,
+        this.options.workspaceRoot,
+      );
+      const prepared = await this.options.sessions.prepareChannelRun(key);
+      await this.options.evolution.beginImplementation(ticket.id, {
+        actor: "webui",
+      });
+      implementationStarted = true;
+      await emitWebEvent(runOptions.onEvent, {
+        type: "run_start",
+        conversationId: EVOLUTION_CHANNEL_NAME,
+        runId: runContext.runId,
+      });
+      await this.options.sessions.appendContextMessage(key, {
+        message: {
+          role: "user",
+          content: prompt,
+        },
+        source: "webui",
+      });
+
+      await emitWebEvent(runOptions.onEvent, {
+        type: "status",
+        conversationId: EVOLUTION_CHANNEL_NAME,
+        runId: runContext.runId,
+        message: `Implementation workspace: ${implementationWorkspaceRoot}`,
+      });
+
+      const workspaceSkills = await scanWorkspaceSkills(implementationWorkspaceRoot, {
+        ...(this.options.pibotSkillsRoot === undefined
+          ? {}
+          : { pibotSkillsRoot: this.options.pibotSkillsRoot }),
+        ...(this.options.disabledSkills === undefined
+          ? {}
+          : { disabledSkills: this.options.disabledSkills }),
+        ...(this.options.maxSkills === undefined
+          ? {}
+          : { maxSkills: this.options.maxSkills }),
+        ...(this.options.maxSkillFileBytes === undefined
+          ? {}
+          : { maxSkillFileBytes: this.options.maxSkillFileBytes }),
+      });
+      const selfInstructions =
+        await this.options.evolution.readCurrentSelfInstructions();
+      const taskStore = new FileTaskStore({
+        workspaceRoot: implementationWorkspaceRoot,
+      });
+      const childAgents = this.createChildAgentRuntime({
+        key,
+        runContext,
+        workspaceRoot: implementationWorkspaceRoot,
+      });
+      const runToolSchemas = evolutionImplementationToolSchemas(
+        this.options.tools,
+      );
+      const runTools = createCodingToolExecutor({
+        workspaceRoot: implementationWorkspaceRoot,
+        ...(this.options.pibotSkillsRoot === undefined
+          ? {}
+          : { pibotSkillsRoot: this.options.pibotSkillsRoot }),
+        skills: workspaceSkills.skills,
+        sandboxExecutor: this.options.sandboxExecutor,
+        approvalGate: createToolApprovalGate(
+          evolutionImplementationApprovalMode(this.options.toolApprovalMode),
+        ),
+        disabledTools: EVOLUTION_IMPLEMENTATION_DISABLED_TOOLS,
+        runtime: runContext.state,
+        tasks: taskStore,
+        ...(childAgents === undefined ? {} : { childAgents }),
+        memory: {
+          store: this.options.store,
+          key,
+          source: {
+            type: "user",
+            runId: runContext.runId,
+            userId: "webui" as SlackUserId,
+          },
+        },
+        evolution: {
+          submitManualSignal: (input) =>
+            this.options.evolution.submitManualSignal(input),
+          source: "webui_user",
+          actor: "webui",
+        },
+        ...this.options.toolLimits,
+      });
+      const agentLoop = new MinimalAgentLoop({
+        model: this.options.model,
+        tools: runTools,
+        hooks: [
+          new RuntimeModeHook({
+            state: runContext.state,
+            describeTool: (name) => runTools.describeTool(name),
+          }),
+        ],
+      });
+      const systemPrompt = buildCodingAgentSystemPrompt({
+        tools: runToolSchemas,
+        memories: prepared.memories,
+        workspaceSkills: workspaceSkills.skills,
+        repoPrompt: undefined,
+        channelWorkspacePrompt: selfInstructionsTicket
+          ? formatSelfInstructionsWorkspacePrompt(
+              implementationWorkspaceRoot,
+              this.options.workspaceRoot,
+              evolutionSnapshot.tickets,
+              ticket.id,
+            )
+          : formatEvolutionWorkspacePrompt(
+              implementationWorkspaceRoot,
+              this.options.workspaceRoot,
+              evolutionSnapshot.tickets,
+              ticket.id,
+              evolutionSnapshot.runtimeVersions.find((version) =>
+                version.id === evolutionSnapshot.activeRuntimeVersion?.versionId
+              ),
+            ),
+        workspaceRoot: implementationWorkspaceRoot,
+        mode: runContext.state.mode,
+        reflectionEnabled: false,
+        ...(selfInstructions === undefined
+          ? {}
+          : { agentSelfInstructions: selfInstructions }),
+        ...(this.options.thinkingLanguage === undefined
+          ? {}
+          : { thinkingLanguage: this.options.thinkingLanguage }),
+      });
+      const result = await agentLoop.run(
+        {
+          userText: prompt,
+          systemPrompt,
+          history: prepared.history,
+          tools: runToolSchemas,
+          maxTurns: this.options.maxTurns,
+          runContext,
+          ...(this.options.modelName === undefined
+            ? {}
+            : { model: this.options.modelName }),
+          ...(this.options.temperature === undefined
+            ? {}
+            : { temperature: this.options.temperature }),
+          ...(this.options.maxOutputTokens === undefined
+            ? {}
+            : { maxOutputTokens: this.options.maxOutputTokens }),
+          onEvent: async (event) => {
+            await emitWebEvent(runOptions.onEvent, {
+              type: "agent_event",
+              conversationId: EVOLUTION_CHANNEL_NAME,
+              runId: runContext.runId,
+              event: toWebAgentStreamLoopEvent(event),
+            });
+          },
+        },
+        runOptions.signal,
+      );
+
+      reason = result.reason;
+      errorCode = result.error?.code;
+      await this.options.sessions.appendRunMessages(prepared, result.messages);
+      await this.recordRunRolloutSummaryBestEffort({
+        key,
+        runId: runContext.runId,
+        userText: ticket.title,
+        reason,
+        turns: result.turns,
+        messages: result.messages,
+        ...(result.error === undefined
+          ? {}
+          : {
+              errorCode: result.error.code,
+              errorMessage: result.error.message,
+            }),
+        durationMs: Date.now() - startedAtMs,
+      });
+      if (result.error !== undefined) {
+        await this.options.sessions.appendContextMessage(key, {
+          message: {
+            role: "assistant",
+            content: `Evolution implementation error (${result.error.code}). ${result.error.message}`,
+          },
+          source: "agent",
+        });
+      }
+
+      let validation:
+        | RuntimeCodeValidationReport
+        | SelfInstructionsValidationReport
+        | undefined;
+      let publish: RuntimeCodePublishReport | undefined;
+      let selfInstructionsDraft: string | undefined;
+      let postRunError: string | undefined;
+      const agentCompleted = result.error === undefined && result.reason === "completed";
+      if (agentCompleted) {
+        if (selfInstructionsTicket) {
+          await emitWebEvent(runOptions.onEvent, {
+            type: "status",
+            conversationId: EVOLUTION_CHANNEL_NAME,
+            runId: runContext.runId,
+            message: "Validating self-instructions draft...",
+          });
+          if (selfInstructionsStaging === undefined) {
+            throw new Error("Missing self-instructions staging workspace");
+          }
+          selfInstructionsDraft = await readStagedSelfInstructions(
+            selfInstructionsStaging,
+          );
+          validation = validateStagedSelfInstructions({
+            instructions: selfInstructionsDraft,
+            baselineInstructions: selfInstructionsStaging.baselineInstructions,
+          });
+          if (validation.status !== "passed") {
+            postRunError = "Self-instructions validation did not pass.";
+          }
+        } else {
+          await emitWebEvent(runOptions.onEvent, {
+            type: "status",
+            conversationId: EVOLUTION_CHANNEL_NAME,
+            runId: runContext.runId,
+            message: "Validating isolated workspace...",
+          });
+          if (runtimeStaging === undefined) {
+            throw new Error("Missing runtime-code staging workspace");
+          }
+          validation = await validateRuntimeCodeWorkspace({
+            workspaceRoot: runtimeStaging.root,
+            dependencyRoot: this.options.workspaceRoot,
+          });
+          if (validation.status === "passed") {
+            await emitWebEvent(runOptions.onEvent, {
+              type: "status",
+              conversationId: EVOLUTION_CHANNEL_NAME,
+              runId: runContext.runId,
+              message: "Validation passed. Publishing checked changes...",
+            });
+            publish = await publishRuntimeCodeWorkspace({
+              stagingRoot: runtimeStaging.root,
+              destinationRoot: this.options.workspaceRoot,
+              baseline: runtimeStaging.baseline,
+            });
+            if (publish.conflicts.length > 0) {
+              postRunError = `Publish conflict in ${publish.conflicts.join(", ")}`;
+            } else if (!runtimeCodePublishHasChanges(publish)) {
+              postRunError = "Implementation produced no publishable source changes.";
+            }
+          } else {
+            postRunError = "Validation did not pass.";
+          }
+        }
+      }
+
+      const success = selfInstructionsTicket
+        ? agentCompleted &&
+          validation?.status === "passed" &&
+          selfInstructionsDraft !== undefined
+        : agentCompleted &&
+          validation?.status === "passed" &&
+          publish !== undefined &&
+          publish.conflicts.length === 0 &&
+          runtimeCodePublishHasChanges(publish);
+      await this.options.evolution.finishImplementation(ticket.id, {
+        actor: "webui",
+        success,
+        summary: formatEvolutionImplementationSummary({
+          reason: result.reason,
+          stagingRoot: implementationWorkspaceRoot,
+          ...optionalSummaryField("agentSummary", finalAssistantSummary(result.messages)),
+          ...optionalSummaryField("errorCode", result.error?.code),
+          ...optionalSummaryField("validation", validation),
+          ...optionalSummaryField("publish", publish),
+          ...optionalSummaryField("postRunError", postRunError),
+        }),
+      });
+      if (success && selfInstructionsTicket && selfInstructionsDraft !== undefined) {
+        await emitWebEvent(runOptions.onEvent, {
+          type: "status",
+          conversationId: EVOLUTION_CHANNEL_NAME,
+          runId: runContext.runId,
+          message: "Creating selectable self-instructions version...",
+        });
+        await this.options.evolution.createSelfInstructionsVersionForTicket(ticket.id, {
+          actor: "webui",
+          instructions: selfInstructionsDraft,
+        });
+      } else if (success && publish !== undefined) {
+        await emitWebEvent(runOptions.onEvent, {
+          type: "status",
+          conversationId: EVOLUTION_CHANNEL_NAME,
+          runId: runContext.runId,
+          message: "Capturing selectable runtime version...",
+        });
+        await this.options.evolution.createRuntimeCodeVersionForTicket(ticket.id, {
+          actor: "webui",
+          workspaceRoot: this.options.workspaceRoot,
+          changedFiles: publish.changedFiles,
+          deletedFiles: publish.deletedFiles,
+        });
+      }
+      if (!success) {
+        await this.reportEvolutionFailureIfNeeded({
+          runId: runContext.runId,
+          key,
+          reason,
+          errorCode: errorCode ?? result.reason,
+          durationMs: Date.now() - startedAtMs,
+        });
+      }
+
+      return {
+        conversationId: EVOLUTION_CHANNEL_NAME,
+        runId: runContext.runId,
+        reason,
+        ...(errorCode === undefined ? {} : { errorCode }),
+      };
+    } catch (error: unknown) {
+      if (implementationStarted) {
+        await this.options.evolution.finishImplementation(ticketId, {
+          actor: "webui",
+          success: false,
+          summary: error instanceof Error ? error.message : String(error),
+        });
+      }
+      throw error;
+    } finally {
+      this.activeByConversation.delete(EVOLUTION_CHANNEL_NAME);
+    }
+  }
+
+  async deleteChannelWorkspace(conversationId: string): Promise<void> {
+    const key = this.memoryKeyFor(conversationId);
+    await this.options.store.deleteChannelDirectory(key);
+  }
+
+  private async conversationWithChannelContext(
+    conversation: WebConversation,
+  ): Promise<WebConversation> {
+    await this.ensureConversationContextMigrated(conversation.id, conversation);
+    const key = this.memoryKeyFor(conversation.id);
+    return {
+      ...conversation,
+      messages: (await this.options.sessions.readChannelContextMessages(key))
+        .map(channelContextMessageToWebMessage),
+    };
+  }
+
+  private async recordRunRolloutSummaryBestEffort(input: {
+    readonly key: ChannelSessionKey;
+    readonly runId: AgentRunId;
+    readonly userText: string;
+    readonly reason: string;
+    readonly turns: number;
+    readonly messages: readonly LlmMessage[];
+    readonly errorCode?: string;
+    readonly errorMessage?: string;
+    readonly durationMs?: number;
+  }): Promise<void> {
+    try {
+      await this.options.sessions.recordRunRolloutSummary({
+        ...input,
+        source: {
+          type: "system",
+          runId: input.runId,
+        },
+      });
+    } catch {
+      // Memory sedimentation is best-effort and must not fail the user run.
+    }
+  }
+
+  private async ensureConversationContextMigrated(
+    conversationId: string,
+    conversation?: WebConversation,
+  ): Promise<void> {
+    if (this.migratedContextByConversation.has(conversationId)) {
+      return;
+    }
+
+    const existing = conversation ?? await this.options.conversations.get(conversationId);
+    const key = this.memoryKeyFor(conversationId);
+    const contextMessages = await this.options.sessions.readChannelContextMessages(key);
+    if (contextMessages.length === 0 && existing.messages.length > 0) {
+      for (const message of existing.messages) {
+        if (message.role === "system") {
+          continue;
+        }
+        await this.options.sessions.appendContextMessage(key, {
+          message: webConversationMessageToLlmMessage(message),
+          source: message.role === "user" ? "webui" : "agent",
+          createdAt: message.createdAt,
+        });
+      }
+    }
+
+    this.migratedContextByConversation.add(conversationId);
+  }
+
+  private async prepareRepoWorkflow(
+    key: {
+      readonly teamId: SlackTeamId;
+      readonly channelId: SlackChannelId;
+    },
+    signal: AbortSignal | undefined,
+  ): Promise<RepoRunStartSnapshot | undefined> {
+    return this.options.repoWorkflow?.prepareCodingTask(key, signal);
+  }
+
+  private async resolveRunWorkspaceRoot(
+    key: {
+      readonly teamId: SlackTeamId;
+      readonly channelId: SlackChannelId;
+    },
+    repoStart: RepoRunStartSnapshot | undefined,
+  ): Promise<string> {
+    if (repoStart !== undefined) {
+      return repoStart.config.repoPath;
+    }
+
+    return (await this.options.store.ensureChannelDirectory(key)).channelDir;
+  }
+
+  private memoryKeyFor(conversationId: string): {
+    readonly teamId: SlackTeamId;
+    readonly channelId: SlackChannelId;
+  } {
+    if (this.options.memoryKey !== undefined) {
+      return this.options.memoryKey;
+    }
+    return {
+      teamId: "webui" as SlackTeamId,
+      channelId: sanitizeChannelId(conversationId) as SlackChannelId,
+    };
+  }
+
+  private requireEvolutionTicketForImplementation(
+    tickets: readonly EvolutionTicket[],
+    ticketId: string,
+  ): EvolutionTicket {
+    const ticket = tickets.find((candidate) => candidate.id === ticketId);
+    if (ticket === undefined) {
+      throw new Error(`Unknown evolution ticket: ${ticketId}`);
+    }
+    if (ticket.status !== "approved" && ticket.status !== "failed") {
+      throw new Error("Only approved or failed evolution tickets can be implemented");
+    }
+    return ticket;
+  }
+
+  private async reportEvolutionFailureIfNeeded(input: {
+    readonly runId: AgentRunId;
+    readonly key: {
+      readonly teamId: SlackTeamId;
+      readonly channelId: SlackChannelId;
+    };
+    readonly reason: string;
+    readonly errorCode: string;
+    readonly durationMs: number;
+  }): Promise<void> {
+    if (input.reason === "cancelled" || input.errorCode === "aborted") {
+      return;
+    }
+    if (String(input.key.channelId).startsWith(`${EVOLUTION_CHANNEL_NAME}--`)) {
+      return;
+    }
+    try {
+      await this.options.evolution.reportRunFailure({
+        runId: input.runId,
+        channelId: input.key.channelId,
+        userId: "webui" as SlackUserId,
+        reason: input.reason,
+        errorCode: input.errorCode,
+        durationMs: input.durationMs,
+        source: "runtime_error",
+        adapter: "webui",
+      });
+    } catch {
+      return;
+    }
+  }
+
+}
+
+function channelContextMessageToWebMessage(
+  entry: ChannelContextMessage,
+): WebConversationMessage {
+  const message = entry.message;
+  return {
+    id: `ctx_${entry.lineNumber}`,
+    role: message.role,
+    content: message.content,
+    createdAt: entry.createdAt ?? "",
+    ...(message.toolCallId === undefined ? {} : { toolCallId: message.toolCallId }),
+    ...(message.toolCalls === undefined ? {} : { toolCalls: message.toolCalls }),
+    ...(message.reasoningContent === undefined
+      ? {}
+      : { reasoningContent: message.reasoningContent }),
+  };
+}
+
+function webConversationMessageToLlmMessage(
+  message: WebConversationMessage,
+): LlmMessage {
+  return {
+    role: message.role,
+    content: message.content,
+    ...(message.toolCallId === undefined
+      ? {}
+      : { toolCallId: message.toolCallId as ToolCallId }),
+    ...(message.toolCalls === undefined ? {} : { toolCalls: message.toolCalls }),
+    ...(message.reasoningContent === undefined
+      ? {}
+      : { reasoningContent: message.reasoningContent }),
+  };
+}
+
+async function emitWebEvent(
+  onEvent: WebAgentRunOptions["onEvent"],
+  event: WebAgentRunnerEvent,
+): Promise<void> {
+  await onEvent?.(event);
+}
+
+function webApprovalView(
+  approvalId: string,
+  pending: PendingWebApproval,
+  status: WebApprovalView["status"],
+  resolvedMessage: string | undefined,
+): WebApprovalView {
+  return {
+    id: approvalId,
+    conversationId: pending.conversationId,
+    runId: pending.runId,
+    toolName: pending.request.call.name,
+    risk: String(pending.request.risk),
+    title: approvalTitle(pending.request),
+    summary: approvalSummary(pending.request),
+    details: approvalDetails(pending.request.call),
+    status,
+    expiresAt: pending.expiresAt,
+    ...(resolvedMessage === undefined ? {} : { resolvedMessage }),
+  };
+}
+
+function completedMissingApproval(
+  approvalId: string,
+  decision: ToolApprovalDecision,
+  status: WebApprovalView["status"],
+  resolvedMessage: string,
+): WebApprovalView {
+  return {
+    id: approvalId,
+    conversationId: "",
+    runId: "" as AgentRunId,
+    toolName: "",
+    risk: "",
+    title: "Approval completed",
+    summary: decision.approved ? "Approved." : decision.reason,
+    details: [],
+    status,
+    expiresAt: new Date().toISOString(),
+    resolvedMessage,
+  };
+}
+
+function approvalTitle(request: ToolApprovalPromptRequest): string {
+  if (request.call.name === "enter_plan_mode") {
+    return "Enter Plan Mode";
+  }
+  if (request.call.name === "exit_plan_mode") {
+    return "Approve Plan";
+  }
+  return `Approve ${request.call.name}`;
+}
+
+function approvalSummary(request: ToolApprovalPromptRequest): string {
+  if (request.call.name === "enter_plan_mode") {
+    return "Switch this run into read-only planning mode.";
+  }
+  if (request.call.name === "exit_plan_mode") {
+    return "Leave Plan Mode and continue execution with the saved plan.";
+  }
+  return request.explanation || `${request.call.name} requires approval.`;
+}
+
+function approvalDetails(call: ToolCall): readonly string[] {
+  const input = readToolInput(call.input);
+  switch (call.name) {
+    case "enter_plan_mode": {
+      const goal = readInputString(input, "goal");
+      return goal.length === 0 ? [] : [`Goal: ${truncateSummary(goal, 240)}`];
+    }
+    case "exit_plan_mode": {
+      const summary = readInputString(input, "summary");
+      const planPath = readInputString(input, "planPath") || "PLAN.md";
+      const planExcerpt = readInputString(input, "planExcerpt");
+      return [
+        `Plan: ${planPath}`,
+        ...(summary.length === 0
+          ? []
+          : [`Summary: ${truncateSummary(summary, 240)}`]),
+        ...(planExcerpt.length === 0
+          ? []
+          : [`Plan excerpt: ${Buffer.byteLength(planExcerpt, "utf8")} bytes stored in ${planPath}.`]),
+      ];
+    }
+    case "bash":
+      return [`Command: ${truncateSummary(readInputString(input, "command"), 1200)}`];
+    case "write":
+      return [
+        `Path: ${readInputString(input, "path")}`,
+        `Bytes: ${Buffer.byteLength(readInputString(input, "content"), "utf8")}`,
+      ];
+    case "edit":
+      return [
+        `Path: ${readInputString(input, "path")}`,
+        `Replacements: ${readInputArray(input, "replacements").length}`,
+      ];
+    case "read":
+    case "attach":
+      return [`Path: ${readInputString(input, "path")}`];
+    case "grep":
+      return [`Pattern: ${readInputString(input, "pattern")}`];
+    default:
+      return [`Arguments: ${truncateSummary(JSON.stringify(call.input), 1000)}`];
+  }
+}
+
+function approvalDecisionStatus(
+  request: ToolApprovalPromptRequest,
+  approved: boolean,
+): string {
+  if (request.call.name === "enter_plan_mode") {
+    return approved
+      ? "Plan Mode approved. Entering Plan Mode."
+      : "Plan Mode rejected.";
+  }
+  if (request.call.name === "exit_plan_mode") {
+    return approved
+      ? "Plan approved. Continuing execution."
+      : "Plan rejected.";
+  }
+  return approved ? "Approved." : "Rejected.";
+}
+
+function deniedApproval(reason: string): ToolApprovalDecision {
+  return {
+    approved: false,
+    reason,
+  };
+}
+
+function readToolInput(input: unknown): Record<string, unknown> {
+  return typeof input === "object" && input !== null && !Array.isArray(input)
+    ? input as Record<string, unknown>
+    : {};
+}
+
+function readInputString(input: Record<string, unknown>, key: string): string {
+  const value = input[key];
+  return typeof value === "string" ? value : "";
+}
+
+function readInputArray(
+  input: Record<string, unknown>,
+  key: string,
+): readonly unknown[] {
+  const value = input[key];
+  return Array.isArray(value) ? value : [];
+}
+
+function toWebAgentStreamLoopEvent(
+  event: AgentLoopEvent,
+): WebAgentStreamLoopEvent {
+  switch (event.type) {
+    case "agent_start":
+      return {
+        type: "agent_start",
+        maxTurns: event.maxTurns,
+      };
+    case "turn_start":
+      return {
+        type: "turn_start",
+        turn: event.turn,
+      };
+    case "message_delta":
+      return {
+        type: "message_delta",
+        turn: event.turn,
+        text: event.text,
+      };
+    case "reasoning_delta":
+      return {
+        type: "reasoning_delta",
+        turn: event.turn,
+        text: event.text,
+      };
+    case "message_completed":
+      return {
+        type: "message_completed",
+        turn: event.turn,
+        role: event.message.role,
+      };
+    case "tool_start":
+      return {
+        type: "tool_start",
+        turn: event.turn,
+        call: {
+          id: event.call.id,
+          name: event.call.name,
+          summary: formatToolCallSummary(event.call),
+        },
+      };
+    case "tool_end":
+      return {
+        type: "tool_end",
+        turn: event.turn,
+        call: {
+          id: event.call.id,
+          name: event.call.name,
+        },
+        result: event.result.ok
+          ? {
+              ok: true,
+              summary: formatToolResultSummary(event.call, event.result),
+            }
+          : {
+              ok: false,
+              summary: event.result.error.message,
+              error: {
+                code: event.result.error.code,
+                message: event.result.error.message,
+              },
+            },
+      };
+    case "turn_end":
+      return {
+        type: "turn_end",
+        turn: event.turn,
+        reason: event.reason,
+      };
+    case "agent_end":
+      return {
+        type: "agent_end",
+        reason: event.reason,
+        ...(event.error === undefined
+          ? {}
+          : {
+              error: {
+                code: event.error.code,
+                message: event.error.message,
+              },
+            }),
+      };
+  }
+}
+
+function formatToolCallSummary(call: ToolCall): string {
+  const input = call.input as Record<string, unknown> | undefined;
+  if (input === undefined || input === null) {
+    return call.name;
+  }
+  switch (call.name) {
+    case "read":
+      return `read ${stringField(input, "path")}`;
+    case "bash":
+      return `bash ${truncateSummary(stringField(input, "command"), 80)}`;
+    case "grep":
+      return `grep ${stringField(input, "pattern")}`;
+    case "edit":
+      return `edit ${stringField(input, "path")}`;
+    case "write":
+      return `write ${stringField(input, "path")}`;
+    case "agent_spawn": {
+      const role = typeof input.role === "string" ? input.role : "agent";
+      const task =
+        typeof input.task === "string"
+          ? truncateSummary(input.task, 60)
+          : "";
+      return `spawn ${role} ${task}`;
+    }
+    case "memory_read":
+    case "memory_write":
+    case "memory_delete": {
+      const scope = typeof input.scope === "string" ? input.scope : "";
+      const document =
+        typeof input.document === "string" ? input.document : "";
+      return `${call.name} ${scope}/${document}`;
+    }
+    case "attach":
+      return `attach ${stringField(input, "path")}`;
+    case "lsp":
+      return `lsp ${stringField(input, "action")}`;
+    default:
+      return call.name;
+  }
+}
+
+function formatToolResultSummary(
+  call: ToolCall,
+  result: ToolResult,
+): string {
+  if (!result.ok) {
+    return `${call.name}: ${result.error.message}`;
+  }
+  const output = result.output as Record<string, unknown> | undefined;
+  if (output === undefined || output === null) {
+    return `${call.name}: OK`;
+  }
+  switch (call.name) {
+    case "read": {
+      if (
+        typeof output.path === "string" &&
+        typeof output.totalLines === "number"
+      ) {
+        return `${output.path} (${output.totalLines} lines)`;
+      }
+      return `${call.name}: OK`;
+    }
+    case "bash": {
+      if (typeof output.exitCode === "number") {
+        const timedOut = output.timedOut === true;
+        const aborted = output.aborted === true;
+        if (timedOut) return `bash: timed out`;
+        if (aborted) return `bash: aborted`;
+        return `bash: exited ${output.exitCode}`;
+      }
+      return `${call.name}: OK`;
+    }
+    case "grep": {
+      if (typeof output.matches === "number" || Array.isArray(output.matches)) {
+        const count = Array.isArray(output.matches)
+          ? output.matches.length
+          : output.matches;
+        return `grep: ${count} matches`;
+      }
+      return `${call.name}: OK`;
+    }
+    case "edit":
+    case "write": {
+      if (
+        typeof output.path === "string" &&
+        output.summary !== undefined &&
+        typeof output.summary === "object" &&
+        output.summary !== null
+      ) {
+        const summary = output.summary as Record<string, unknown>;
+        if (typeof summary.description === "string") {
+          return `${output.path}: ${summary.description}`;
+        }
+      }
+      if (typeof output.path === "string") {
+        return `${output.path}: written`;
+      }
+      return `${call.name}: OK`;
+    }
+    case "agent_spawn": {
+      if (
+        output.childRunId !== undefined &&
+        typeof output.childRunId === "string"
+      ) {
+        const worktree =
+          typeof output.worktreePath === "string" && output.worktreePath.length > 0
+            ? ` worktree ${output.worktreePath}`
+            : "";
+        return `agent_spawn: ${output.childRunId}${worktree}`;
+      }
+      return `${call.name}: OK`;
+    }
+    case "agent_collect": {
+      const agent = output.agent as Record<string, unknown> | undefined;
+      if (
+        agent !== undefined &&
+        typeof agent.childRunId === "string" &&
+        typeof agent.status === "string"
+      ) {
+        return `agent_collect: ${agent.childRunId} ${agent.status}`;
+      }
+      return `${call.name}: OK`;
+    }
+    default: {
+      if (typeof output.message === "string") {
+        return output.message;
+      }
+      return `${call.name}: OK`;
+    }
+  }
+}
+
+function stringField(obj: Record<string, unknown>, key: string): string {
+  const value = obj[key];
+  if (typeof value === "string" && value.length > 0) {
+    return value;
+  }
+  return "";
+}
+
+function truncateSummary(value: string, maxLen: number): string {
+  if (value.length <= maxLen) {
+    return value;
+  }
+  return value.slice(0, maxLen - 1) + "...";
+}
+
+function historyWithoutCurrentUser(
+  history: readonly LlmMessage[],
+  currentText: string,
+): readonly LlmMessage[] {
+  let currentUserIndex = -1;
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const message = history[index];
+    if (message?.role === "user" && message.content === currentText) {
+      currentUserIndex = index;
+      break;
+    }
+  }
+  if (currentUserIndex >= 0) {
+    return [
+      ...history.slice(0, currentUserIndex),
+      ...history.slice(currentUserIndex + 1),
+    ];
+  }
+  return history;
+}
+
+function resetActiveControlMessageBoundary(
+  active: ActiveWebConversationRun,
+): void {
+  let resolved = false;
+  active.controlMessageReady = new Promise<void>((resolve) => {
+    active.resolveControlMessageReady = () => {
+      if (resolved) {
+        return;
+      }
+      resolved = true;
+      resolve();
+    };
+  });
+}
+
+function resolveActiveControlMessageBoundary(
+  active: ActiveWebConversationRun,
+): void {
+  active.resolveControlMessageReady();
+}
+
+function formatEvolutionImplementationPrompt(
+  ticket: EvolutionTicket,
+  implementationWorkspaceRoot: string,
+  sourceWorkspaceRoot: string,
+): string {
+  if (ticket.target === "self_instructions") {
+    return formatSelfInstructionsImplementationPrompt(
+      ticket,
+      implementationWorkspaceRoot,
+      sourceWorkspaceRoot,
+    );
+  }
+  const proposal = ticket.proposal;
+  return [
+    `Implement approved pibot self-evolution ticket ${ticket.id}.`,
+    "",
+    `Title: ${ticket.title}`,
+    `Target: ${ticket.target}`,
+    `Topic: ${proposal.versionTopic ?? ticket.title}`,
+    "",
+    "Proposal summary:",
+    proposal.summary,
+    "",
+    "Diagnosis:",
+    proposal.diagnosis,
+    "",
+    "Risk:",
+    proposal.risk,
+    "",
+    "Rollback plan:",
+    proposal.rollbackPlan,
+    "",
+    "Boundaries:",
+    `- Work inside the isolated implementation workspace at ${implementationWorkspaceRoot}.`,
+    `- The protected source repository is ${sourceWorkspaceRoot}; do not try to edit it directly.`,
+    "- This is the agent's own runtime codebase, not the user's ordinary session workspace.",
+    "- The ticket has already been approved through the self-evolution control plane; do not enter Plan Mode, write PLAN.md, or ask for a second plan approval.",
+    "- Make only the source changes needed for this approved ticket.",
+    "- Do not edit .pibot/evolution/tickets.json, .pibot/evolution/audit.jsonl, or evolution context JSONL files directly.",
+    "- The control plane will validate this isolated workspace and publish checked changes back to the source repository after your run completes.",
+    "- You may run local validation, but the final publish does not depend on you editing the protected source repository.",
+    "- Report changed files, validation commands, failures, and remaining risks in the final answer.",
+  ].join("\n");
+}
+
+function formatSelfInstructionsImplementationPrompt(
+  ticket: EvolutionTicket,
+  implementationWorkspaceRoot: string,
+  sourceWorkspaceRoot: string,
+): string {
+  const proposal = ticket.proposal;
+  return [
+    `Implement approved pibot self-instructions ticket ${ticket.id}.`,
+    "",
+    `Title: ${ticket.title}`,
+    `Target: ${ticket.target}`,
+    `Topic: ${proposal.versionTopic ?? ticket.title}`,
+    "",
+    "Proposal summary:",
+    proposal.summary,
+    "",
+    "Diagnosis:",
+    proposal.diagnosis,
+    "",
+    "Risk:",
+    proposal.risk,
+    "",
+    "Rollback plan:",
+    proposal.rollbackPlan,
+    "",
+    ...(proposal.proposedSelfInstructions === undefined ||
+      proposal.proposedSelfInstructions.trim().length === 0
+      ? []
+      : [
+          "Approved draft self-instructions:",
+          proposal.proposedSelfInstructions,
+          "",
+        ]),
+    "Boundaries:",
+    `- Work inside the isolated self-instructions workspace at ${implementationWorkspaceRoot}.`,
+    `- The protected source repository is ${sourceWorkspaceRoot}; do not edit it directly.`,
+    `- Edit ${selfInstructionsFileName()} in the isolated workspace. The control plane will version and publish that file after your run completes.`,
+    "- This is the agent's own future behavior guidance, not the user's ordinary session workspace.",
+    "- The ticket has already been approved through the self-evolution control plane; do not enter Plan Mode, write PLAN.md, or ask for a second plan approval.",
+    "- Keep the final instructions narrow, actionable, reversible, and scoped to future pibot behavior.",
+    "- Do not encode transient ticket details unless they are reusable as future guidance.",
+    "- Do not edit .pibot/evolution/tickets.json, .pibot/evolution/audit.jsonl, or evolution context JSONL files directly.",
+    `- Report the final ${selfInstructionsFileName()} changes, risks, and any validation notes in the final answer.`,
+  ].join("\n");
+}
+
+function formatEvolutionWorkspacePrompt(
+  implementationWorkspaceRoot: string,
+  sourceWorkspaceRoot: string,
+  tickets: readonly EvolutionTicket[],
+  currentTicketId: string,
+  activeRuntimeVersion: RuntimeCodeVersion | undefined,
+): string {
+  return [
+    "Tool workspace:",
+    `You are implementing an approved self-evolution ticket inside an isolated copy of pibot: ${implementationWorkspaceRoot}`,
+    `The source repository is ${sourceWorkspaceRoot}, but tools are intentionally scoped to the isolated copy.`,
+    "Tool paths are relative to the isolated implementation workspace.",
+    "Do not modify files outside this workspace.",
+    "Do not directly edit control-plane state under .pibot/; the WebUI evolution controller records ticket status and ticket-scoped context.",
+    "",
+    formatEvolutionTopicIndex(tickets, currentTicketId, activeRuntimeVersion),
+  ].join("\n");
+}
+
+function formatSelfInstructionsWorkspacePrompt(
+  implementationWorkspaceRoot: string,
+  sourceWorkspaceRoot: string,
+  tickets: readonly EvolutionTicket[],
+  currentTicketId: string,
+): string {
+  return [
+    "Tool workspace:",
+    `You are implementing an approved self-instructions ticket inside an isolated workspace: ${implementationWorkspaceRoot}`,
+    `The source repository is ${sourceWorkspaceRoot}, but tools are intentionally scoped to the isolated self-instructions workspace.`,
+    "Tool paths are relative to the isolated workspace.",
+    `Edit only ${selfInstructionsFileName()} unless you need temporary notes for yourself.`,
+    "Do not modify files outside this workspace.",
+    "Do not directly edit control-plane state under .pibot/; the WebUI evolution controller records ticket status and ticket-scoped context.",
+    "",
+    formatEvolutionTopicIndex(tickets, currentTicketId, undefined),
+  ].join("\n");
+}
+
+function formatEvolutionTopicIndex(
+  tickets: readonly EvolutionTicket[],
+  currentTicketId: string,
+  activeRuntimeVersion: RuntimeCodeVersion | undefined,
+): string {
+  const cutoff = activeRuntimeVersion?.createdAt;
+  const topics = tickets
+    .slice()
+    .filter((ticket) =>
+      ticket.id === currentTicketId ||
+      cutoff === undefined ||
+      topicTimeForTicket(ticket) <= cutoff
+    )
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+    .slice(0, 20)
+    .map(evolutionContextTopic);
+  if (topics.length === 0) {
+    return "Evolution topics index: no prior tickets.";
+  }
+  return [
+    "Evolution topics index:",
+    "Detailed handling context is isolated per ticket; use this list only as a short topic/status map.",
+    ...(activeRuntimeVersion === undefined
+      ? []
+      : [
+          `Topic cutoff: active runtime version v${String(activeRuntimeVersion.number).padStart(4, "0")} created at ${activeRuntimeVersion.createdAt}; omit later non-current ticket topics.`,
+        ]),
+    ...topics.map((topic) => [
+      "- ",
+      topic.ticketId === currentTicketId ? "[current] " : "",
+      topic.ticketId,
+      ": ",
+      topic.topic,
+      " [",
+      topic.status,
+      "/",
+      topic.target,
+      "]",
+    ].join("")),
+  ].join("\n");
+}
+
+function topicTimeForTicket(ticket: EvolutionTicket): string {
+  return ticket.rollout?.appliedAt ?? ticket.updatedAt ?? ticket.createdAt;
+}
+
+function runtimeCodePublishHasChanges(publish: RuntimeCodePublishReport): boolean {
+  return publish.changedFiles.length > 0 || publish.deletedFiles.length > 0;
+}
+
+function formatEvolutionImplementationSummary(input: {
+  readonly agentSummary?: string;
+  readonly reason: string;
+  readonly errorCode?: string;
+  readonly stagingRoot: string;
+  readonly validation?: RuntimeCodeValidationReport | SelfInstructionsValidationReport;
+  readonly publish?: RuntimeCodePublishReport;
+  readonly postRunError?: string;
+}): string {
+  const validationLines = input.validation === undefined
+    ? ["Validation: not run."]
+    : [
+        `Validation: ${input.validation.status}.`,
+        ...input.validation.checks.map((check) =>
+          `- ${check.name}: ${check.passed ? "passed" : "failed"} - ${check.message}`
+        ),
+      ];
+  const publishLines = input.publish === undefined
+    ? ["Publish: not run."]
+    : [
+        input.publish.conflicts.length === 0
+          ? "Publish: completed."
+          : `Publish: blocked by conflicts in ${input.publish.conflicts.join(", ")}.`,
+        `Changed files: ${input.publish.changedFiles.length === 0 ? "none" : input.publish.changedFiles.join(", ")}`,
+        `Deleted files: ${input.publish.deletedFiles.length === 0 ? "none" : input.publish.deletedFiles.join(", ")}`,
+      ];
+  return [
+    input.agentSummary ?? `Implementation run ended with reason=${input.reason}${input.errorCode === undefined ? "" : `, error=${input.errorCode}`}.`,
+    "",
+    `Isolated workspace: ${input.stagingRoot}`,
+    ...validationLines,
+    ...publishLines,
+    ...(input.postRunError === undefined ? [] : [`Issue: ${input.postRunError}`]),
+  ].join("\n").slice(0, 4000);
+}
+
+function optionalSummaryField<K extends string, T>(
+  key: K,
+  value: T | undefined,
+): Partial<Record<K, T>> {
+  return value === undefined ? {} : { [key]: value } as Record<K, T>;
+}
+
+function finalAssistantSummary(messages: readonly LlmMessage[]): string | undefined {
+  const summary = messages
+    .slice()
+    .reverse()
+    .find((message) =>
+      message.role === "assistant" && message.content.trim().length > 0
+    )
+    ?.content.trim();
+  if (summary === undefined) {
+    return undefined;
+  }
+  return summary.length <= 2000 ? summary : `${summary.slice(0, 1997)}...`;
+}
+
+function evolutionImplementationApprovalMode(
+  mode: ToolApprovalMode,
+): ToolApprovalMode {
+  return mode === "read-only" ? "workspace-write" : mode;
+}
+
+export interface WebUiSelfEvolutionRequest {
+  readonly summary: string;
+  readonly details: string;
+  readonly severity: EvolutionSeverity;
+  readonly scope: EvolutionScope;
+  readonly target: EvolutionTarget;
+}
+
+const EVOLUTION_IMPLEMENTATION_DISABLED_TOOLS = [
+  "enter_plan_mode",
+  "update_plan",
+  "exit_plan_mode",
+] as const;
+
+const EVOLUTION_IMPLEMENTATION_DISABLED_TOOL_SET = new Set<string>(
+  EVOLUTION_IMPLEMENTATION_DISABLED_TOOLS,
+);
+
+function selfEvolutionToolSchemas(
+  tools: readonly LlmToolSchema[],
+): readonly LlmToolSchema[] {
+  return tools.filter((tool) => tool.name === "create_evolution_task");
+}
+
+function evolutionImplementationToolSchemas(
+  tools: readonly LlmToolSchema[],
+): readonly LlmToolSchema[] {
+  return tools.filter(
+    (tool) => !EVOLUTION_IMPLEMENTATION_DISABLED_TOOL_SET.has(tool.name),
+  );
+}
+
+function formatSelfEvolutionTicketPrompt(text: string): string {
+  return [
+    "This WebUI message appears to request pibot self-evolution.",
+    "File exactly one reviewable ticket with create_evolution_task. Choose the ticket severity, scope, and target from the user's request; do not rely on runtime-side heuristics for that classification.",
+    "Do not edit ordinary workspace files in this run.",
+    "",
+    "Original request:",
+    text.trim(),
+  ].join("\n");
+}
+
+function findCreatedEvolutionTicketId(
+  messages: readonly LlmMessage[],
+): string | undefined {
+  for (const message of messages) {
+    if (message.role !== "tool") {
+      continue;
+    }
+    const parsed = parseJsonRecord(message.content);
+    if (parsed === undefined || parsed.ok !== true || !isRecord(parsed.output)) {
+      continue;
+    }
+    const ticketId = parsed.output.ticketId;
+    if (typeof ticketId === "string" && ticketId.length > 0) {
+      return ticketId;
+    }
+  }
+  return undefined;
+}
+
+function parseJsonRecord(
+  value: string,
+): Readonly<Record<string, unknown>> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function detectWebUiSelfEvolutionRequest(
+  text: string,
+): WebUiSelfEvolutionRequest | undefined {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  const mentionsPibot = /\bpibot\b/iu.test(trimmed);
+  const mentionsSelfEvolution =
+    /自进化|self[-\s]?evolution|agent\s+self|agent[-\s]?evolution|self[-\s]?evaluation/iu.test(
+      trimmed,
+    );
+  const mentionsWebUi = /\bweb\s?ui\b|webui/iu.test(trimmed);
+  const mentionsConversation =
+    /\bconversation\b|\bsession\b|会话|聊天/iu.test(trimmed);
+  const mentionsPibotControlledSurface =
+    /\bweb\s?ui\b|webui|system\s?prompt|系统提示词|提示词|工单|ticket|审批|approval|沙箱|sandbox|工具|tool|runtime|运行时|版本|version|回退|rollback|activate|启用|自进化链路|agent[-\s]?evolution|self[-\s]?evaluation|channel|频道|会话|界面|页面|按钮|图标|列表|显示|样式|布局|交互|体验|刷新|输入框|发送/iu.test(
+      trimmed,
+    );
+  const mentionsWebUiSelfEvolutionSurface =
+    mentionsWebUi &&
+    /pibot|自进化|self[-\s]?evolution|agent[-\s]?evolution|self[-\s]?evaluation|自进化链路|工单|ticket|runtime|运行时|版本|version|回退|rollback|activate|启用/iu.test(
+      trimmed,
+    );
+  const mentionsPibotSurface =
+    mentionsSelfEvolution ||
+    (mentionsPibot && mentionsPibotControlledSurface) ||
+    mentionsWebUiSelfEvolutionSurface ||
+    (mentionsConversation && /pibot|自进化|self[-\s]?evolution|agent[-\s]?evolution|self[-\s]?evaluation/iu.test(trimmed));
+  const asksForAgentChange =
+    /进行自进化|自进化一下|问题|bug|错误|异常|失败|残留|需要|修复|改进|优化|删除|移除|去掉|不要|不用|不能|不会|没有|没法|没能|应该|希望|触发|跳进去|进入|绕过|越界|工作区之外|权限|边界|太多|过多|多余|只要|只显示|只保留|保留|隐藏|减少|精简|简化|就行|就可以|fix|issue|problem|broken|improve|should|must|leak|outside workspace/iu.test(
+      trimmed,
+    );
+
+  if (!mentionsPibotSurface || !asksForAgentChange) {
+    return undefined;
+  }
+
+  const scope = classifyEvolutionScope(trimmed);
+  const target = classifyEvolutionTarget(trimmed);
+  return {
+    summary: summarizeSelfEvolutionRequest(trimmed),
+    details: `Original WebUI request:\n${trimmed}`,
+    severity: /critical|严重|安全|越界|工作区之外|outside workspace|权限|泄漏|leak/iu.test(trimmed)
+      ? "critical"
+      : "warning",
+    scope,
+    target,
+  };
+}
+
+class ChannelWorkspaceBoundaryHook implements RuntimeHook {
+  constructor(
+    private readonly options: {
+      readonly workspaceRoot: string;
+    },
+  ) {}
+
+  beforeToolCall(context: {
+    readonly call: {
+      readonly name: string;
+      readonly input: unknown;
+    };
+  }) {
+    if (context.call.name !== "bash") {
+      return undefined;
+    }
+    if (!isRecord(context.call.input)) {
+      return undefined;
+    }
+    const command = context.call.input.command;
+    if (typeof command !== "string") {
+      return undefined;
+    }
+
+    const outsidePath = findOutsideWorkspacePathReference(
+      command,
+      this.options.workspaceRoot,
+    );
+    if (outsidePath === undefined) {
+      return undefined;
+    }
+
+    return {
+      allowed: false as const,
+      reason:
+        "bash command references an absolute path outside this WebUI workspace: " +
+        outsidePath,
+    };
+  }
+}
+
+export function findOutsideWorkspacePathReference(
+  command: string,
+  workspaceRoot: string,
+): string | undefined {
+  const normalizedRoot = path.resolve(workspaceRoot);
+  const absolutePathPattern =
+    /(?:^|[\s"'`=([{;|&])((?:\/[A-Za-z0-9._~+@:%-]+)+\/?)/gu;
+  let match: RegExpExecArray | null;
+  while ((match = absolutePathPattern.exec(command)) !== null) {
+    const candidate = trimShellPath(match[1] ?? "");
+    if (candidate.length === 0 || candidate.startsWith("//")) {
+      continue;
+    }
+    if (isSystemExecutablePath(candidate)) {
+      continue;
+    }
+    if (isPathOutside(normalizedRoot, candidate)) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+function classifyEvolutionScope(text: string): EvolutionScope {
+  if (/工单|ticket/iu.test(text)) {
+    return "runtime";
+  }
+  if (/\bweb\s?ui\b|webui|slack|channel|adapter|会话|频道/iu.test(text)) {
+    return "adapter";
+  }
+  if (
+    /runtime|运行时|sandbox|沙箱|tool|工具|工单|ticket|approval|审批|权限|边界|越界|版本|version|回退|rollback|activate|启用|自进化链路|agent[-\s]?evolution|self[-\s]?evaluation/iu.test(
+      text,
+    )
+  ) {
+    return "runtime";
+  }
+  return "global_agent";
+}
+
+function classifyEvolutionTarget(text: string): EvolutionTarget {
+  if (/prompt|提示词|system prompt/iu.test(text)) {
+    return "prompt";
+  }
+  if (
+    /runtime[_\s-]?code|源码|代码|web\s?ui|webui|server|删除|移除|去掉|不用|太多|过多|多余|只显示|只保留|隐藏|精简|简化|残留|sandbox|沙箱|tool|工具|工单|ticket|bash|channel|频道|显示|界面|页面|按钮|timeline|时间线|topic|版本|version|回退|rollback|样式|布局|换行|交互|体验|刷新|重启|启用|activate|自进化链路|agent[-\s]?evolution|self[-\s]?evaluation|命名|重命名|名字|名称|rename|label|title/iu.test(
+      text,
+    )
+  ) {
+    return "runtime_code";
+  }
+  if (/policy|策略|审批|approval|权限|边界|越界|工作区之外/iu.test(text)) {
+    return "policy";
+  }
+  return "self_instructions";
+}
+
+function summarizeSelfEvolutionRequest(text: string): string {
+  const normalized = text.replace(/\s+/gu, " ").trim();
+  const prefix = "WebUI self-evolution request";
+  const limit = 120;
+  if (normalized.length <= limit) {
+    return `${prefix}: ${normalized}`;
+  }
+  return `${prefix}: ${normalized.slice(0, limit - 1)}...`;
+}
+
+function trimShellPath(value: string): string {
+  return value.replace(/[),.;:]+$/u, "");
+}
+
+function isSystemExecutablePath(value: string): boolean {
+  return /^\/(?:bin|sbin|usr\/bin|usr\/sbin|usr\/local\/bin|opt\/homebrew\/bin)\//u.test(
+    value,
+  );
+}
+
+function isPathOutside(workspaceRoot: string, candidate: string): boolean {
+  const relativePath = path.relative(workspaceRoot, path.resolve(candidate));
+  return (
+    relativePath === ".." ||
+    relativePath.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relativePath)
+  );
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null;
+}
+
+function sanitizeChannelId(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_.-]+/gu, "_").slice(0, 80) || "default";
+}
