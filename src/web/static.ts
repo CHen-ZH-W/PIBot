@@ -30,6 +30,7 @@ export const WEBUI_CSS = `
   --ok: #22c55e;
   --warn: #eab308;
   --focus: #60a5fa;
+  --app-header-height: 50px;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
@@ -170,6 +171,14 @@ select:focus {
   display: none;
 }
 
+.shell.skills-shell {
+  grid-template-columns: 248px minmax(0, 1fr);
+}
+
+.shell.skills-shell .inspector {
+  display: none;
+}
+
 .sidebar,
 .main,
 .inspector {
@@ -184,13 +193,17 @@ select:focus {
   flex-direction: column;
 }
 
-.brand {
-  height: 50px;
+.brand,
+.topbar {
+  height: var(--app-header-height);
+  min-height: var(--app-header-height);
+  flex: 0 0 var(--app-header-height);
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 0 14px;
   border-bottom: 1px solid var(--line);
+  background: #141414;
 }
 
 .brand strong {
@@ -247,6 +260,7 @@ select:focus {
   align-items: center;
   gap: 6px;
   cursor: pointer;
+  overflow: hidden;
 }
 
 .session-item:hover,
@@ -261,12 +275,6 @@ select:focus {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.session-meta {
-  color: var(--dim);
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
 }
 
 .session-delete {
@@ -284,6 +292,32 @@ select:focus {
   border-color: rgba(239, 68, 68, 0.45);
 }
 
+.ticket-row .session-delete {
+  margin-left: auto;
+  flex: 0 0 24px;
+}
+
+.item-toolbar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.item.runtime-version-item {
+  position: relative;
+}
+
+.item.runtime-version-item .session-delete {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+}
+
+.item.runtime-version-item .item-title {
+  padding-right: 26px;
+}
+
 .sidebar-bottom {
   padding: 10px;
   border-top: 1px solid var(--line-soft);
@@ -295,12 +329,29 @@ select:focus {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  background: transparent;
+  background: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 20px;
+  padding: 6px 14px;
+  margin-bottom: 4px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 1px 3px rgba(0, 0, 0, 0.3);
+  transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+
+.evolution-entry:last-child {
+  margin-bottom: 0;
 }
 
 .evolution-entry.active {
-  background: #232323;
-  border-color: var(--line);
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.15);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 2px 6px rgba(0, 0, 0, 0.35);
 }
 
 .count {
@@ -335,6 +386,12 @@ select:focus {
   gap: 6px;
   color: var(--dim);
   font-size: 12px;
+  overflow: hidden;
+}
+
+.ticket-row .item-meta {
+  flex-wrap: nowrap;
+  align-items: center;
 }
 
 .main {
@@ -342,26 +399,21 @@ select:focus {
   flex-direction: column;
 }
 
-.topbar {
-  height: 50px;
-  border-bottom: 1px solid var(--line);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 14px;
-  background: #141414;
-}
-
 .topbar-left {
   min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
+  overflow: hidden;
+  flex: 1;
 }
 
 .topbar h1 {
   margin: 0;
   font-size: 15px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .toolbar {
@@ -490,6 +542,12 @@ select:focus {
   font-weight: 650;
 }
 
+.panel-header .panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .panel-body {
   padding: 12px;
   display: grid;
@@ -501,6 +559,58 @@ select:focus {
   gap: 8px;
 }
 
+.skills-list {
+  display: grid;
+  gap: 8px;
+}
+
+.skill-row {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  text-align: left;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.skill-row .skill-title {
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.skill-row .item-meta {
+  flex-wrap: nowrap;
+  align-items: center;
+  min-width: 0;
+}
+
+.skill-row .skill-location {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-row .skill-description {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  min-width: 0;
+}
+
 .ticket-row {
   width: 100%;
   border: 1px solid var(--line);
@@ -508,11 +618,13 @@ select:focus {
   background: var(--panel-2);
   color: var(--text);
   text-align: left;
-  height: auto;
-  padding: 10px;
-  display: grid;
-  gap: 6px;
+  height: 80px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   cursor: pointer;
+  overflow: hidden;
 }
 
 .ticket-row:hover,
@@ -525,12 +637,29 @@ select:focus {
   display: flex;
   gap: 8px;
   justify-content: space-between;
+  align-items: flex-start;
+  min-width: 0;
+  flex: 0 0 38px;
+}
+
+.ticket-row .line strong {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-height: 38px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 19px;
 }
 
 .badge {
   display: inline-flex;
   align-items: center;
-  min-height: 22px;
+  height: 22px;
   padding: 0 7px;
   border-radius: 999px;
   border: 1px solid var(--line);
@@ -538,6 +667,7 @@ select:focus {
   background: #141414;
   font-size: 12px;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .badge.ok {
@@ -573,6 +703,36 @@ select:focus {
   margin-bottom: 5px;
 }
 
+.file-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.file-picker input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.file-picker-btn {
+  flex-shrink: 0;
+}
+
+.file-picker-label {
+  color: var(--dim);
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .timeline {
   display: grid;
   gap: 8px;
@@ -605,6 +765,27 @@ select:focus {
   border-color: rgba(234, 179, 8, 0.35);
   color: #fef08a;
   background: rgba(234, 179, 8, 0.08);
+}
+
+.action-status.danger {
+  border-color: rgba(239, 68, 68, 0.4);
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.action-error {
+  flex: 0 0 auto;
+  margin-bottom: 12px;
+}
+
+.action-error span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.action-error button {
+  margin-left: auto;
+  flex: 0 0 auto;
 }
 
 .spinner {
@@ -1064,6 +1245,7 @@ textarea:disabled {
 export const WEBUI_SCRIPT = `
 const app = document.getElementById("app");
 const EVOLUTION_CONVERSATION_ID = "self-evaluation";
+const PENDING_NEW_SESSION = "__pending_new__";
 const state = {
   view: "sessions",
   snapshot: null,
@@ -1074,11 +1256,17 @@ const state = {
   pendingActions: {},
   activeEvolutionTicketId: null,
   evolutionPane: "tickets",
+  evolutionContextLoaded: false,
   selectedTicketId: null,
   selectedConversationId: null,
+  pendingNewSession: false,
   autoScrollMain: true,
   loading: true,
   error: null,
+  actionError: null,
+  skillImportFiles: [],
+  skillImportFolderName: "",
+  skillImportOverwrite: false,
   drafts: {}
 };
 let renderScheduled = false;
@@ -1104,6 +1292,13 @@ function escapeHtml(value) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function errorMessage(error) {
+  if (error && typeof error.message === "string" && error.message.length > 0) {
+    return error.message;
+  }
+  return String(error || "Unexpected error");
 }
 
 function saveDraft() {
@@ -1247,6 +1442,17 @@ function activeRuntimeVersionId() {
   return active ? active.versionId : "";
 }
 
+function pendingRuntimeActivation() {
+  return state.snapshot && state.snapshot.pendingRuntimeActivation
+    ? state.snapshot.pendingRuntimeActivation
+    : null;
+}
+
+function pendingRuntimeActivationVersionId() {
+  var pending = pendingRuntimeActivation();
+  return pending ? pending.versionId : "";
+}
+
 function runtimeVersionLabel(version) {
   if (!version) return "";
   var number = Number.isFinite(Number(version.number))
@@ -1276,6 +1482,10 @@ function selfInstructionVersionForTicket(ticket) {
 
 function isRuntimeVersionActive(versionId) {
   return !!versionId && activeRuntimeVersionId() === versionId;
+}
+
+function isRuntimeVersionPendingActivation(versionId) {
+  return !!versionId && pendingRuntimeActivationVersionId() === versionId;
 }
 
 function badgeClass(value) {
@@ -1414,12 +1624,14 @@ async function refresh(options) {
     : !hasLoadedState();
   state.loading = showLoading;
   state.error = null;
+  state.actionError = null;
   if (showLoading) {
     render();
   }
   try {
     const data = await api("/api/state");
     state.snapshot = data.evolution;
+    state.evolutionContextLoaded = false;
     state.runtime = data.runtime || null;
     state.conversations = data.conversations;
     state.skills = data.skills || { skills: [], disabledSkills: [], issues: [] };
@@ -1428,6 +1640,9 @@ async function refresh(options) {
     }
     if (!state.selectedConversationId && data.conversations[0]) {
       state.selectedConversationId = data.conversations[0].id;
+    }
+    if (state.view === "evolution" && state.evolutionPane === "context") {
+      await ensureEvolutionContextLoaded();
     }
   } catch (error) {
     state.error = error.message;
@@ -1486,9 +1701,17 @@ function patchTicket(ticketId, patch) {
 function updateEvolutionContext(context) {
   if (!context) return;
   state.snapshot = Object.assign({}, state.snapshot || {}, { context: context });
+  state.evolutionContextLoaded = true;
+}
+
+async function ensureEvolutionContextLoaded() {
+  if (state.evolutionContextLoaded) return;
+  const result = await api("/api/evolution/context");
+  updateEvolutionContext(result.context);
 }
 
 function selectedConversation() {
+  if (state.pendingNewSession) return null;
   return state.conversations.find(function(conversation) {
     return conversation.id === state.selectedConversationId;
   }) || state.conversations[0] || null;
@@ -1616,8 +1839,9 @@ function render() {
   }).length;
   const shellClass = state.view === "sessions"
     ? "shell sessions-shell"
-    : (state.view === "evolution" && state.evolutionPane === "context" ? "shell evolution-focus-shell" : "shell");
-  const contentClass = state.view === "evolution" && state.evolutionPane === "tickets"
+    : (state.view === "skills" ? "shell skills-shell"
+      : (state.view === "evolution" && state.evolutionPane === "context" ? "shell evolution-focus-shell" : "shell"));
+  const contentClass = (state.view === "evolution" && state.evolutionPane === "tickets") || state.view === "skills"
     ? "content ticket-workspace-content"
     : "content";
   app.innerHTML =
@@ -1629,16 +1853,16 @@ function render() {
           '<div class="session-list">' + (state.conversations.length === 0 ? '<div class="empty">No sessions.</div>' : state.conversations.map(renderSidebarConversation).join("")) + '</div>' +
         '</div>' +
         '<div class="sidebar-bottom">' +
-          '<button class="evolution-entry ' + (state.view === "skills" ? "active" : "") + '" data-view="skills"><span>Skills</span><span class="count">' + ((state.skills && state.skills.skills && state.skills.skills.length) || 0) + '</span></button>' +
-          '<button class="evolution-entry ' + (state.view === "evolution" ? "active" : "") + '" data-view="evolution"><span>#self-evaluation</span><span class="count">' + pendingCount + '</span></button>' +
+          '<button class="evolution-entry ' + (state.view === "skills" ? "active" : "") + '" data-view="skills"><span>Skills</span></button>' +
+          '<button class="evolution-entry ' + (state.view === "evolution" ? "active" : "") + '" data-view="evolution"><span>Self-evaluation</span><span class="count">' + pendingCount + '</span></button>' +
         '</div>' +
       '</aside>' +
       '<main class="main">' +
         renderTopbar(activeTicket) +
-        '<div class="' + contentClass + '" data-scroll-key="main">' + renderMain(activeTicket, activeConversation, tickets) + '</div>' +
+        '<div class="' + contentClass + '" data-scroll-key="main">' + renderActionError() + renderMain(activeTicket, activeConversation, tickets) + '</div>' +
       '</main>' +
       '<aside class="inspector">' +
-        '<div class="topbar"><h1>Inspector</h1></div>' +
+        '<div class="topbar"><div class="topbar-left"><h1>Inspector</h1></div><div class="toolbar"></div></div>' +
         '<div class="content">' + renderInspector(activeTicket) + '</div>' +
       '</aside>' +
     '</div>';
@@ -1747,22 +1971,22 @@ function renderTopbar(ticket) {
   const conversation = selectedConversation();
   const title = state.view === "evolution"
     ? evolutionTopbarTitle(ticket)
-    : (state.view === "skills" ? "Skills" : (conversation ? conversation.title : "Sessions"));
+    : (state.view === "skills" ? "Skills" : (conversation ? conversation.title : (state.pendingNewSession ? "New Session" : "Sessions")));
   const leading = state.view === "evolution" && state.evolutionPane === "context"
-    ? '<button class="ghost btn-icon" data-action="back-evolution" title="返回" aria-label="返回">←</button>'
+    ? '<button class="ghost btn-icon" data-action="back-evolution" title="Back" aria-label="Back">←</button>'
     : '';
   const refreshPending = pendingLabel("refresh");
   const actions = state.view === "sessions"
     ? ''
     : (state.view === "skills" ? '' : renderEvolutionTopbarActions(ticket));
-  return '<div class="topbar"><div class="topbar-left">' + leading + '<h1>' + escapeHtml(title) + '</h1></div><div class="toolbar">' + actions + '<button class="ghost btn-icon' + pendingClass(refreshPending) + '" data-action="refresh"' + disabledAttr(state.loading || !!refreshPending) + ' title="' + (refreshPending || "Refresh") + '"><span class="refresh-icon">↻</span></button></div></div>';
+  return '<div class="topbar"><div class="topbar-left">' + leading + '<h1 title="' + escapeHtml(title) + '">' + escapeHtml(title) + '</h1></div><div class="toolbar">' + actions + '<button class="ghost btn-icon' + pendingClass(refreshPending) + '" data-action="refresh"' + disabledAttr(state.loading || !!refreshPending) + ' title="' + (refreshPending || "Refresh") + '"><span class="refresh-icon">↻</span></button></div></div>';
 }
 
 function evolutionTopbarTitle(ticket) {
   if (state.evolutionPane === "context" && ticket) {
-    return "#self-evaluation / Context";
+    return "Self-evaluation / Context";
   }
-  return "#self-evaluation";
+  return "Self-evaluation";
 }
 
 function renderEvolutionTopbarActions(ticket) {
@@ -1772,7 +1996,6 @@ function renderEvolutionTopbarActions(ticket) {
 function renderSidebarConversation(conversation) {
   return '<div class="session-item ' + (conversation.id === state.selectedConversationId ? "active" : "") + '" data-conversation-id="' + escapeHtml(conversation.id) + '">' +
     '<span class="session-name" title="' + escapeHtml(conversation.title) + '">' + escapeHtml(conversation.title) + '</span>' +
-    '<span class="session-meta">' + conversation.messages.length + '</span>' +
     '<button class="session-delete" title="Delete session" aria-label="Delete session" data-action="delete-conversation" data-conversation-id="' + escapeHtml(conversation.id) + '">x</button>' +
   '</div>';
 }
@@ -1810,12 +2033,22 @@ function upsertConversation(conversation, options) {
     state.conversations = [conversation].concat(state.conversations);
   } else {
     state.conversations = state.conversations.map(function(item) {
-      return item.id === conversation.id ? conversation : item;
+      return item.id === conversation.id ? mergeConversationForState(item, conversation) : item;
     });
   }
   if (options && options.select) {
     state.selectedConversationId = conversation.id;
   }
+}
+
+function mergeConversationForState(existing, incoming) {
+  if (!existing) return incoming;
+  var existingMessages = Array.isArray(existing.messages) ? existing.messages : [];
+  var incomingMessages = Array.isArray(incoming.messages) ? incoming.messages : [];
+  if (existingMessages.length > 0 && incomingMessages.length === 0) {
+    return Object.assign({}, incoming, { messages: existingMessages });
+  }
+  return incoming;
 }
 
 function pushLiveStatus(live, line) {
@@ -1945,11 +2178,13 @@ function ticketActionKey(ticketId) {
 }
 
 function actionKeyForTarget(action, target) {
-  if (action === "save-proposal" || action === "approve-ticket" || action === "start-implementation" || action === "reject-ticket" || action === "activate-runtime") {
+  if (action === "save-proposal" || action === "approve-ticket" || action === "start-implementation" || action === "reject-ticket" || action === "activate-runtime" || action === "delete-ticket") {
     return ticketActionKey(target.dataset.ticketId || "");
   }
   if (action === "activate-version") return "runtime-version:" + (target.dataset.versionId || "");
   if (action === "rollback-version") return "version:" + (target.dataset.versionId || "");
+  if (action === "delete-runtime-version") return "runtime-delete:" + (target.dataset.versionId || "");
+  if (action === "delete-self-version") return "self-delete:" + (target.dataset.versionId || "");
   if (action === "append-evolution-context") return "evolution-context";
   if (action === "import-skill") return "skill-import";
   if (action === "send-session-message") return "session:" + (target.dataset.conversationId || "");
@@ -1975,23 +2210,35 @@ function renderMain(ticket, conversation, tickets) {
   return renderEvolution(ticket, tickets);
 }
 
+function renderActionError() {
+  if (!state.actionError || state.error) return "";
+  return '<div class="action-status danger action-error" role="alert">' +
+    '<span>' + escapeHtml(state.actionError) + '</span>' +
+    '<button class="ghost" data-action="dismiss-action-error">Dismiss</button>' +
+  '</div>';
+}
+
 function renderSkills() {
   const skills = (state.skills && state.skills.skills) || [];
   const issues = (state.skills && state.skills.issues) || [];
   const pending = pendingLabel("skill-import");
-  return '<div class="split">' +
-    '<section class="panel">' +
+  const importFiles = state.skillImportFiles || [];
+  const importLabel = importFiles.length === 0
+    ? "No folder chosen"
+    : state.skillImportFolderName + " (" + importFiles.length + " file" + (importFiles.length === 1 ? "" : "s") + ")";
+  return '<div class="split ticket-workspace skills-workspace">' +
+    '<section class="panel ticket-panel">' +
       '<div class="panel-header"><span class="panel-title">Skill Index</span><span class="badge">' + skills.length + '</span></div>' +
-      '<div class="panel-body">' +
+      '<div class="panel-body"><div class="skills-list">' +
         (issues.length === 0 ? "" : '<div class="action-status warn"><span>' + escapeHtml(issues.length + " scanner warning" + (issues.length === 1 ? "" : "s")) + '</span></div>') +
         (skills.length === 0 ? '<div class="empty">No skills.</div>' : skills.map(renderSkillRow).join("")) +
-      '</div>' +
+      '</div></div>' +
     '</section>' +
     '<section class="panel">' +
       '<div class="panel-header"><span class="panel-title">Import</span></div>' +
       '<div class="panel-body">' +
-        '<div class="field"><label for="skill-import-files">Folder</label><input id="skill-import-files" type="file" multiple webkitdirectory directory></div>' +
-        '<label class="checkbox-line"><input id="skill-import-overwrite" type="checkbox"> <span>Overwrite existing</span></label>' +
+        '<div class="field"><label>Folder</label><div class="file-picker"><input id="skill-import-files" type="file" multiple webkitdirectory directory><button type="button" class="file-picker-btn" data-target="skill-import-files">Choose Folder</button><span class="file-picker-label" id="skill-import-files-label">' + escapeHtml(importLabel) + '</span></div></div>' +
+        '<label class="checkbox-line"><input id="skill-import-overwrite" type="checkbox"' + (state.skillImportOverwrite ? " checked" : "") + '> <span>Overwrite existing</span></label>' +
         '<div class="toolbar"><button class="primary' + pendingClass(pending) + '" data-action="import-skill"' + disabledAttr(!!pending) + '>' + (pending || "Import") + '</button></div>' +
       '</div>' +
     '</section>' +
@@ -1999,10 +2246,10 @@ function renderSkills() {
 }
 
 function renderSkillRow(skill) {
-  return '<div class="item">' +
-    '<div class="item-title">' + escapeHtml(skill.name) + '</div>' +
-    '<div class="item-meta"><span class="badge">' + escapeHtml(skill.source) + '</span><span>' + escapeHtml(skill.location) + '</span>' + (skill.disableModelInvocation ? '<span class="badge warn">manual</span>' : '') + '</div>' +
-    '<div class="approval-summary">' + escapeHtml(skill.description) + '</div>' +
+  return '<div class="skill-row">' +
+    '<div class="skill-title">' + escapeHtml(skill.name) + '</div>' +
+    '<div class="item-meta"><span class="badge">' + escapeHtml(skill.source) + '</span><span class="skill-location" title="' + escapeHtml(skill.location) + '">' + escapeHtml(skill.location) + '</span>' + (skill.disableModelInvocation ? '<span class="badge warn">manual</span>' : '') + '</div>' +
+    '<div class="skill-description">' + escapeHtml(skill.description) + '</div>' +
   '</div>';
 }
 
@@ -2030,12 +2277,14 @@ function renderEvolutionContextPage(ticket) {
     ? liveRunFor(EVOLUTION_CONVERSATION_ID)
     : null;
   const notePending = pendingLabel("evolution-context");
+  const loadPending = pendingLabel("evolution-context-load");
   const contextMessages = evolutionContextMessages(ticket.id);
   const messages = renderCachedContextMessageSequence(contextMessages, 30) + renderLiveMessage(live, EVOLUTION_CONVERSATION_ID);
   return '<div class="panel evolution-context-page">' +
     '<div class="panel-header"><span class="panel-title">' + escapeHtml(ticket.title) + '</span><span class="badge ' + badgeClass(ticket.status) + '">' + escapeHtml(ticket.status) + '</span></div>' +
       '<div class="panel-body">' +
         '<div class="item-meta"><span title="' + escapeHtml(ticket.id) + '">' + escapeHtml(ticketDisplayId(ticket)) + '</span><span>' + escapeHtml(ticket.target) + '</span><span>' + contextMessages.length + ' context messages</span></div>' +
+        (loadPending ? '<div class="action-status"><span class="spinner"></span><span>' + escapeHtml(loadPending) + '</span></div>' : '') +
         '<div class="messages">' + (messages.length === 0 ? '<div class="empty">No ticket context yet.</div>' : messages) + '</div>' +
         '<div class="field"><label for="evolution-context-message">Note</label><textarea id="evolution-context-message" style="min-height:78px"' + disabledAttr(!!notePending) + '></textarea></div>' +
         '<div class="toolbar"><button class="' + pendingClass(notePending).trim() + '" data-action="append-evolution-context"' + disabledAttr(!!notePending) + '>' + (notePending || "Add Note") + '</button></div>' +
@@ -2052,7 +2301,9 @@ function renderTicketRow(ticket) {
     : '';
   return '<div class="ticket-row ' + (ticket.id === state.selectedTicketId ? "active" : "") + '" data-ticket-id="' + escapeHtml(ticket.id) + '">' +
     '<span class="line"><strong>' + escapeHtml(ticket.title) + '</strong><span class="badge ' + badgeClass(ticket.status) + '">' + escapeHtml(ticket.status) + '</span></span>' +
-    '<span class="item-meta"><span title="' + escapeHtml(ticket.id) + '">' + escapeHtml(ticketDisplayId(ticket)) + '</span>' + versionText + (activeRun ? '<span>running</span>' : '') + '</span>' +
+    '<span class="item-meta"><span title="' + escapeHtml(ticket.id) + '">' + escapeHtml(ticketDisplayId(ticket)) + '</span>' + versionText + (activeRun ? '<span>running</span>' : '') +
+      '<button class="session-delete" title="Delete ticket" aria-label="Delete ticket" data-action="delete-ticket" data-ticket-id="' + escapeHtml(ticket.id) + '">×</button>' +
+    '</span>' +
   '</div>';
 }
 
@@ -2085,7 +2336,7 @@ function renderTicketDetail(ticket) {
         '<div class="field"><label>Ticket</label><span class="badge" title="' + escapeHtml(ticket.id) + '">' + escapeHtml(ticketDisplayId(ticket)) + '</span></div>' +
         versionField +
       '</div>' +
-      fieldInput("ticket-title", "Title", ticket.title) +
+      fieldInput("ticket-title", "Title", ticket.title, " maxlength=\\"25\\"") +
       fieldInput("proposal-version-topic", "Version topic", proposal.versionTopic || ticket.title) +
       fieldTextarea("proposal-summary", "Summary", proposal.summary, 90) +
       fieldTextarea("proposal-diagnosis", "Diagnosis", proposal.diagnosis, 120) +
@@ -2134,6 +2385,8 @@ function renderTicketActions(ticket, options) {
       buttons.push('<button disabled>No Version Snapshot</button>');
     } else if (isRuntimeVersionActive(version.id)) {
       buttons.push('<button class="primary" disabled>Active Version</button>');
+    } else if (isRuntimeVersionPendingActivation(version.id)) {
+      buttons.push('<button class="primary" data-action="confirm-runtime-version" data-ticket-id="' + escapeHtml(ticket.id) + '" data-version-id="' + escapeHtml(version.id) + '"' + disabledAttr(busy || !activationConfigured) + '>' + escapeHtml(pending ? "Confirming..." : "Confirm Version") + '</button>');
     } else {
       buttons.push(actionButton("activate-runtime", ticket.id, pending ? "Activating..." : "Activate Version", "primary", busy || !activationConfigured));
     }
@@ -2156,7 +2409,7 @@ function renderTicketActionStatus(ticket, pending, activeEvolutionRunning, evolu
     return '<div class="action-status"><span class="spinner"></span><span>' + escapeHtml(pending) + '</span></div>';
   }
   if (ticket.status === "applying" || activeEvolutionRunning) {
-    return '<div class="action-status"><span class="spinner"></span><span>Implementation is running in #self-evaluation.</span></div>';
+    return '<div class="action-status"><span class="spinner"></span><span>Implementation is running in Self-evaluation.</span></div>';
   }
   if (evolutionRunning) {
     return '<div class="action-status warn"><span>Another implementation is running. Actions are paused until it finishes.</span></div>';
@@ -2189,7 +2442,8 @@ function requiresRuntimeActivation(ticket) {
 }
 
 function fieldInput(id, label, value) {
-  return '<div class="field"><label for="' + id + '">' + label + '</label><input id="' + id + '" value="' + escapeHtml(value) + '"></div>';
+  var extraAttrs = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : "";
+  return '<div class="field"><label for="' + id + '">' + label + '</label><input id="' + id + '" value="' + escapeHtml(value) + '"' + extraAttrs + '></div>';
 }
 
 function fieldTextarea(id, label, value, height) {
@@ -2224,6 +2478,13 @@ function timelineMessageForDisplay(event) {
 }
 
 function renderConversation(conversation) {
+  if (!conversation && state.pendingNewSession) {
+    return '<div class="panel"><div class="panel-body">' +
+      '<div class="messages"><div class="empty">New session. Type a message to start.</div></div>' +
+      '<div class="field"><label for="session-message">Message</label><textarea id="session-message" style="min-height:110px">' + escapeHtml(getDraft(PENDING_NEW_SESSION)) + '</textarea></div>' +
+      '<div class="toolbar"><button class="primary" data-action="send-session-message" data-conversation-id="' + PENDING_NEW_SESSION + '">⬆</button></div>' +
+    '</div></div>';
+  }
   if (!conversation) {
     return '<div class="panel"><div class="panel-body"><div class="empty">No session selected.</div></div></div>';
   }
@@ -3141,21 +3402,28 @@ function renderInspector(ticket) {
 
 function renderRuntimeVersionsPanel(snapshot) {
   const versions = (snapshot.runtimeVersions || []).slice().reverse();
-  return '<div class="panel" style="margin-top:12px"><div class="panel-header"><span class="panel-title">Runtime Versions</span><span class="badge">' + versions.length + '</span></div><div class="panel-body">' +
+  return '<div class="panel" style="margin-top:12px"><div class="panel-header"><span class="panel-title">Runtime Versions</span><span class="panel-actions"><span class="badge">' + versions.length + '</span></span></div><div class="panel-body">' +
     (versions.length === 0 ? '<div class="empty">No runtime versions yet.</div>' : versions.map(renderRuntimeVersion).join("")) +
   '</div></div>';
 }
 
 function renderRuntimeVersion(version) {
   const active = isRuntimeVersionActive(version.id);
+  const pendingActivation = isRuntimeVersionPendingActivation(version.id);
   const pending = pendingLabel("runtime-version:" + version.id);
+  const confirmPending = pendingLabel("runtime-confirm:" + version.id);
   const label = runtimeVersionLabel(version);
   const sourceTicket = ticketById(version.sourceTicketId);
   const sourceLabel = sourceTicket ? ticketDisplayId(sourceTicket) : version.sourceTicketId;
-  return '<div class="item"><div class="item-title">' + escapeHtml(runtimeVersionTitle(version)) + '</div>' +
-    '<div class="item-meta"><span>' + escapeHtml(label) + '</span><span>' + fmtShortTime(version.createdAt) + '</span>' + (active ? '<span class="badge ok">active</span>' : '') + '</div>' +
+  const action = pendingActivation
+    ? '<button class="' + pendingClass(confirmPending).trim() + '" data-action="confirm-runtime-version" data-version-id="' + escapeHtml(version.id) + '"' + disabledAttr(!!confirmPending) + '>' + (confirmPending || "Confirm Version") + '</button>'
+    : '<button class="' + (active ? 'primary' : pendingClass(pending).trim()) + '" data-action="activate-version" data-version-id="' + escapeHtml(version.id) + '"' + disabledAttr(active || !!pending) + '>' + (active ? "Active Version" : (pending || "Activate Version")) + '</button>';
+  const deleteButton = '<button class="session-delete" title="Delete runtime version" aria-label="Delete runtime version" data-action="delete-runtime-version" data-version-id="' + escapeHtml(version.id) + '"' + disabledAttr(active || pendingActivation || !!pending || !!confirmPending) + '>×</button>';
+  return '<div class="item runtime-version-item">' + deleteButton +
+    '<div class="item-title">' + escapeHtml(runtimeVersionTitle(version)) + '</div>' +
+    '<div class="item-meta"><span>' + escapeHtml(label) + '</span><span>' + fmtShortTime(version.createdAt) + '</span></div>' +
     '<div class="item-meta"><span title="' + escapeHtml(version.sourceTicketId) + '">' + escapeHtml(sourceLabel) + '</span></div>' +
-    '<button class="' + (active ? 'primary' : pendingClass(pending).trim()) + '" data-action="activate-version" data-version-id="' + escapeHtml(version.id) + '"' + disabledAttr(active || !!pending) + '>' + (active ? "Active Version" : (pending || "Activate Version")) + '</button></div>';
+    action + '</div>';
 }
 
 function renderSelfInstructionVersionsPanel(snapshot) {
@@ -3167,16 +3435,21 @@ function renderSelfInstructionVersionsPanel(snapshot) {
 
 function renderVersion(version) {
   const pending = pendingLabel("version:" + version.id);
-  return '<div class="item"><div class="item-title">' + escapeHtml(version.topic || version.label) + '</div><div class="item-meta"><span>' + escapeHtml(version.label) + '</span></div><div class="item-meta"><span>' + escapeHtml(version.id) + '</span></div><div class="item-meta"><span>' + fmtTime(version.createdAt) + '</span></div><button class="' + pendingClass(pending).trim() + '" data-action="rollback-version" data-version-id="' + escapeHtml(version.id) + '"' + disabledAttr(!!pending) + '>' + (pending || "Activate Version") + '</button></div>';
+  return '<div class="item"><div class="item-title">' + escapeHtml(version.topic || version.label) + '</div><div class="item-meta"><span>' + escapeHtml(version.label) + '</span></div><div class="item-meta"><span>' + escapeHtml(version.id) + '</span></div><div class="item-meta"><span>' + fmtTime(version.createdAt) + '</span></div><div class="item-toolbar"><button class="' + pendingClass(pending).trim() + '" data-action="rollback-version" data-version-id="' + escapeHtml(version.id) + '"' + disabledAttr(!!pending) + '>' + (pending || "Activate Version") + '</button><button class="session-delete" title="Delete self-instruction version" aria-label="Delete self-instruction version" data-action="delete-self-version" data-version-id="' + escapeHtml(version.id) + '"' + disabledAttr(!!pending) + '>×</button></div></div>';
 }
 
-async function renameConversation(conversationId, title) {
+async function renameConversation(conversationId, title, options) {
   const result = await api("/api/conversations/" + encodeURIComponent(conversationId), {
     method: "PATCH",
     body: JSON.stringify({ title: title })
   });
-  state.selectedConversationId = result.conversation.id;
-  state.view = "sessions";
+  const shouldSelect = !(options && options.select === false);
+  upsertConversation(result.conversation, shouldSelect ? { select: true } : undefined);
+  if (shouldSelect) {
+    state.selectedConversationId = result.conversation.id;
+    state.view = "sessions";
+  }
+  render();
 }
 
 async function promptRenameConversation(conversationId) {
@@ -3188,6 +3461,114 @@ async function promptRenameConversation(conversationId) {
   if (!trimmed || trimmed === conversation.title) return false;
   await renameConversation(conversationId, trimmed);
   return true;
+}
+
+function generateAutoTitle(content) {
+  var trimmed = content.trim();
+  if (!trimmed) return "";
+  // Strip common markdown formatting noise
+  var bt = String.fromCharCode(96);
+  var cleaned = trimmed
+    .replace(new RegExp("^" + bt + "{3}[\\s\\S]*?" + bt + "{3}", "g"), "")
+    .replace(new RegExp(bt + "{1,3}([^" + bt + "]+)" + bt + "{1,3}", "g"), "$1")
+    .replace(/^[#*>-]+\s*/gm, "")
+    .trim();
+  if (!cleaned) cleaned = trimmed;
+  var pibotIntentTitle = generatePibotIntentTitle(cleaned);
+  if (pibotIntentTitle) return pibotIntentTitle;
+  // Take the first sentence or line (support CJK punctuation)
+  var newline = String.fromCharCode(10);
+  var sentenceParts = cleaned.split(new RegExp("[.!?\\u3002\\uff01\\uff1f" + newline + "]"));
+  var firstSentence = "";
+  for (var i = 0; i < sentenceParts.length; i++) {
+    var part = sentenceParts[i].trim();
+    if (part) { firstSentence = part; break; }
+  }
+  if (!firstSentence) firstSentence = cleaned.substring(0, 40).trim();
+  // Truncate to a concise title (target ~25 chars max)
+  var maxLen = 25;
+  if (firstSentence.length > maxLen) {
+    var truncated = firstSentence.substring(0, maxLen);
+    // Try to break at word boundary for Latin scripts
+    var lastSpace = truncated.lastIndexOf(" ");
+    if (lastSpace > 10) {
+      truncated = truncated.substring(0, lastSpace);
+    }
+    return truncated + "\u2026";
+  }
+  return firstSentence;
+}
+
+function generatePibotIntentTitle(content) {
+  var text = String(content || "").trim();
+  if (!/(pibot|自进化|self[-\s]?evolution|web\s?ui|webui|会话|session|页面|界面|标题|命名)/iu.test(text)) {
+    return "";
+  }
+  var mentionsPibotOrWebUi = /(pibot|自进化|self[-\s]?evolution|web\s?ui|webui)/iu.test(text);
+  var mentionsTitle = /(会话.*(命名|标题)|命名.*会话|标题.*会话|session.*title|title.*session|rename|重命名)/iu.test(text);
+  var mentionsFirstTurnPage = /(第一个问题|首个问题|第一轮|首轮|回答结束|结束时|页面.*(出问题|异常|坏|错|空白|刷新)|界面.*(出问题|异常|坏|错|空白|刷新))/iu.test(text);
+  var wantsFix = /(修复|解决|改进|改善|不好|出问题|异常|坏|错|fix|improve|broken|bad)/iu.test(text);
+  if (mentionsTitle && mentionsFirstTurnPage) return "修复会话命名与页面";
+  if (mentionsTitle && (mentionsPibotOrWebUi || wantsFix)) return "修复会话命名";
+  if (mentionsFirstTurnPage && (mentionsPibotOrWebUi || wantsFix)) return "修复首轮页面刷新";
+  if (mentionsPibotOrWebUi && wantsFix) return "改进 pibot 自进化";
+  return "";
+}
+
+function maybeAutoNameConversation(conversationId, content) {
+  improveConversationTitle(conversationId, content).catch(function() {});
+}
+
+async function improveConversationTitle(conversationId, content) {
+  var conversation = state.conversations.find(function(item) { return item.id === conversationId; });
+  if (!shouldAutoGenerateConversationTitle(conversation, content)) return;
+  var modelTitle = await fetchModelGeneratedTitle(conversationId, content);
+  conversation = state.conversations.find(function(item) { return item.id === conversationId; });
+  if (!shouldAutoGenerateConversationTitle(conversation, content)) return;
+  if (modelTitle && modelTitle !== conversation.title) {
+    await renameConversation(conversationId, modelTitle, { select: false });
+    return;
+  }
+}
+
+function shouldAutoGenerateConversationTitle(conversation, content) {
+  if (!conversation) return false;
+  // Allow auto-generation for early conversations (up to ~3 exchanges);
+  // the heuristic-title match below prevents overwriting manually renamed titles.
+  if (Array.isArray(conversation.messages) && conversation.messages.length > 6) return false;
+  var title = String(conversation.title || "").trim();
+  if (isPlaceholderConversationTitle(title)) return true;
+  var heuristicTitle = generateAutoTitle(content);
+  return !!heuristicTitle && title === heuristicTitle;
+}
+
+function isPlaceholderConversationTitle(title) {
+  var normalized = String(title || "").trim();
+  return normalized === "Web session" || normalized === "Untitled session";
+}
+
+async function fetchModelGeneratedTitle(conversationId, content) {
+  var timeout = null;
+  try {
+    var controller = new AbortController();
+    timeout = setTimeout(function() { controller.abort(); }, 20000);
+    var response = await fetch("/api/conversations/" + encodeURIComponent(conversationId) + "/generate-title", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: content }),
+      signal: controller.signal
+    });
+    if (!response.ok) return "";
+    var data = await response.json();
+    if (data.generated && data.title) {
+      return String(data.title).trim();
+    }
+    return "";
+  } catch (e) {
+    return "";
+  } finally {
+    if (timeout !== null) clearTimeout(timeout);
+  }
 }
 
 document.addEventListener("wheel", function(event) {
@@ -3237,8 +3618,9 @@ document.addEventListener("keydown", function(event) {
   event.preventDefault();
   const conversationId = state.selectedConversationId;
   if (!conversationId) return;
+  state.actionError = null;
   sendSessionMessageFromInput(conversationId).catch(function(error) {
-    state.error = error.message;
+    state.actionError = errorMessage(error);
     render();
   });
 });
@@ -3270,11 +3652,48 @@ document.addEventListener("compositionend", function(event) {
   }
 });
 
+document.addEventListener("click", function(event) {
+  const btn = event.target.closest(".file-picker-btn");
+  if (!btn) return;
+  const targetId = btn.dataset.target;
+  if (!targetId) return;
+  const input = document.getElementById(targetId);
+  if (input) input.click();
+});
+
+document.addEventListener("change", function(event) {
+  const input = event.target.closest("#skill-import-files");
+  if (input) {
+    const label = document.getElementById("skill-import-files-label");
+    if (!input.files || input.files.length === 0) {
+      state.skillImportFiles = [];
+      state.skillImportFolderName = "";
+      if (label) label.textContent = "No folder chosen";
+      return;
+    }
+    const files = Array.from(input.files);
+    const first = files[0];
+    const relative = first.webkitRelativePath || first.name;
+    const folderName = relative.indexOf("/") !== -1 ? relative.slice(0, relative.indexOf("/")) : relative;
+    state.skillImportFiles = files;
+    state.skillImportFolderName = folderName;
+    if (label) {
+      label.textContent = folderName + " (" + files.length + " file" + (files.length === 1 ? "" : "s") + ")";
+    }
+    return;
+  }
+  const overwrite = event.target.closest("#skill-import-overwrite");
+  if (overwrite) {
+    state.skillImportOverwrite = !!overwrite.checked;
+  }
+});
+
 document.addEventListener("click", async function(event) {
   const target = event.target.closest("[data-view],[data-ticket-id],[data-conversation-id],[data-action]");
   if (!target) return;
   if (target.dataset.view) {
     saveDraft();
+    state.actionError = null;
     state.view = target.dataset.view;
     if (state.view === "evolution") {
       state.evolutionPane = "tickets";
@@ -3285,6 +3704,7 @@ document.addEventListener("click", async function(event) {
   }
   if (target.dataset.ticketId && !target.dataset.action) {
     saveDraft();
+    state.actionError = null;
     state.view = "evolution";
     state.selectedTicketId = target.dataset.ticketId;
     state.evolutionPane = "tickets";
@@ -3294,8 +3714,10 @@ document.addEventListener("click", async function(event) {
   }
   if (target.dataset.conversationId && !target.dataset.action) {
     saveDraft();
+    state.actionError = null;
     state.view = "sessions";
     state.selectedConversationId = target.dataset.conversationId;
+    state.pendingNewSession = false;
     state.autoScrollMain = true;
     if (event.detail >= 2) {
       try {
@@ -3303,7 +3725,7 @@ document.addEventListener("click", async function(event) {
         if (renamed) await refresh();
         else render();
       } catch (error) {
-        state.error = error.message;
+        state.actionError = errorMessage(error);
         render();
       }
       return;
@@ -3313,6 +3735,9 @@ document.addEventListener("click", async function(event) {
   }
   if (!target.dataset.action) return;
   if (target.disabled) return;
+  if (target.dataset.action !== "dismiss-action-error") {
+    state.actionError = null;
+  }
   const pendingKey = actionKeyForTarget(target.dataset.action, target);
   if (pendingKey && pendingLabel(pendingKey)) return;
   try {
@@ -3321,8 +3746,8 @@ document.addEventListener("click", async function(event) {
       await refresh();
     }
   } catch (error) {
-    await refresh();
-    state.error = error.message;
+    await refresh({ showLoading: false });
+    state.actionError = errorMessage(error);
     render();
   }
 });
@@ -3408,30 +3833,32 @@ async function sendApprovalDecision(approvalId, approved) {
   });
 }
 
-async function importSkillFromInput() {
-  const input = document.getElementById("skill-import-files");
-  if (!input || !input.files || input.files.length === 0) {
+async function importSelectedSkill() {
+  const selectedFiles = (state.skillImportFiles || []).slice();
+  if (selectedFiles.length === 0) {
     throw new Error("Select a Skill folder first.");
   }
   const files = [];
-  for (var index = 0; index < input.files.length; index++) {
-    const file = input.files[index];
+  for (var index = 0; index < selectedFiles.length; index++) {
+    const file = selectedFiles[index];
     files.push({
       path: file.webkitRelativePath || file.name,
       content: await file.text()
     });
   }
-  const overwrite = !!(document.getElementById("skill-import-overwrite") || {}).checked;
   const result = await api("/api/skills/import", {
     method: "POST",
     body: JSON.stringify({
       files: files,
-      overwrite: overwrite
+      overwrite: state.skillImportOverwrite
     })
   });
   if (result.skills) {
     state.skills = result.skills;
   }
+  state.skillImportFiles = [];
+  state.skillImportFolderName = "";
+  state.skillImportOverwrite = false;
 }
 
 async function streamEvolutionImplementation(ticketId) {
@@ -3642,6 +4069,14 @@ async function sendSessionMessageFromInput(conversationId) {
   if (content.trim().length === 0) return;
   textarea.value = "";
   delete state.drafts[conversationId];
+  if (conversationId === PENDING_NEW_SESSION) {
+    const autoTitle = "Web session";
+    const result = await api("/api/conversations", { method: "POST", body: JSON.stringify({ title: autoTitle }) });
+    upsertConversation(result.conversation);
+    state.pendingNewSession = false;
+    state.selectedConversationId = result.conversation.id;
+    conversationId = result.conversation.id;
+  }
   if (liveRunFor(conversationId) !== null) {
     await sendSessionControlMessage(conversationId, content);
     return;
@@ -3651,6 +4086,11 @@ async function sendSessionMessageFromInput(conversationId) {
 
 async function handleAction(target) {
   const action = target.dataset.action;
+  if (action === "dismiss-action-error") {
+    state.actionError = null;
+    render();
+    return false;
+  }
   if (action === "refresh") {
     await withPending("refresh", "Refreshing...", async function() {
       await refresh({ showLoading: false });
@@ -3681,6 +4121,9 @@ async function handleAction(target) {
     state.evolutionPane = "context";
     state.autoScrollMain = true;
     render();
+    await withPending("evolution-context-load", "Loading context...", async function() {
+      await ensureEvolutionContextLoaded();
+    });
     return false;
   }
   if (action === "append-evolution-context") {
@@ -3698,15 +4141,24 @@ async function handleAction(target) {
     return false;
   }
   if (action === "import-skill") {
+    const overwrite = document.getElementById("skill-import-overwrite");
+    if (overwrite) {
+      state.skillImportOverwrite = !!overwrite.checked;
+    }
     await withPending("skill-import", "Importing...", async function() {
-      await importSkillFromInput();
+      await importSelectedSkill();
     });
     return false;
   }
   if (action === "save-proposal") {
     const ticketId = target.dataset.ticketId;
+    const titleInput = document.getElementById("ticket-title");
+    if (titleInput && titleInput.value.length > 25) {
+      alert("Ticket title must be at most 25 characters.");
+      return;
+    }
     const body = {
-      title: document.getElementById("ticket-title").value,
+      title: titleInput ? titleInput.value : "",
       summary: document.getElementById("proposal-summary").value,
       diagnosis: document.getElementById("proposal-diagnosis").value,
       versionTopic: document.getElementById("proposal-version-topic").value,
@@ -3767,7 +4219,8 @@ async function handleAction(target) {
       if (result.runtimeActivation) {
         state.snapshot = Object.assign({}, state.snapshot || {}, {
           runtimeActivation: result.runtimeActivation,
-          activeRuntimeVersion: result.activeRuntimeVersion || (state.snapshot && state.snapshot.activeRuntimeVersion)
+          activeRuntimeVersion: result.activeRuntimeVersion || (state.snapshot && state.snapshot.activeRuntimeVersion),
+          pendingRuntimeActivation: result.pendingRuntimeActivation || (state.snapshot && state.snapshot.pendingRuntimeActivation)
         });
       }
       if (!result.alreadyActive) {
@@ -3785,11 +4238,30 @@ async function handleAction(target) {
       updateEvolutionContext(result.context);
       state.snapshot = Object.assign({}, state.snapshot || {}, {
         activeRuntimeVersion: result.activeRuntimeVersion || (state.snapshot && state.snapshot.activeRuntimeVersion),
+        pendingRuntimeActivation: result.pendingRuntimeActivation || (state.snapshot && state.snapshot.pendingRuntimeActivation),
         runtimeActivation: result.runtimeActivation || (state.snapshot && state.snapshot.runtimeActivation)
       });
       if (!result.alreadyActive) {
         await waitForRuntimeActivation(key, result.runtimeActivation);
       }
+    });
+    return false;
+  }
+  if (action === "confirm-runtime-version") {
+    const ticketId = target.dataset.ticketId || "";
+    const versionId = target.dataset.versionId || pendingRuntimeActivationVersionId();
+    const key = ticketId ? ticketActionKey(ticketId) : "runtime-confirm:" + versionId;
+    await withPending(key, "Confirming version...", async function() {
+      const path = versionId
+        ? "/api/evolution/runtime-code/versions/" + encodeURIComponent(versionId) + "/confirm"
+        : "/api/evolution/runtime-code/activation/confirm";
+      const result = await api(path, { method: "POST", body: JSON.stringify({ actor: "webui", versionId: versionId }) });
+      if (result.ticket) upsertTicket(result.ticket);
+      updateEvolutionContext(result.context);
+      state.snapshot = Object.assign({}, state.snapshot || {}, {
+        activeRuntimeVersion: result.activeRuntimeVersion || (state.snapshot && state.snapshot.activeRuntimeVersion),
+        pendingRuntimeActivation: null
+      });
     });
     return false;
   }
@@ -3800,12 +4272,43 @@ async function handleAction(target) {
     });
     return;
   }
-  if (action === "new-session") {
-    await withPending("new-session", "Creating session...", async function() {
-      const result = await api("/api/conversations", { method: "POST", body: JSON.stringify({ title: "Web session" }) });
-      state.selectedConversationId = result.conversation.id;
-      state.view = "sessions";
+  if (action === "delete-ticket") {
+    const ticketId = target.dataset.ticketId;
+    const ticket = ticketById(ticketId);
+    const label = ticket ? ticket.title : ticketId;
+    if (!window.confirm('Delete ticket "' + label + '" and its associated version data?')) return;
+    await withPending(ticketActionKey(ticketId), "Deleting ticket...", async function() {
+      const result = await api("/api/evolution/tickets/" + encodeURIComponent(ticketId), { method: "DELETE" });
+      updateEvolutionContext(result.context);
+      if (state.selectedTicketId === ticketId) {
+        state.selectedTicketId = null;
+      }
     });
+    return;
+  }
+  if (action === "delete-runtime-version") {
+    const versionId = target.dataset.versionId;
+    if (!window.confirm('Delete runtime version "' + versionId + '" and its archived files?')) return;
+    await withPending("runtime-delete:" + versionId, "Deleting version...", async function() {
+      await api("/api/evolution/runtime-code/versions/" + encodeURIComponent(versionId), { method: "DELETE" });
+      await refresh({ showLoading: false });
+    });
+    return;
+  }
+  if (action === "delete-self-version") {
+    const versionId = target.dataset.versionId;
+    if (!window.confirm('Delete self-instruction version "' + versionId + '"?')) return;
+    await withPending("self-delete:" + versionId, "Deleting version...", async function() {
+      await api("/api/evolution/self-instructions/versions/" + encodeURIComponent(versionId), { method: "DELETE" });
+    });
+    return;
+  }
+  if (action === "new-session") {
+    state.pendingNewSession = true;
+    state.selectedConversationId = PENDING_NEW_SESSION;
+    state.view = "sessions";
+    state.autoScrollMain = true;
+    render();
     return;
   }
   if (action === "rename-conversation") {

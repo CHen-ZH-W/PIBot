@@ -52,6 +52,7 @@ export interface EvolutionContextRecorder {
   readEvolutionContext(
     options?: EvolutionContextReadOptions,
   ): Promise<EvolutionContextSnapshot>;
+  deleteEvolutionContext(ticketId: string | undefined): Promise<void>;
 }
 
 export class SessionEvolutionContextRecorder implements EvolutionContextRecorder {
@@ -88,6 +89,15 @@ export class SessionEvolutionContextRecorder implements EvolutionContextRecorder
         };
       })),
     };
+  }
+
+  async deleteEvolutionContext(ticketId: string | undefined): Promise<void> {
+    if (ticketId === undefined) {
+      return;
+    }
+    await this.sessions.deleteChannelDirectory(
+      evolutionTicketChannelKey(ticketId),
+    );
   }
 }
 

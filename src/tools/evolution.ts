@@ -30,7 +30,8 @@ export const createEvolutionTaskTool: CodingToolDefinition<
     properties: {
       summary: {
         type: "string",
-        description: "Short title for the requested agent self-improvement.",
+        description:
+          "Short title for the requested agent self-improvement. Keep within 25 characters; the WebUI ticket card shows 2 lines of fixed height so 20-25 character titles display fully.",
       },
       details: {
         type: "string",
@@ -124,8 +125,8 @@ export const createEvolutionTaskTool: CodingToolDefinition<
       target: result.ticket.target,
       message:
         result.ticket.target === "runtime_code"
-          ? "Runtime-code self-evolution ticket created. Review and approve it, then start implementation in #self-evaluation."
-          : "Self-evolution ticket created. Review, approve, apply, or roll it back in #self-evaluation.",
+          ? "已创建 runtime_code 自进化工单。请在 Self-evaluation 中评审并批准，然后启动实现。"
+          : "已创建自进化工单。请在 Self-evaluation 中评审、批准、应用或回滚。",
     };
   },
 };

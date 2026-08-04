@@ -5,6 +5,7 @@ import { errorFields, type AppLogger, NoopLogger } from "../app/logging";
 import {
   evolutionChannelKey,
   evolutionContextTopic,
+  evolutionTicketChannelKey,
   type EvolutionContextRecorder,
 } from "../evolution/channel-context";
 import type {
@@ -25,16 +26,19 @@ import {
   type SkillImportFile,
 } from "../workspace/skills";
 import type { WebAgentRunner } from "./agent";
-import type {
-  FileWebConversationStore,
-  WebConversation,
-  WebConversationRole,
+import {
+  conversationTitleRetryReady,
+  conversationTitleSource,
+  type FileWebConversationStore,
+  type WebConversation,
+  type WebConversationRole,
 } from "./conversations";
 import { WEBUI_CSS, WEBUI_HTML, WEBUI_SCRIPT } from "./static";
 
 export interface WebUiServerOptions {
   readonly host: string;
   readonly port: number;
+  readonly publicUrl?: string | undefined;
   readonly workspaceRoot: string;
   readonly evolution: EvolutionController;
   readonly evolutionContext?: EvolutionContextRecorder;
@@ -46,6 +50,7 @@ export interface WebUiServerOptions {
   readonly disabledSkills?: readonly string[];
   readonly maxSkills?: number;
   readonly maxSkillFileBytes?: number;
+  readonly titleEmptyRetryMs?: number;
 }
 
 export interface StartedWebUiServer {
@@ -89,9 +94,16 @@ export async function startWebUiServer(
     });
   });
 
-  const url = `http://${options.host}:${options.port}`;
+  const url = options.publicUrl ?? browserUrlFor(options.host, options.port);
   logger.info("webui_started", { url });
   return { server, url };
+}
+
+function browserUrlFor(host: string, port: number): string {
+  if (host === "0.0.0.0" || host === "::") {
+    return `http://127.0.0.1:${port}`;
+  }
+  return `http://${host}:${port}`;
 }
 
 async function routeRequest(
@@ -124,14 +136,10 @@ async function routeRequest(
       readWebConversations(options),
       readWebSkills(options),
     ]);
-    const evolutionContext = await readEvolutionContext(
-      options,
-      evolution.tickets,
-    );
     sendJson(response, 200, {
       evolution: {
         ...evolution,
-        context: evolutionContext,
+        context: readLightweightEvolutionContext(evolution.tickets),
         runtimeActivation: runtimeActivationState(options),
       },
       runtime: runtimeState,
@@ -163,6 +171,13 @@ async function routeRequest(
     sendJson(response, 200, {
       import: result,
       skills: await readWebSkills(options),
+    });
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/evolution/context") {
+    const evolution = await options.evolution.readSnapshot();
+    sendJson(response, 200, {
+      context: await readEvolutionContext(options, evolution.tickets),
     });
     return;
   }
@@ -316,7 +331,12 @@ async function routeRequest(
     sendJson(response, 202, {
       ticket: result.ticket,
       version: result.version,
-      activeRuntimeVersion: result.active,
+      ...(result.active === undefined
+        ? {}
+        : { activeRuntimeVersion: result.active }),
+      ...(result.pending === undefined
+        ? {}
+        : { pendingRuntimeActivation: result.pending }),
       publish: result.publish,
       alreadyActive: result.alreadyActive,
       runtimeActivation: runtimeActivationState(options),
@@ -354,11 +374,13 @@ async function routeRequest(
     }
     const body = await readJsonBody(request);
     const actorName = optionalStringValue(body, "actor")?.trim() || "webui";
+    const confirmPending = optionalBooleanValue(body, "confirmPending");
     const result = await options.evolution.activateRuntimeCodeVersion(
       runtimeVersionActivationMatch,
       {
         actor: actorName,
         commandLabel: options.runtimeActivation.label,
+        ...(confirmPending === undefined ? {} : { confirmPending }),
         workspaceRoot: options.workspaceRoot,
       },
     );
@@ -366,7 +388,12 @@ async function routeRequest(
     sendJson(response, 202, {
       ticket: result.ticket,
       version: result.version,
-      activeRuntimeVersion: result.active,
+      ...(result.active === undefined
+        ? {}
+        : { activeRuntimeVersion: result.active }),
+      ...(result.pending === undefined
+        ? {}
+        : { pendingRuntimeActivation: result.pending }),
       publish: result.publish,
       alreadyActive: result.alreadyActive,
       runtimeActivation: runtimeActivationState(options),
@@ -389,6 +416,29 @@ async function routeRequest(
         errorFields(error),
       );
     }
+    return;
+  }
+  const runtimeVersionConfirmByIdMatch = matchRoute(
+    url.pathname,
+    /^\/api\/evolution\/runtime-code\/versions\/([^/]+)\/confirm$/u,
+  );
+  if (method === "POST" && runtimeVersionConfirmByIdMatch !== undefined) {
+    const body = await readJsonBody(request);
+    const actorName = optionalStringValue(body, "actor")?.trim() || "webui";
+    const result = await options.evolution.confirmRuntimeCodeVersion(
+      runtimeVersionConfirmByIdMatch,
+      { actor: actorName },
+    );
+    const evolution = await options.evolution.readSnapshot();
+    sendJson(response, 200, {
+      confirmed: result.confirmed,
+      ...(result.ticket === undefined ? {} : { ticket: result.ticket }),
+      ...(result.version === undefined ? {} : { version: result.version }),
+      ...(result.active === undefined
+        ? {}
+        : { activeRuntimeVersion: result.active }),
+      context: await readEvolutionContext(options, evolution.tickets),
+    });
     return;
   }
   const rejectMatch = matchRoute(
@@ -420,6 +470,60 @@ async function routeRequest(
     const evolution = await options.evolution.readSnapshot();
     sendJson(response, 200, {
       ticket,
+      context: await readEvolutionContext(options, evolution.tickets),
+    });
+    return;
+  }
+  const deleteTicketMatch = matchRoute(
+    url.pathname,
+    /^\/api\/evolution\/tickets\/([^/]+)$/u,
+  );
+  if (method === "DELETE" && deleteTicketMatch !== undefined) {
+    const body = await readJsonBody(request);
+    const result = await options.evolution.deleteTicket(deleteTicketMatch, {
+      ...optionalBodyString(body, "actor"),
+    });
+    const evolution = await options.evolution.readSnapshot();
+    sendJson(response, 200, {
+      ...result,
+      context: await readEvolutionContext(options, evolution.tickets),
+    });
+    return;
+  }
+  const deleteRuntimeVersionMatch = matchRoute(
+    url.pathname,
+    /^\/api\/evolution\/runtime-code\/versions\/([^/]+)$/u,
+  );
+  if (method === "DELETE" && deleteRuntimeVersionMatch !== undefined) {
+    const body = await readJsonBody(request);
+    const result = await options.evolution.deleteRuntimeVersion(
+      deleteRuntimeVersionMatch,
+      {
+        ...optionalBodyString(body, "actor"),
+      },
+    );
+    const evolution = await options.evolution.readSnapshot();
+    sendJson(response, 200, {
+      ...result,
+      context: await readEvolutionContext(options, evolution.tickets),
+    });
+    return;
+  }
+  const deleteSelfVersionMatch = matchRoute(
+    url.pathname,
+    /^\/api\/evolution\/self-instructions\/versions\/([^/]+)$/u,
+  );
+  if (method === "DELETE" && deleteSelfVersionMatch !== undefined) {
+    const body = await readJsonBody(request);
+    const result = await options.evolution.deleteSelfVersion(
+      deleteSelfVersionMatch,
+      {
+        ...optionalBodyString(body, "actor"),
+      },
+    );
+    const evolution = await options.evolution.readSnapshot();
+    sendJson(response, 200, {
+      ...result,
       context: await readEvolutionContext(options, evolution.tickets),
     });
     return;
@@ -485,6 +589,49 @@ async function routeRequest(
     }
     await options.conversations.delete(conversationMatch);
     sendJson(response, 200, { deleted: true, id: conversationMatch });
+    return;
+  }
+  const generateTitleMatch = matchRoute(
+    url.pathname,
+    /^\/api\/conversations\/([^/]+)\/generate-title$/u,
+  );
+  if (method === "POST" && generateTitleMatch !== undefined) {
+    if (options.agent === undefined) {
+      sendJson(response, 400, {
+        error: "WebUI agent runner is not configured",
+      });
+      return;
+    }
+    const body = await readJsonBody(request);
+    const title = await options.agent.generateConversationTitle(
+      generateTitleMatch,
+      optionalStringValue(body, "content"),
+    );
+    if (title.length === 0) {
+      sendJson(response, 200, { title: "", generated: false });
+      return;
+    }
+    sendJson(response, 200, { title, generated: true });
+    return;
+  }
+  const runtimeVersionConfirmMatch = matchRoute(
+    url.pathname,
+    /^\/api\/evolution\/runtime-code\/activation\/confirm$/u,
+  );
+  if (method === "POST" && runtimeVersionConfirmMatch !== undefined) {
+    const body = await readJsonBody(request);
+    const actorName = optionalStringValue(body, "actor")?.trim() || "webui";
+    const versionId = optionalStringValue(body, "versionId")?.trim();
+    const active = await options.evolution.confirmPendingRuntimeActivation({
+      actor: actorName,
+      ...(versionId === undefined || versionId.length === 0 ? {} : { versionId }),
+    });
+    const evolution = await options.evolution.readSnapshot();
+    sendJson(response, 200, {
+      confirmed: active !== undefined,
+      ...(active === undefined ? {} : { activeRuntimeVersion: active }),
+      context: await readEvolutionContext(options, evolution.tickets),
+    });
     return;
   }
   const messageMatch = matchRoute(
@@ -584,6 +731,21 @@ async function readEvolutionContext(
     });
 }
 
+function readLightweightEvolutionContext(
+  tickets: readonly EvolutionTicket[] = [],
+) {
+  return {
+    key: evolutionChannelKey(),
+    messages: [],
+    topics: tickets.map(evolutionContextTopic),
+    ticketContexts: tickets.map((ticket) => ({
+      ticketId: ticket.id,
+      key: evolutionTicketChannelKey(ticket.id),
+      messages: [],
+    })),
+  };
+}
+
 function runtimeActivationState(options: WebUiServerOptions) {
   return {
     configured: options.runtimeActivation !== undefined,
@@ -637,6 +799,51 @@ async function streamAgentConversationMessage(
   response.once("close", abortOnClose);
   request.once("aborted", abortOnRequest);
 
+  let writeChain = Promise.resolve();
+  const writeStreamEvent = (value: unknown): Promise<void> => {
+    writeChain = writeChain.then(() => writeNdjson(response, value));
+    return writeChain;
+  };
+
+  let markMainRunFinished: (() => void) | undefined;
+  const mainRunFinished = new Promise<void>((resolve) => {
+    markMainRunFinished = resolve;
+  });
+  const initialTitleTask = generateAndPersistConversationTitle(
+    options,
+    input.conversationId,
+    input.content,
+    async (conversation) => {
+      if (!response.writableEnded) {
+        await writeStreamEvent({ type: "conversation", conversation });
+      }
+    },
+  );
+  const titleLifecycleTask = initialTitleTask.then(async (initialResult) => {
+    await mainRunFinished;
+    if (initialResult.outcome !== "empty" && initialResult.outcome !== "failed") {
+      return initialResult;
+    }
+    options.logger?.warn("webui_title_generation_retry", {
+      conversationId: input.conversationId,
+      reason: initialResult.outcome === "empty" ? "empty" : "error",
+    });
+    return generateAndPersistConversationTitle(
+      options,
+      input.conversationId,
+      input.content,
+      async (conversation) => {
+        if (!response.writableEnded) {
+          await writeStreamEvent({ type: "conversation", conversation });
+        }
+      },
+      {
+        ignoreRetryAfter: true,
+        reportFinalFailure: true,
+      },
+    );
+  });
+
   try {
     const run = await options.agent.runUserMessage(
       input.conversationId,
@@ -644,13 +851,13 @@ async function streamAgentConversationMessage(
       {
         signal: controller.signal,
         onEvent: async (event) => {
-          await writeNdjson(response, event);
+          await writeStreamEvent(event);
         },
       },
     );
     const conversation = await options.agent.getConversation(input.conversationId);
     const evolution = await options.evolution.readSnapshot();
-    await writeNdjson(response, {
+    await writeStreamEvent({
       type: "done",
       conversation,
       run,
@@ -661,17 +868,140 @@ async function streamAgentConversationMessage(
       context: await readEvolutionContext(options, evolution.tickets),
     });
   } catch (error: unknown) {
-    await writeNdjson(response, {
+    await writeStreamEvent({
       type: "error",
       error: errorMessage(error),
     });
   } finally {
+    markMainRunFinished?.();
+    await Promise.race([titleLifecycleTask, delay(1500)]);
+    await writeChain;
     response.off("close", abortOnClose);
     request.off("aborted", abortOnRequest);
     if (!response.writableEnded) {
       response.end();
     }
   }
+}
+
+type ConversationTitleGenerationOutcome =
+  | "generated"
+  | "empty"
+  | "failed"
+  | "protected"
+  | "skipped";
+
+interface ConversationTitleGenerationResult {
+  readonly outcome: ConversationTitleGenerationOutcome;
+  readonly conversation?: WebConversation;
+}
+
+async function generateAndPersistConversationTitle(
+  options: WebUiServerOptions,
+  conversationId: string,
+  content: string,
+  onConversation?: (conversation: WebConversation) => Promise<void> | void,
+  generationOptions: {
+    readonly ignoreRetryAfter?: boolean;
+    readonly reportFinalFailure?: boolean;
+  } = {},
+): Promise<ConversationTitleGenerationResult> {
+  if (options.agent === undefined) {
+    return { outcome: "skipped" };
+  }
+  try {
+    const current = await options.conversations.get(conversationId);
+    if (!shouldGenerateConversationTitle(current, generationOptions)) {
+      return { outcome: "skipped" };
+    }
+    let lastPersistedTitle: string | undefined;
+    let persistedConversation: WebConversation | undefined;
+    let cancelledByRename = false;
+    const persistCandidate = async (title: string): Promise<void> => {
+      if (cancelledByRename || title.length === 0) {
+        return;
+      }
+      const latest = await options.conversations.get(conversationId);
+      const canPersist = lastPersistedTitle === undefined
+        ? shouldGenerateConversationTitle(latest, generationOptions)
+        : latest.title === lastPersistedTitle;
+      if (!canPersist) {
+        cancelledByRename = true;
+        return;
+      }
+      if (latest.title !== title) {
+        await options.conversations.rename(conversationId, title, {
+          source: "model",
+        });
+      }
+      lastPersistedTitle = title;
+      persistedConversation = await options.agent?.getConversation(conversationId);
+      if (persistedConversation !== undefined) {
+        await onConversation?.(persistedConversation);
+      }
+    };
+
+    try {
+      const title = await options.agent.generateConversationTitle(
+        conversationId,
+        content,
+        { onCandidate: persistCandidate },
+      );
+      await persistCandidate(title);
+      if (persistedConversation !== undefined) {
+        return { outcome: "generated", conversation: persistedConversation };
+      }
+      if (cancelledByRename) {
+        return { outcome: "protected" };
+      }
+      await options.conversations.recordTitleGenerationFailure(
+        conversationId,
+        options.titleEmptyRetryMs,
+      );
+      if (generationOptions.reportFinalFailure === true) {
+        options.logger?.warn("webui_title_generation_empty", { conversationId });
+      }
+      return { outcome: "empty" };
+    } catch (error: unknown) {
+      if (persistedConversation !== undefined) {
+        return { outcome: "generated", conversation: persistedConversation };
+      }
+      if (cancelledByRename) {
+        return { outcome: "protected" };
+      }
+      await options.conversations.recordTitleGenerationFailure(
+        conversationId,
+        options.titleEmptyRetryMs,
+      );
+      if (generationOptions.reportFinalFailure === true) {
+        options.logger?.warn("webui_title_generation_failed", {
+          conversationId,
+          ...errorFields(error),
+        });
+      }
+      return { outcome: "failed" };
+    }
+  } catch (error: unknown) {
+    options.logger?.warn("webui_title_generation_failed", {
+      conversationId,
+      ...errorFields(error),
+    });
+    return { outcome: "failed" };
+  }
+}
+
+function shouldGenerateConversationTitle(
+  conversation: WebConversation,
+  options: {
+    readonly ignoreRetryAfter?: boolean;
+  } = {},
+): boolean {
+  if (conversation.messages.length > 6) {
+    return false;
+  }
+  return options.ignoreRetryAfter === true
+    ? conversationTitleSource(conversation) === "placeholder"
+    : conversationTitleRetryReady(conversation);
 }
 
 async function streamEvolutionImplementation(
@@ -733,6 +1063,12 @@ async function writeNdjson(
   if (!response.write(`${JSON.stringify(value)}\n`)) {
     await once(response, "drain");
   }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function readJsonBody(

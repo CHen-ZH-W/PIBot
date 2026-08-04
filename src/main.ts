@@ -64,7 +64,10 @@ import { SessionEvolutionContextRecorder } from "./evolution/channel-context";
 import { EvolutionController } from "./evolution/controller";
 import { FileEvolutionStore } from "./evolution/store";
 import { createRuntimeCodeActivationController } from "./evolution/runtime-activation";
-import { WebAgentRunner } from "./web/agent";
+import {
+  resolveConversationTitleModelName,
+  WebAgentRunner,
+} from "./web/agent";
 import { FileWebConversationStore } from "./web/conversations";
 import { startWebUiServer } from "./web/server";
 
@@ -73,6 +76,10 @@ async function main(): Promise<void> {
   const storeRoot = process.env.PIBOT_STORE_ROOT ?? path.join(workspaceRoot, ".pibot");
   const pibotSkillsRoot = path.join(storeRoot, "skills");
   const configuredModel = readOptionalEnv("OPENAI_MODEL");
+  const titleModelName = resolveConversationTitleModelName(
+    configuredModel,
+    readOptionalEnv("PIBOT_TITLE_MODEL"),
+  );
   const configuredBaseUrl = readOptionalEnv("OPENAI_BASE_URL");
   const modelContextWindowTokens =
     readPositiveIntegerEnv("MODEL_CONTEXT_WINDOW_TOKENS") ??
@@ -92,11 +99,11 @@ async function main(): Promise<void> {
   });
 
   const logger = new ConsoleJsonLogger();
-  const webUiHost = readOptionalEnv("PIBOT_WEBUI_HOST") ?? "127.0.0.1";
+  const webUiHost = readOptionalEnv("PIBOT_WEBUI_HOST") ?? "0.0.0.0";
   const webUiPort = readPositiveIntegerEnv("PIBOT_WEBUI_PORT") ?? 8787;
   const webUiPublicUrl =
     readOptionalEnv("PIBOT_WEBUI_PUBLIC_URL") ??
-    `http://${webUiHost}:${webUiPort}`;
+    browserUrlFor(webUiHost, webUiPort);
   const webUiEnabled = readBooleanEnv("PIBOT_WEBUI_ENABLED") === true;
   const slackBotToken = requiredEnv("SLACK_BOT_TOKEN");
   let shouldBypassQueue = (event: SlackEvent) =>
@@ -384,6 +391,7 @@ async function main(): Promise<void> {
     await startWebUiServer({
       host: webUiHost,
       port: webUiPort,
+      publicUrl: webUiPublicUrl,
       workspaceRoot,
       logger,
       evolution: evolutionController,
@@ -395,6 +403,8 @@ async function main(): Promise<void> {
       maxSkills: readPositiveIntegerEnv("SKILLS_MAX_COUNT") ?? 100,
       maxSkillFileBytes:
         readPositiveIntegerEnv("SKILLS_MAX_FILE_BYTES") ?? 64_000,
+      titleEmptyRetryMs:
+        readPositiveIntegerEnv("PIBOT_TITLE_EMPTY_RETRY_MS") ?? 300_000,
       agent: new WebAgentRunner({
         conversations,
         workspaceRoot,
@@ -440,6 +450,7 @@ async function main(): Promise<void> {
           readPositiveIntegerEnv("SKILLS_MAX_FILE_BYTES") ?? 64_000,
         pibotSkillsRoot,
         ...(configuredModel === undefined ? {} : { modelName: configuredModel }),
+        ...(titleModelName === undefined ? {} : { titleModelName }),
       }),
     });
   }
@@ -694,6 +705,13 @@ async function runStartupBackfill(options: {
   } catch (error: unknown) {
     options.logger.warn("slack_backfill_failed", errorFields(error));
   }
+}
+
+function browserUrlFor(host: string, port: number): string {
+  if (host === "0.0.0.0" || host === "::") {
+    return `http://127.0.0.1:${port}`;
+  }
+  return `http://${host}:${port}`;
 }
 
 function createSandboxExecutorFromEnv(workspaceRoot: string): {

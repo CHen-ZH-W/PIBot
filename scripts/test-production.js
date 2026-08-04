@@ -74,11 +74,17 @@ const {
 const {
   detectWebUiSelfEvolutionRequest,
   findOutsideWorkspacePathReference,
+  resolveConversationTitleModelName,
   WebAgentRunner,
 } = require("../dist/web/agent");
 const {
+  conversationTitleRetryReady,
+  conversationTitleSource,
   FileWebConversationStore,
 } = require("../dist/web/conversations");
+const {
+  startWebUiServer,
+} = require("../dist/web/server");
 
 async function runTests() {
   await runCase("Slack event filtering", testSlackEventFiltering);
@@ -117,6 +123,23 @@ async function runTests() {
     testWebUiSelfEvolutionModelClassification,
   );
   await runCase("WebUI active run accepts steering", testWebUiActiveRunSteering);
+  await runCase("WebUI state defers full evolution context", testWebUiStateDefersEvolutionContext);
+  await runCase(
+    "WebUI title model follows ggbot fast-model selection",
+    testWebUiTitleModelSelection,
+  );
+  await runCase(
+    "WebUI model title generation reads channel context",
+    testWebUiModelTitleGenerationReadsChannelContext,
+  );
+  await runCase(
+    "WebUI message stream emits generated conversation title",
+    testWebUiMessageStreamGeneratesConversationTitle,
+  );
+  await runCase(
+    "WebUI title stream persists before completion and protects manual rename",
+    testWebUiTitleStreamPersistsBeforeCompletion,
+  );
   await runCase(
     "WebUI context overflow compacts and retries",
     testWebUiContextOverflowRetry,
@@ -152,6 +175,11 @@ async function runTests() {
   await runCase("Kimi stream usage parsing", testKimiStreamUsageParsing);
   await runCase("SSE tool call argument fragments", testSseToolCallArgumentFragments);
   await runCase("WebUI browser script parses", testWebUiBrowserScriptParses);
+  await runCase("WebUI shell smoke renders", testWebUiShellSmokeRender);
+  await runCase(
+    "WebUI Skill import survives render and action errors remain recoverable",
+    testWebUiSkillImportAndActionErrorRecovery,
+  );
   await runCase(
     "WebUI markdown table tolerates blank separator gap",
     testWebUiMarkdownTableRendering,
@@ -164,13 +192,80 @@ async function runTests() {
   console.log("Production tests passed");
 }
 
+async function testWebUiTitleModelSelection() {
+  assert.equal(
+    resolveConversationTitleModelName("deepseek-reasoner", undefined),
+    "deepseek-chat",
+  );
+  assert.equal(
+    resolveConversationTitleModelName("kimi-k2.6", undefined),
+    undefined,
+  );
+  assert.equal(
+    resolveConversationTitleModelName("deepseek-reasoner", "fast-title"),
+    "fast-title",
+  );
+
+  const workspaceRoot = await createWorkspace("pibot-webui-title-source-test-");
+  const conversations = new FileWebConversationStore(join(workspaceRoot, "store"));
+  const conversation = await conversations.create("Web session");
+  assert.equal(conversationTitleSource(conversation), "placeholder");
+  assert.equal(conversationTitleRetryReady(conversation), true);
+
+  const failed = await conversations.recordTitleGenerationFailure(conversation.id, 60_000);
+  assert.equal(failed.titleFailureCount, 1);
+  assert.equal(conversationTitleRetryReady(failed), false);
+
+  const modelTitle = await conversations.rename(conversation.id, "模型标题", {
+    source: "model",
+  });
+  assert.equal(conversationTitleSource(modelTitle), "model");
+  assert.equal(modelTitle.titleFailureCount, undefined);
+  assert.equal(modelTitle.titleRetryAfter, undefined);
+
+  const manualTitle = await conversations.rename(conversation.id, "我的标题");
+  const protectedTitle = await conversations.rename(conversation.id, "模型覆盖", {
+    source: "model",
+  });
+  assert.equal(conversationTitleSource(manualTitle), "manual");
+  assert.equal(protectedTitle.title, "我的标题");
+  assert.equal(conversationTitleSource(protectedTitle), "manual");
+}
+
 async function testWebUiBrowserScriptParses() {
   const { WEBUI_CSS, WEBUI_SCRIPT } = require("../dist/web/static");
+  const serverSource = await readFile(join(__dirname, "../dist/web/server.js"), "utf8");
   new vm.Script(WEBUI_SCRIPT, {
     filename: "WEBUI_SCRIPT.js",
   });
   assert.match(WEBUI_SCRIPT, /function shouldRenderRun\(conversationId\)/u);
   assert.match(WEBUI_SCRIPT, /function scheduleRunRender\(conversationId, options\)/u);
+  assert.match(WEBUI_SCRIPT, /function mergeConversationForState\(existing, incoming\)/u);
+  assert.match(WEBUI_SCRIPT, /existingMessages\.length > 0 && incomingMessages\.length === 0/u);
+  assert.match(WEBUI_SCRIPT, /function improveConversationTitle\(conversationId, content\)/u);
+  assert.match(WEBUI_SCRIPT, /function generatePibotIntentTitle\(content\)/u);
+  assert.match(WEBUI_SCRIPT, /renameConversation\(conversationId, modelTitle, \{ select: false \}\)/u);
+  assert.doesNotMatch(WEBUI_SCRIPT, /maybeAutoNameConversation\(conversationId, content\);/u);
+  assert.match(serverSource, /generateAndPersistConversationTitle/u);
+  assert.match(serverSource, /webui_title_generation_failed/u);
+  assert.match(serverSource, /writeStreamEvent\(\{ type: "conversation", conversation \}\)/u);
+  assert.match(serverSource, /shouldGenerateConversationTitle\(conversation/u);
+  assert.doesNotMatch(WEBUI_SCRIPT, /applyImmediateConversationTitle/u);
+  assert.doesNotMatch(WEBUI_SCRIPT, /renameConversation\(conversationId, heuristicTitle/u);
+  assert.match(WEBUI_SCRIPT, /function fetchModelGeneratedTitle\(conversationId, content\)/u);
+  assert.match(WEBUI_SCRIPT, /body: JSON\.stringify\(\{ content: content \}\)/u);
+  assert.match(WEBUI_SCRIPT, /function shouldAutoGenerateConversationTitle\(conversation, content\)/u);
+  assert.match(WEBUI_SCRIPT, /title === heuristicTitle/u);
+  assert.match(WEBUI_SCRIPT, /function pendingRuntimeActivation\(\)/u);
+  assert.match(WEBUI_SCRIPT, /data-action="confirm-runtime-version"/u);
+  assert.match(WEBUI_SCRIPT, /\/runtime-code\/versions\/" \+ encodeURIComponent\(versionId\) \+ "\/confirm/u);
+  assert.match(WEBUI_SCRIPT, /Confirm Version/u);
+  assert.match(WEBUI_SCRIPT, /skillImportFiles: \[\]/u);
+  assert.match(WEBUI_SCRIPT, /state\.skillImportFiles = files/u);
+  assert.match(WEBUI_SCRIPT, /async function importSelectedSkill\(\)/u);
+  assert.match(WEBUI_SCRIPT, /function renderActionError\(\)/u);
+  assert.match(WEBUI_SCRIPT, /state\.actionError = errorMessage\(error\)/u);
+  assert.doesNotMatch(WEBUI_SCRIPT, /importSkillFromInput/u);
   assert.match(WEBUI_SCRIPT, /evolutionPane: "tickets"/u);
   assert.match(WEBUI_SCRIPT, /function renderEvolutionTicketWorkspace\(ticket, tickets\)/u);
   assert.match(WEBUI_SCRIPT, /function renderEvolutionContextPage\(ticket\)/u);
@@ -242,8 +337,16 @@ async function testWebUiBrowserScriptParses() {
   assert.match(WEBUI_SCRIPT, /function mainScrollContainerForEventTarget\(value\)/u);
   assert.match(WEBUI_SCRIPT, /!mainScroll\.classList\.contains\("ticket-workspace-content"\)/u);
   assert.match(WEBUI_SCRIPT, /<div class="split ticket-workspace">/u);
+  assert.match(WEBUI_SCRIPT, /<div class="topbar"><div class="topbar-left"><h1>Inspector<\/h1><\/div><div class="toolbar"><\/div><\/div>/u);
+  assert.match(WEBUI_CSS, /--app-header-height: 50px;/u);
+  assert.match(WEBUI_CSS, /\.brand,\n\.topbar \{[\s\S]*?height: var\(--app-header-height\);[\s\S]*?min-height: var\(--app-header-height\);[\s\S]*?flex: 0 0 var\(--app-header-height\);/u);
+  assert.match(WEBUI_CSS, /\.ticket-row \.line \{[\s\S]*?align-items: flex-start;[\s\S]*?flex: 0 0 38px;/u);
+  assert.match(WEBUI_CSS, /\.ticket-row \.line strong \{[\s\S]*?-webkit-line-clamp: 2;[\s\S]*?max-height: 38px;[\s\S]*?white-space: normal;[\s\S]*?line-height: 19px;/u);
   assert.match(WEBUI_CSS, /\.main > \.ticket-workspace-content/u);
   assert.match(WEBUI_CSS, /\.ticket-workspace \.stack/u);
+  assert.match(WEBUI_CSS, /\.shell\.skills-shell \{[^}]*?grid-template-columns: 248px minmax\(0, 1fr\);/u);
+  assert.match(WEBUI_CSS, /\.shell\.skills-shell \.inspector \{[^}]*?display: none;/u);
+  assert.match(WEBUI_SCRIPT, /state\.view === "skills" \? "shell skills-shell"/u);
   assert.match(WEBUI_CSS, /position: sticky/u);
   assert.match(WEBUI_CSS, /contain: paint/u);
   assert.match(WEBUI_CSS, /\.reasoning:not\(\[open\]\) \.reasoning-body/u);
@@ -267,12 +370,205 @@ async function testWebUiMarkdownTableRendering() {
   assert.doesNotMatch(html, /<pre class="md-pre"><code>\|------\|:--:\|------\|/u);
 }
 
+async function testWebUiShellSmokeRender() {
+  const { WEBUI_SCRIPT } = require("../dist/web/static");
+  const appElement = {
+    innerHTML: "",
+    value: "",
+    selectionStart: 0,
+    selectionEnd: 0,
+    classList: {
+      contains() {
+        return false;
+      },
+      add() {},
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    },
+  };
+  const context = {
+    AbortController,
+    URL,
+    console,
+    fetch: async (path) => ({
+      ok: true,
+      statusText: "OK",
+      async json() {
+        if (path === "/api/state") {
+          return {
+            evolution: {
+              tickets: [],
+              signals: [],
+              selfVersions: [],
+              runtimeVersions: [],
+              context: { messages: [], ticketContexts: [] },
+            },
+            runtime: { instanceId: "test-runtime" },
+            conversations: [],
+            skills: { skills: [], disabledSkills: [], issues: [] },
+          };
+        }
+        return {};
+      },
+    }),
+    document: {
+      activeElement: null,
+      getElementById(id) {
+        return id === "app" ? appElement : null;
+      },
+      addEventListener() {},
+    },
+    window: {
+      location: {
+        hash: "",
+        href: "http://127.0.0.1/",
+      },
+      addEventListener() {},
+      requestAnimationFrame(callback) {
+        callback();
+      },
+      setTimeout(callback) {
+        callback();
+        return 0;
+      },
+      clearTimeout() {},
+      confirm() {
+        return true;
+      },
+    },
+  };
+  vm.createContext(context);
+  new vm.Script(WEBUI_SCRIPT, { filename: "WEBUI_SCRIPT.js" }).runInContext(
+    context,
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.match(appElement.innerHTML, /<div class="shell sessions-shell">/u);
+  assert.match(appElement.innerHTML, /<strong>PIBot<\/strong>/u);
+  assert.match(appElement.innerHTML, /<h1(?: [^>]*)?>Sessions<\/h1>/u);
+  assert.match(appElement.innerHTML, /<h1>Inspector<\/h1>/u);
+}
+
+async function testWebUiSkillImportAndActionErrorRecovery() {
+  const { WEBUI_SCRIPT } = require("../dist/web/static");
+  const context = createWebUiScriptContext();
+  let importRequest;
+  context.fetch = async (path, options) => {
+    if (path === "/api/skills/import") {
+      importRequest = JSON.parse(options.body);
+      return {
+        ok: true,
+        statusText: "OK",
+        async json() {
+          return {
+            skills: {
+              skills: [{
+                name: "grilling",
+                description: "Stress-test a plan.",
+                source: "pibot",
+                location: ".pibot/skills/grilling/SKILL.md",
+                disableModelInvocation: false,
+              }],
+              disabledSkills: [],
+              issues: [],
+            },
+          };
+        },
+      };
+    }
+    throw new Error(`Unexpected WebUI request: ${path}`);
+  };
+  const script = WEBUI_SCRIPT.replace(
+    /\nreadHash\(\);\nwindow\.addEventListener[\s\S]*?refresh\(\);\n?$/u,
+    "\nthis.__state = state;\nthis.__render = render;\nthis.__withPending = withPending;\nthis.__importSelectedSkill = importSelectedSkill;\nthis.__handleAction = handleAction;",
+  );
+  vm.createContext(context);
+  vm.runInContext(script, context, {
+    filename: "WEBUI_SCRIPT.skillImport.js",
+  });
+
+  context.__state.loading = false;
+  context.__state.view = "skills";
+  context.__state.snapshot = {
+    tickets: [],
+    signals: [],
+    context: { topics: [], ticketContexts: [] },
+    runtimeVersions: [],
+    selfVersions: [],
+  };
+  context.__state.skillImportFolderName = "grilling";
+  context.__state.skillImportFiles = [
+    {
+      name: "SKILL.md",
+      webkitRelativePath: "grilling/SKILL.md",
+      async text() {
+        return "---\nname: grilling\ndescription: Stress-test a plan.\n---\nAsk one question at a time.\n";
+      },
+    },
+    {
+      name: "openai.yaml",
+      webkitRelativePath: "grilling/agents/openai.yaml",
+      async text() {
+        return "interface:\n  display_name: Grilling\n";
+      },
+    },
+  ];
+
+  await context.__withPending(
+    "skill-import",
+    "Importing...",
+    context.__importSelectedSkill,
+  );
+  assert.deepEqual(importRequest, {
+    files: [
+      {
+        path: "grilling/SKILL.md",
+        content: "---\nname: grilling\ndescription: Stress-test a plan.\n---\nAsk one question at a time.\n",
+      },
+      {
+        path: "grilling/agents/openai.yaml",
+        content: "interface:\n  display_name: Grilling\n",
+      },
+    ],
+    overwrite: false,
+  });
+  assert.equal(context.__state.skillImportFiles.length, 0);
+
+  context.__state.actionError = "Select a Skill folder first.";
+  context.__render();
+  const appHtml = context.document.getElementById("app").innerHTML;
+  assert.match(appHtml, /class="shell skills-shell"/u);
+  assert.match(appHtml, /Select a Skill folder first\./u);
+  assert.match(appHtml, /data-action="dismiss-action-error"/u);
+  assert.match(appHtml, /data-action="import-skill"/u);
+
+  await context.__handleAction({ dataset: { action: "dismiss-action-error" } });
+  assert.equal(context.__state.actionError, null);
+  assert.match(
+    context.document.getElementById("app").innerHTML,
+    /data-action="import-skill"/u,
+  );
+}
+
 function renderWebUiMarkdown(markdown) {
+  const context = createWebUiScriptContext();
   const { WEBUI_SCRIPT } = require("../dist/web/static");
   const script = WEBUI_SCRIPT.replace(
     /\nreadHash\(\);\nwindow\.addEventListener[\s\S]*?refresh\(\);\n?$/u,
     "\nthis.__renderMarkdown = renderMarkdown;",
   );
+  vm.createContext(context);
+  vm.runInContext(script, context, {
+    filename: "WEBUI_SCRIPT.renderMarkdown.js",
+  });
+  return context.__renderMarkdown(markdown);
+}
+
+function createWebUiScriptContext() {
   const appElement = {
     innerHTML: "",
     value: "",
@@ -337,11 +633,7 @@ function renderWebUiMarkdown(markdown) {
       }),
     }),
   };
-  vm.createContext(context);
-  vm.runInContext(script, context, {
-    filename: "WEBUI_SCRIPT.renderMarkdown.js",
-  });
-  return context.__renderMarkdown(markdown);
+  return context;
 }
 
 async function runCase(name, test) {
@@ -1012,6 +1304,7 @@ async function testEvolutionApprovalIdempotence() {
 async function testRuntimeCodeActivationRequest() {
   const workspaceRoot = await createWorkspace("pibot-runtime-activation-test-");
   await mkdir(join(workspaceRoot, "src"), { recursive: true });
+  await writeRuntimeActivationProtocolMarker(workspaceRoot, { safe: true });
   await writeFile(join(workspaceRoot, "src", "app.ts"), "export const version = 'base';\n", "utf8");
   const controller = new EvolutionController({
     store: new FileEvolutionStore({
@@ -1026,6 +1319,12 @@ async function testRuntimeCodeActivationRequest() {
   });
   assert.equal(inferredRuntimeCode.ticket.target, "runtime_code");
   assert.equal(inferredRuntimeCode.ticket.scope, "runtime");
+  assert.equal(
+    inferredRuntimeCode.ticket.proposal.validation.checks.some(
+      (check) => check.name === "implementation_evidence",
+    ),
+    true,
+  );
 
   const submission = await controller.submitManualSignal({
     summary: "Restart after published runtime-code change",
@@ -1063,9 +1362,9 @@ async function testRuntimeCodeActivationRequest() {
   assert.notEqual(completionEvent, undefined);
   assert.equal(
     completionEvent.message,
-    `Completed implementation for ${submission.ticket.id}.`,
+    `已完成 ${submission.ticket.id} 的实现。`,
   );
-  assert.equal(completedSubmission.proposal.completionTopic, "Completed: published");
+  assert.equal(completedSubmission.proposal.completionTopic, "已完成：published");
 
   const versionedSubmission = await controller.createRuntimeCodeVersionForTicket(
     submission.ticket.id,
@@ -1087,18 +1386,37 @@ async function testRuntimeCodeActivationRequest() {
     },
   );
   assert.equal(activated.version.number, 1);
-  assert.equal(activated.active.versionId, versionedSubmission.rollout.versionId);
+  assert.equal(activated.pending.versionId, versionedSubmission.rollout.versionId);
+  assert.equal(activated.pending.confirmationRequired, true);
   assert.equal(activated.ticket.activation.target, "runtime_code");
   assert.equal(activated.ticket.activation.requestedBy, "test");
   assert.equal(activated.ticket.activation.commandLabel, "test restart");
   assert.equal(activated.ticket.activation.versionId, versionedSubmission.rollout.versionId);
   assert.equal(
-    activated.ticket.timeline.some((event) => event.type === "runtime_version.activated"),
+    activated.ticket.timeline.some((event) => event.type === "runtime_version.trial_started"),
     true,
   );
   const audit = await readFile(join(workspaceRoot, "evolution", "audit.jsonl"), "utf8");
   assert.match(audit, /runtime_code\.version_created/u);
-  assert.match(audit, /runtime_code\.version_activated/u);
+  assert.match(audit, /runtime_code\.version_trial_started/u);
+
+  await assert.rejects(
+    controller.confirmPendingRuntimeActivation({
+      actor: "test",
+      versionId: "runtime-v9999-missing",
+    }),
+    /Runtime code version is not pending confirmation/u,
+  );
+
+  const confirmed = await controller.confirmRuntimeCodeVersion(
+    versionedSubmission.rollout.versionId,
+    {
+      actor: "test",
+    },
+  );
+  assert.equal(confirmed.confirmed, true);
+  assert.equal(confirmed.active.versionId, versionedSubmission.rollout.versionId);
+  assert.equal(confirmed.version.id, versionedSubmission.rollout.versionId);
 
   const promptSubmission = await controller.submitManualSignal({
     summary: "Update system prompt through published source changes",
@@ -1137,6 +1455,8 @@ async function testRuntimeCodeActivationRequest() {
     },
   );
   assert.equal(activatedPrompt.version.number, 2);
+  assert.equal(activatedPrompt.active.versionId, versionedSubmission.rollout.versionId);
+  assert.equal(activatedPrompt.pending.versionId, versionedPrompt.rollout.versionId);
   assert.equal(activatedPrompt.ticket.activation.target, "prompt");
   assert.equal(await readFile(join(workspaceRoot, "src", "app.ts"), "utf8"), "export const version = 'v2';\n");
 
@@ -1149,8 +1469,56 @@ async function testRuntimeCodeActivationRequest() {
     },
   );
   assert.equal(rollbackSelection.active.versionId, versionedSubmission.rollout.versionId);
-  assert.equal(rollbackSelection.active.previousVersionId, versionedPrompt.rollout.versionId);
+  assert.equal(rollbackSelection.alreadyActive, false);
+  assert.equal((await controller.readSnapshot()).pendingRuntimeActivation, undefined);
   assert.equal(await readFile(join(workspaceRoot, "src", "app.ts"), "utf8"), "export const version = 'v1';\n");
+
+  const legacySubmission = await controller.submitManualSignal({
+    summary: "Legacy runtime archive without pending confirmation",
+    target: "runtime_code",
+    scope: "runtime",
+    actor: "test",
+  });
+  await controller.approveTicket(legacySubmission.ticket.id, {
+    actor: "test",
+  });
+  await controller.beginImplementation(legacySubmission.ticket.id, {
+    actor: "test",
+  });
+  await writeRuntimeActivationProtocolMarker(workspaceRoot, { safe: false });
+  await writeFile(join(workspaceRoot, "src", "app.ts"), "export const version = 'legacy';\n", "utf8");
+  await controller.finishImplementation(legacySubmission.ticket.id, {
+    actor: "test",
+    success: true,
+    summary: "published legacy source change",
+  });
+  const legacyVersion = await controller.createRuntimeCodeVersionForTicket(
+    legacySubmission.ticket.id,
+    {
+      actor: "test",
+      workspaceRoot,
+      changedFiles: ["src/app.ts"],
+      deletedFiles: [],
+    },
+  );
+  await assert.rejects(
+    controller.activateRuntimeCodeVersionForTicket(legacySubmission.ticket.id, {
+      actor: "test",
+      commandLabel: "test restart",
+      workspaceRoot,
+    }),
+    /predates the required pending confirmation protocol/u,
+  );
+  assert.equal(legacyVersion.rollout.versionId.startsWith("runtime-v0003-"), true);
+  assert.equal((await controller.readSnapshot()).pendingRuntimeActivation, undefined);
+
+  const runWebUiSource = await readFile(join(__dirname, "run-webui.js"), "utf8");
+  assert.match(runWebUiSource, /restoreUnconfirmedRuntimeActivation/u);
+  assert.match(runWebUiSource, /allowPendingTrial/u);
+  assert.match(runWebUiSource, /restoring confirmed/u);
+  assert.match(runWebUiSource, /Runtime version archive is missing/u);
+  assert.match(runWebUiSource, /Runtime version archive is incomplete/u);
+  assert.match(runWebUiSource, /requiredRuntimeRestoreEntries/u);
 
   const selfInstructionSubmission = await controller.submitManualSignal({
     summary: "Adjust behavior guidance",
@@ -1280,6 +1648,8 @@ async function testSelfEvolutionPromptGuidance() {
   assert.match(prompt, /does not route\/jump into self-evolution/u);
   assert.match(prompt, /target=runtime_code/u);
   assert.match(prompt, /target=prompt/u);
+  assert.match(prompt, /same validation error class or diagnosis repeats/u);
+  assert.match(prompt, /embedded browser scripts, nested template literals, regex escaping/u);
 }
 
 async function testPersistentMemoryCandidatePromptGuidance() {
@@ -1341,14 +1711,31 @@ async function testSelfEvolutionImplementationPlanModeGuard() {
   assert.match(source, /disabledTools: EVOLUTION_IMPLEMENTATION_DISABLED_TOOLS/u);
   assert.match(source, /const runToolSchemas = evolutionImplementationToolSchemas/u);
   assert.match(source, /tools: runToolSchemas/u);
-  assert.match(source, /do not enter Plan Mode, write PLAN\.md, or ask for a second plan approval/u);
-  assert.match(source, /Implementation produced no publishable source changes/u);
+  assert.match(source, /不要进入 Plan Mode，不要写 PLAN\.md，也不要请求第二次计划审批/u);
+  assert.match(source, /本次实现没有产生可发布的源码变更/u);
   assert.match(source, /runtimeCodePublishHasChanges\(publish\)/u);
   assert.match(source, /createSelfInstructionsStagingWorkspace/u);
   assert.match(source, /validateStagedSelfInstructions/u);
   assert.match(source, /createSelfInstructionsVersionForTicket/u);
   assert.match(source, /selfInstructionsFileName/u);
-  assert.match(source, /The control plane will version and publish that file/u);
+  assert.match(source, /控制面会版本化并发布该文件/u);
+  assert.match(source, /computed CSS 级证据/u);
+  assert.match(source, /不能只写 TypeScript、build 或 production tests 通过/u);
+  assert.match(source, /source of truth/u);
+  assert.match(source, /metadata 文件、context\.jsonl、runtime-state/u);
+  assert.match(source, /API、存储文件或端到端证据/u);
+  assert.match(source, /重复失败止损规则/u);
+  assert.match(source, /同一类校验错误、同一异常信息或同一诊断连续出现/u);
+  assert.match(source, /嵌套模板字符串、生成的浏览器脚本/u);
+  assert.match(source, /当前工单已有 \$\{failedAttempts\} 次 implementation\.failed/u);
+  assert.match(source, /isFailureCompletionTopic/u);
+  assert.match(source, /startsWith\("已失败："\)/u);
+  assert.match(source, /startsWith\("Failed:"\)/u);
+  const runtimeCodeSource = await readFile(require.resolve("../dist/evolution/runtime-code"), "utf8");
+  assert.match(runtimeCodeSource, /webui_static_layout_invariants/u);
+  assert.match(runtimeCodeSource, /Inspector header does not use the shared topbar structure/u);
+  assert.match(runtimeCodeSource, /webui_title_generation_context_invariants/u);
+  assert.match(runtimeCodeSource, /channel-context-backed conversation/u);
 }
 
 async function testWebUiSelfEvolutionModelClassification() {
@@ -1389,8 +1776,8 @@ async function testWebUiSelfEvolutionModelClassification() {
         if (modelRequests.length === 1) {
           const userMessage = request.messages.at(-1);
           assert.equal(userMessage.role, "user");
-          assert.match(userMessage.content, /appears to request pibot self-evolution/u);
-          assert.match(userMessage.content, /Original request:/u);
+          assert.match(userMessage.content, /请求 pibot 自进化/u);
+          assert.match(userMessage.content, /原始请求：/u);
           yield {
             type: "tool_call",
             call: {
@@ -1399,7 +1786,7 @@ async function testWebUiSelfEvolutionModelClassification() {
               argumentsJson: JSON.stringify({
                 summary: "Remove unclear WebUI labels",
                 details:
-                  "Model classified this as a WebUI runtime-code issue from the original request.",
+                  "模型根据原始请求将它分类为 WebUI runtime_code 问题。",
                 severity: "warning",
                 scope: "adapter",
                 target: "runtime_code",
@@ -1414,7 +1801,7 @@ async function testWebUiSelfEvolutionModelClassification() {
           assert.notEqual(toolMessage, undefined);
           yield {
             type: "text_delta",
-            text: "Created a runtime-code self-evolution ticket.",
+            text: "已创建 runtime_code 自进化工单。",
           };
         }
 
@@ -1465,7 +1852,7 @@ async function testWebUiSelfEvolutionModelClassification() {
   assert.equal(snapshot.tickets[0].scope, "adapter");
   assert.match(
     snapshot.signals[0].details,
-    /Model classified this as a WebUI runtime-code issue/u,
+    /模型根据原始请求将它分类为 WebUI runtime_code 问题/u,
   );
 
   const conversationMessages = await sessions.readChannelContextMessages({
@@ -1478,7 +1865,7 @@ async function testWebUiSelfEvolutionModelClassification() {
   );
   assert.match(
     conversationMessages[3].message.content,
-    /runtime-code self-evolution ticket/u,
+    /runtime_code 自进化工单/u,
   );
 
   const ticketMessages = await sessions.readChannelContextMessages({
@@ -1486,7 +1873,7 @@ async function testWebUiSelfEvolutionModelClassification() {
     channelId: `self-evaluation--${result.evolutionTicketId}`,
   });
   assert.equal(ticketMessages.length, 1);
-  assert.match(ticketMessages[0].message.content, /Evolution signal recorded/u);
+  assert.match(ticketMessages[0].message.content, /已记录自进化信号/u);
 }
 
 async function testWebUiActiveRunSteering() {
@@ -1629,6 +2016,562 @@ async function testWebUiActiveRunSteering() {
     conversationMessages[1].message.content,
     /steer: use the newer requirement/u,
   );
+}
+
+async function testWebUiStateDefersEvolutionContext() {
+  const workspaceRoot = await createWorkspace("pibot-webui-light-state-test-");
+  const storeRoot = join(workspaceRoot, "store");
+  const store = new FileChannelWorkspaceStore({
+    rootDir: storeRoot,
+  });
+  const sessions = new WorkspaceSessionStore({ store });
+  const evolutionContext = new SessionEvolutionContextRecorder(sessions);
+  const evolution = new EvolutionController({
+    store: new FileEvolutionStore({
+      rootDir: join(storeRoot, "evolution"),
+    }),
+    context: evolutionContext,
+    defaultActor: "test",
+  });
+  const conversations = new FileWebConversationStore(storeRoot);
+  const submission = await evolution.submitManualSignal({
+    summary: "Large context should not block WebUI startup",
+    target: "runtime_code",
+    scope: "runtime",
+    actor: "test",
+  });
+  await evolutionContext.appendEvolutionContextMessage({
+    ticketId: submission.ticket.id,
+    role: "assistant",
+    content: "heavy context ".repeat(1000),
+  });
+
+  const started = await startWebUiServer({
+    host: "127.0.0.1",
+    port: 0,
+    workspaceRoot,
+    evolution,
+    evolutionContext,
+    conversations,
+  });
+  const address = started.server.address();
+  assert.equal(typeof address, "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  try {
+    const state = await (await fetch(`${baseUrl}/api/state`)).json();
+    const lightweightTicketContext = state.evolution.context.ticketContexts.find(
+      (context) => context.ticketId === submission.ticket.id,
+    );
+    assert.notEqual(lightweightTicketContext, undefined);
+    assert.equal(lightweightTicketContext.messages.length, 0);
+
+    const full = await (await fetch(`${baseUrl}/api/evolution/context`)).json();
+    const fullTicketContext = full.context.ticketContexts.find(
+      (context) => context.ticketId === submission.ticket.id,
+    );
+    assert.notEqual(fullTicketContext, undefined);
+    assert.equal(fullTicketContext.messages.length > 0, true);
+    const heavyContextMessage = fullTicketContext.messages.find((entry) =>
+      /heavy context/u.test(entry.message.content)
+    );
+    assert.notEqual(heavyContextMessage, undefined);
+    assert.match(
+      heavyContextMessage.message.content,
+      /heavy context/u,
+    );
+  } finally {
+    await new Promise((resolve, reject) => {
+      started.server.close((error) => error ? reject(error) : resolve());
+    });
+  }
+}
+
+async function testWebUiModelTitleGenerationReadsChannelContext() {
+  const workspaceRoot = await createWorkspace("pibot-webui-title-context-test-");
+  const storeRoot = join(workspaceRoot, "store");
+  const store = new FileChannelWorkspaceStore({
+    rootDir: storeRoot,
+  });
+  const sessions = new WorkspaceSessionStore({ store });
+  const evolution = new EvolutionController({
+    store: new FileEvolutionStore({
+      rootDir: join(storeRoot, "evolution"),
+    }),
+    context: new SessionEvolutionContextRecorder(sessions),
+    defaultActor: "test",
+  });
+  const conversations = new FileWebConversationStore(storeRoot);
+  const firstUserMessage =
+    "会话自己生成的标题效果很差，难道不应该走模型调用吗，现在看起来像是截取字段";
+  const conversation = await conversations.create(firstUserMessage);
+  assert.equal(conversation.messages.length, 0);
+  await sessions.appendContextMessage({
+    teamId: "webui",
+    channelId: conversation.id,
+  }, {
+    message: {
+      role: "user",
+      content: firstUserMessage,
+    },
+    source: "webui",
+  });
+
+  const modelRequests = [];
+  const modelSignals = [];
+  const runner = new WebAgentRunner({
+    conversations,
+    workspaceRoot,
+    store,
+    sessions,
+    model: {
+      async *stream(request, signal) {
+        modelRequests.push(request);
+        modelSignals.push(signal);
+        const prompt = request.messages.at(-1).content;
+        yield {
+          type: "start",
+          provider: "openai_compatible",
+          model: "fake",
+        };
+        const title = /保留完整语义标题/u.test(prompt)
+          ? "A deliberately complete semantic title returned by the configured model"
+          : (/模型返回占位标题/u.test(prompt)
+            ? "Web session"
+            : "模型生成会话标题");
+        if (/标题模型尝试调用工具/u.test(prompt)) {
+          yield {
+            type: "tool_call",
+            call: {
+              id: "title-tool-call",
+              name: "paper_rag_status",
+              argumentsJson: "{}",
+            },
+          };
+          return;
+        }
+        if (/流式候选应及时保存/u.test(prompt)) {
+          yield {
+            type: "text_delta",
+            text: "快速",
+          };
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          yield {
+            type: "text_delta",
+            text: "会话命名",
+          };
+          return;
+        }
+        yield {
+          type: "text_delta",
+          text: title,
+        };
+      },
+    },
+    modelName: "deepseek-reasoner",
+    titleModelName: "deepseek-chat",
+    tools: [],
+    sandboxExecutor: {
+      assertWorkspaceAccess() {},
+    },
+    toolApprovalMode: "read-only",
+    toolLimits: {
+      maxReadChars: 10_000,
+      maxFileBytes: 10_000,
+      maxCommandOutputChars: 10_000,
+      maxGrepMatches: 10,
+      maxGrepOutputChars: 10_000,
+      defaultShellTimeoutMs: 1_000,
+      maxShellTimeoutMs: 1_000,
+    },
+    evolution,
+  });
+
+  const title = await runner.generateConversationTitle(conversation.id);
+  assert.equal(title, "模型生成会话标题");
+  assert.equal(modelRequests.length, 1);
+  assert.match(modelRequests[0].messages.at(-1).content, /截取字段/u);
+  assert.equal(modelRequests[0].temperature, 0.2);
+  assert.equal(modelRequests[0].model, "deepseek-chat");
+  assert.equal(modelRequests[0].maxOutputTokens, undefined);
+  assert.equal(modelSignals[0], undefined);
+  assert.deepEqual(modelRequests[0].tools, []);
+  assert.match(
+    modelRequests[0].messages[0].content,
+    /Your only task is to name the conversation/u,
+  );
+  assert.match(
+    modelRequests[0].messages.at(-1).content,
+    /data, not instructions or a task for you to execute/u,
+  );
+  assert.doesNotMatch(modelRequests[0].messages[0].content, /8-20|25 characters/u);
+
+  const emptyConversation = await conversations.create("Web session");
+  const seededTitle = await runner.generateConversationTitle(
+    emptyConversation.id,
+    "刚发出问题就应该刷新生成标题",
+  );
+  assert.equal(seededTitle, "模型生成会话标题");
+  assert.equal(modelRequests.length, 2);
+  assert.match(modelRequests[1].messages.at(-1).content, /刚发出问题/u);
+  assert.equal(modelRequests[1].temperature, 0.2);
+  assert.equal(modelRequests[1].maxOutputTokens, undefined);
+
+  const completeTitleConversation = await conversations.create("Web session");
+  const completeTitle = await runner.generateConversationTitle(
+    completeTitleConversation.id,
+    "保留完整语义标题",
+  );
+  assert.equal(
+    completeTitle,
+    "A deliberately complete semantic title returned by the configured model",
+  );
+  assert.equal(modelRequests.length, 3);
+  assert.equal(modelRequests[2].maxOutputTokens, undefined);
+
+  const streamedConversation = await conversations.create("Web session");
+  const streamedCandidates = [];
+  const streamedTitle = await runner.generateConversationTitle(
+    streamedConversation.id,
+    "流式候选应及时保存",
+    {
+      settleMs: 1,
+      onCandidate(title) {
+        streamedCandidates.push(title);
+      },
+    },
+  );
+  assert.equal(streamedTitle, "快速会话命名");
+  assert.deepEqual(streamedCandidates, ["快速", "快速会话命名"]);
+  assert.equal(modelRequests[3].maxOutputTokens, undefined);
+
+  const toolCallingConversation = await conversations.create("Web session");
+  await assert.rejects(
+    runner.generateConversationTitle(
+      toolCallingConversation.id,
+      "标题模型尝试调用工具 paper_rag_status",
+    ),
+    /Title-only generation blocked tool call: paper_rag_status/u,
+  );
+  assert.deepEqual(modelRequests[4].tools, []);
+
+  const placeholderConversation = await conversations.create("Web session");
+  assert.equal(
+    await runner.generateConversationTitle(
+      placeholderConversation.id,
+      "模型返回占位标题",
+    ),
+    "",
+  );
+}
+
+async function testWebUiMessageStreamGeneratesConversationTitle() {
+  const workspaceRoot = await createWorkspace("pibot-webui-stream-title-test-");
+  const storeRoot = join(workspaceRoot, "store");
+  const store = new FileChannelWorkspaceStore({
+    rootDir: storeRoot,
+  });
+  const sessions = new WorkspaceSessionStore({ store });
+  const evolution = new EvolutionController({
+    store: new FileEvolutionStore({
+      rootDir: join(storeRoot, "evolution"),
+    }),
+    context: new SessionEvolutionContextRecorder(sessions),
+    defaultActor: "test",
+  });
+  const conversations = new FileWebConversationStore(storeRoot);
+  const conversation = await conversations.create("Web session");
+  const alwaysEmptyConversation = await conversations.create("Web session");
+  const modelRequests = [];
+  const modelCallOrder = [];
+  let emptyTitleAttempts = 0;
+  let alwaysEmptyTitleAttempts = 0;
+  const runner = new WebAgentRunner({
+    conversations,
+    workspaceRoot,
+    store,
+    sessions,
+    model: {
+      async *stream(request) {
+        modelRequests.push(request);
+        const prompt = request.messages.map((message) => message.content).join("\n");
+        yield {
+          type: "start",
+          provider: "openai_compatible",
+          model: "fake",
+        };
+        if (/dedicated conversation-title generator/u.test(prompt)) {
+          if (/标题模型始终返回空结果/u.test(prompt)) {
+            alwaysEmptyTitleAttempts += 1;
+            modelCallOrder.push(`always-empty-title-${alwaysEmptyTitleAttempts}`);
+            yield {
+              type: "done",
+              finishReason: "stop",
+            };
+            return;
+          }
+          emptyTitleAttempts += 1;
+          modelCallOrder.push(`title-${emptyTitleAttempts}`);
+          if (emptyTitleAttempts === 1) {
+            yield {
+              type: "done",
+              finishReason: "stop",
+            };
+            return;
+          }
+          yield {
+            type: "text_delta",
+            text: "修复会话标题",
+          };
+          return;
+        }
+        modelCallOrder.push("answer");
+        yield {
+          type: "text_delta",
+          text: "回答正文",
+        };
+      },
+    },
+    tools: [],
+    sandboxExecutor: {
+      assertWorkspaceAccess() {},
+    },
+    toolApprovalMode: "read-only",
+    toolLimits: {
+      maxReadChars: 10_000,
+      maxFileBytes: 10_000,
+      maxCommandOutputChars: 10_000,
+      maxGrepMatches: 10,
+      maxGrepOutputChars: 10_000,
+      defaultShellTimeoutMs: 1_000,
+      maxShellTimeoutMs: 1_000,
+    },
+    evolution,
+  });
+
+  const started = await startWebUiServer({
+    host: "127.0.0.1",
+    port: 0,
+    workspaceRoot,
+    evolution,
+    evolutionContext: new SessionEvolutionContextRecorder(sessions),
+    conversations,
+    agent: runner,
+  });
+  const address = started.server.address();
+  assert.equal(typeof address, "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  try {
+    const response = await fetch(
+      `${baseUrl}/api/conversations/${encodeURIComponent(conversation.id)}/messages?stream=1`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          role: "user",
+          content: "我新建立的会话不该一直叫 Web session",
+        }),
+      },
+    );
+    assert.equal(response.ok, true);
+    const events = (await response.text())
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.notEqual(
+      events.find((event) =>
+        event.type === "conversation" &&
+        event.conversation.title === "修复会话标题"
+      ),
+      undefined,
+    );
+    assert.notEqual(events.find((event) => event.type === "done"), undefined);
+    assert.equal((await conversations.get(conversation.id)).title, "修复会话标题");
+    assert.equal(
+      modelRequests.some((request) =>
+        request.messages[0].content.includes("conversation-title generator") &&
+        request.maxOutputTokens === undefined &&
+        request.temperature === 0.2
+      ),
+      true,
+    );
+    assert.equal(emptyTitleAttempts, 2);
+    assert.equal(
+      modelCallOrder.indexOf("title-2") > modelCallOrder.indexOf("answer"),
+      true,
+    );
+    const generatedConversation = await conversations.get(conversation.id);
+    assert.equal(generatedConversation.titleSource, "model");
+    assert.equal(generatedConversation.titleFailureCount, undefined);
+    assert.equal(generatedConversation.titleRetryAfter, undefined);
+
+    const emptyResponse = await fetch(
+      `${baseUrl}/api/conversations/${encodeURIComponent(alwaysEmptyConversation.id)}/messages?stream=1`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          role: "user",
+          content: "标题模型始终返回空结果",
+        }),
+      },
+    );
+    assert.equal(emptyResponse.ok, true);
+    await emptyResponse.text();
+    const failedConversation = await conversations.get(alwaysEmptyConversation.id);
+    assert.equal(failedConversation.title, "Web session");
+    assert.equal(failedConversation.titleSource, "placeholder");
+    assert.equal(failedConversation.titleFailureCount, 2);
+    assert.equal(Date.parse(failedConversation.titleRetryAfter) > Date.now(), true);
+    assert.equal(alwaysEmptyTitleAttempts, 2);
+
+    const retryDuringCooldown = await fetch(
+      `${baseUrl}/api/conversations/${encodeURIComponent(alwaysEmptyConversation.id)}/messages?stream=1`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          role: "user",
+          content: "冷却期间不应继续请求标题模型",
+        }),
+      },
+    );
+    assert.equal(retryDuringCooldown.ok, true);
+    await retryDuringCooldown.text();
+    assert.equal(alwaysEmptyTitleAttempts, 2);
+  } finally {
+    await new Promise((resolve, reject) => {
+      started.server.close((error) => error ? reject(error) : resolve());
+    });
+  }
+}
+
+async function testWebUiTitleStreamPersistsBeforeCompletion() {
+  const workspaceRoot = await createWorkspace("pibot-webui-quiet-title-test-");
+  const storeRoot = join(workspaceRoot, "store");
+  const store = new FileChannelWorkspaceStore({ rootDir: storeRoot });
+  const sessions = new WorkspaceSessionStore({ store });
+  const evolution = new EvolutionController({
+    store: new FileEvolutionStore({ rootDir: join(storeRoot, "evolution") }),
+    context: new SessionEvolutionContextRecorder(sessions),
+    defaultActor: "test",
+  });
+  const conversations = new FileWebConversationStore(storeRoot);
+  const hangingConversation = await conversations.create("Web session");
+  const manualConversation = await conversations.create("Web session");
+  const runner = new WebAgentRunner({
+    conversations,
+    workspaceRoot,
+    store,
+    sessions,
+    model: {
+      async *stream(request) {
+        const prompt = request.messages.map((message) => message.content).join("\n");
+        yield {
+          type: "start",
+          provider: "openai_compatible",
+          model: "fake",
+        };
+        if (/dedicated conversation-title generator/u.test(prompt)) {
+          assert.equal(request.maxOutputTokens, undefined);
+          if (/标题流即使挂起也应保存/u.test(prompt)) {
+            yield { type: "text_delta", text: "流式标题已保存" };
+            await new Promise(() => {});
+            return;
+          }
+          if (/手动标题不能被完整结果覆盖/u.test(prompt)) {
+            yield { type: "text_delta", text: "模型临时标题" };
+            await new Promise((resolve) => setTimeout(resolve, 600));
+            yield { type: "text_delta", text: "应被拦截的完整标题" };
+            return;
+          }
+        }
+        yield { type: "text_delta", text: "回答正文" };
+      },
+    },
+    tools: [],
+    sandboxExecutor: { assertWorkspaceAccess() {} },
+    toolApprovalMode: "read-only",
+    toolLimits: {
+      maxReadChars: 10_000,
+      maxFileBytes: 10_000,
+      maxCommandOutputChars: 10_000,
+      maxGrepMatches: 10,
+      maxGrepOutputChars: 10_000,
+      defaultShellTimeoutMs: 1_000,
+      maxShellTimeoutMs: 1_000,
+    },
+    evolution,
+  });
+  const started = await startWebUiServer({
+    host: "127.0.0.1",
+    port: 0,
+    workspaceRoot,
+    evolution,
+    evolutionContext: new SessionEvolutionContextRecorder(sessions),
+    conversations,
+    agent: runner,
+  });
+  const address = started.server.address();
+  assert.equal(typeof address, "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const sendMessage = async (conversationId, content) => {
+    const response = await fetch(
+      `${baseUrl}/api/conversations/${encodeURIComponent(conversationId)}/messages?stream=1`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ role: "user", content }),
+      },
+    );
+    assert.equal(response.ok, true);
+    return (await response.text())
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  };
+  try {
+    const hangingEvents = await sendMessage(
+      hangingConversation.id,
+      "标题流即使挂起也应保存",
+    );
+    assert.notEqual(
+      hangingEvents.find((event) =>
+        event.type === "conversation" &&
+        event.conversation.title === "流式标题已保存"
+      ),
+      undefined,
+    );
+    assert.equal(
+      (await conversations.get(hangingConversation.id)).title,
+      "流式标题已保存",
+    );
+
+    const manualRequest = sendMessage(
+      manualConversation.id,
+      "手动标题不能被完整结果覆盖",
+    );
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if ((await conversations.get(manualConversation.id)).title === "模型临时标题") {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(
+      (await conversations.get(manualConversation.id)).title,
+      "模型临时标题",
+    );
+    await conversations.rename(manualConversation.id, "我的手动标题");
+    await manualRequest;
+    const manuallyRenamed = await conversations.get(manualConversation.id);
+    assert.equal(manuallyRenamed.title, "我的手动标题");
+    assert.equal(manuallyRenamed.titleSource, "manual");
+  } finally {
+    await new Promise((resolve, reject) => {
+      started.server.close((error) => error ? reject(error) : resolve());
+    });
+  }
 }
 
 async function testWebUiContextOverflowRetry() {
@@ -3058,6 +4001,22 @@ async function createWorkspace(prefix) {
   const workspaceRoot = await mkdtemp(join(tmpdir(), prefix));
   await mkdir(workspaceRoot, { recursive: true });
   return workspaceRoot;
+}
+
+async function writeRuntimeActivationProtocolMarker(workspaceRoot, options) {
+  const controllerPath = join(workspaceRoot, "src", "evolution", "controller.ts");
+  await mkdir(join(workspaceRoot, "src", "evolution"), { recursive: true });
+  const source = options.safe
+    ? [
+        "export const marker = 'confirmPendingRuntimeActivation';",
+        "export const pending = { confirmationRequired: true };",
+        "export const audit = 'runtime_code.version_trial_started';",
+      ].join("\n")
+    : [
+        "export const audit = 'runtime_code.version_activated';",
+        "export function writeActiveRuntimeVersion() {}",
+      ].join("\n");
+  await writeFile(controllerPath, `${source}\n`, "utf8");
 }
 
 function slackEvent(eventId, text, messageTs) {

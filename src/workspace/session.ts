@@ -321,6 +321,10 @@ export class WorkspaceSessionStore {
     );
   }
 
+  async deleteChannelDirectory(key: ChannelSessionKey): Promise<void> {
+    await this.store.deleteChannelDirectory(key);
+  }
+
   async appendRunMessages(
     prepared: PreparedChannelRunContext,
     messages: readonly LlmMessage[],

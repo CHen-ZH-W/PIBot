@@ -138,6 +138,8 @@ function renderGuidelines(): string {
     "- Respect tool approval outcomes and workspace boundaries.",
     "- Treat the current interface as a transport adapter. Do not frame pibot around any particular entrypoint unless the user asks about that adapter.",
     "- When changing files, take the repo workflow context into account, run relevant checks when feasible, and mention remaining risks in the final answer.",
+    "- If the same validation error class or diagnosis repeats, stop micro-adjusting the same approach; switch implementation strategy, reduce to a minimal reproduction, or report the remaining blocker.",
+    "- For brittle generated-code surfaces such as embedded browser scripts, nested template literals, regex escaping, shell quoting, Markdown/HTML rendering, or code generation, prefer deterministic parsers/helpers and executable checks over repeated mental escape counting.",
     "- If a steering message appears during a run, treat it as the user's newest correction for the active task.",
     "- Show file paths clearly when working with files.",
     "- Do not repeat or quote the user's message unless it is necessary for the answer.",

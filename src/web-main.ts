@@ -19,7 +19,10 @@ import { ChannelRepoWorkflow } from "./workspace/repo";
 import { createSandboxExecutor, type SandboxExecutor } from "./workspace/sandbox";
 import { WorkspaceSessionStore } from "./workspace/session";
 import { FileChannelWorkspaceStore } from "./workspace/store";
-import { WebAgentRunner } from "./web/agent";
+import {
+  resolveConversationTitleModelName,
+  WebAgentRunner,
+} from "./web/agent";
 import { FileWebConversationStore } from "./web/conversations";
 import { startWebUiServer } from "./web/server";
 
@@ -27,11 +30,16 @@ async function main(): Promise<void> {
   const workspaceRoot = process.env.WORKSPACE_ROOT ?? process.cwd();
   const storeRoot = process.env.PIBOT_STORE_ROOT ?? path.join(workspaceRoot, ".pibot");
   const pibotSkillsRoot = path.join(storeRoot, "skills");
-  const host = process.env.PIBOT_WEBUI_HOST ?? "127.0.0.1";
+  const host = process.env.PIBOT_WEBUI_HOST ?? "0.0.0.0";
   const port = readPositiveIntegerEnv("PIBOT_WEBUI_PORT") ?? 8787;
   const logger = new ConsoleJsonLogger();
+  const configuredModel = readOptionalEnv("OPENAI_MODEL");
+  const titleModelName = resolveConversationTitleModelName(
+    configuredModel,
+    readOptionalEnv("PIBOT_TITLE_MODEL"),
+  );
   const publicBaseUrl =
-    process.env.PIBOT_WEBUI_PUBLIC_URL ?? `http://${host}:${port}`;
+    process.env.PIBOT_WEBUI_PUBLIC_URL ?? browserUrlFor(host, port);
   const approvalTimeoutMs =
     readPositiveIntegerEnv("TOOL_APPROVAL_TIMEOUT_MS") ?? 300000;
   const sandbox = createSandboxExecutorFromEnv(workspaceRoot);
@@ -118,6 +126,7 @@ async function main(): Promise<void> {
   await startWebUiServer({
     host,
     port,
+    publicUrl: publicBaseUrl,
     workspaceRoot,
     logger,
     evolution,
@@ -129,6 +138,8 @@ async function main(): Promise<void> {
     maxSkills: readPositiveIntegerEnv("SKILLS_MAX_COUNT") ?? 100,
     maxSkillFileBytes:
       readPositiveIntegerEnv("SKILLS_MAX_FILE_BYTES") ?? 64_000,
+    titleEmptyRetryMs:
+      readPositiveIntegerEnv("PIBOT_TITLE_EMPTY_RETRY_MS") ?? 300_000,
     agent: new WebAgentRunner({
       conversations,
       workspaceRoot,
@@ -175,10 +186,8 @@ async function main(): Promise<void> {
         readPositiveIntegerEnv("SKILLS_MAX_FILE_BYTES") ?? 64_000,
       pibotSkillsRoot,
       thinkingLanguage: readOptionalEnv("PIBOT_THINKING_LANGUAGE") ?? "zh-CN",
-      ...(process.env.OPENAI_MODEL === undefined ||
-        process.env.OPENAI_MODEL.length === 0
-        ? {}
-        : { modelName: process.env.OPENAI_MODEL }),
+      ...(configuredModel === undefined ? {} : { modelName: configuredModel }),
+      ...(titleModelName === undefined ? {} : { titleModelName }),
     }),
   });
 }
@@ -290,6 +299,13 @@ function readToolApprovalModeEnv(): ToolApprovalMode {
 
 function defaultModelContextWindowTokens(): number {
   return 262144;
+}
+
+function browserUrlFor(host: string, port: number): string {
+  if (host === "0.0.0.0" || host === "::") {
+    return `http://127.0.0.1:${port}`;
+  }
+  return `http://${host}:${port}`;
 }
 
 function createSandboxExecutorFromEnv(workspaceRoot: string): {

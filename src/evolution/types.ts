@@ -169,6 +169,10 @@ export interface ActiveRuntimeCodeVersion {
   readonly commandLabel?: string;
 }
 
+export interface PendingRuntimeCodeActivation extends ActiveRuntimeCodeVersion {
+  readonly confirmationRequired: true;
+}
+
 export interface EvolutionRunFailureInput {
   readonly runId: AgentRunId;
   readonly channelId?: SlackChannelId;

@@ -3,6 +3,7 @@ import type { EvolutionContextRecorder } from "./channel-context";
 import {
   activateRuntimeCodeVersionArchive,
   captureRuntimeCodeVersionArchive,
+  runtimeCodeArchiveRequiresActivationConfirmation,
   type RuntimeCodePublishReport,
 } from "./runtime-code";
 import type { FileEvolutionStore, EvolutionStoreSnapshot } from "./store";
@@ -24,6 +25,7 @@ import type {
   EvolutionTicketStatus,
   EvolutionTimelineEvent,
   EvolutionValidationResult,
+  PendingRuntimeCodeActivation,
   RuntimeCodeVersion,
 } from "./types";
 
@@ -58,9 +60,17 @@ export interface UpdateEvolutionProposalInput {
 export interface RuntimeCodeVersionActivationResult {
   readonly version: RuntimeCodeVersion;
   readonly ticket?: EvolutionTicket;
-  readonly active: ActiveRuntimeCodeVersion;
+  readonly active?: ActiveRuntimeCodeVersion;
+  readonly pending?: PendingRuntimeCodeActivation;
   readonly publish: RuntimeCodePublishReport;
   readonly alreadyActive: boolean;
+}
+
+export interface RuntimeCodeVersionConfirmationResult {
+  readonly version?: RuntimeCodeVersion;
+  readonly ticket?: EvolutionTicket;
+  readonly active?: ActiveRuntimeCodeVersion;
+  readonly confirmed: boolean;
 }
 
 export class EvolutionController implements EvolutionRunFailureReporter {
@@ -126,14 +136,14 @@ export class EvolutionController implements EvolutionRunFailureReporter {
         updatedAt: now,
         timeline: [
           ...ticket.timeline,
-          timeline("proposal.updated", "Proposal updated.", input.actor),
+          timeline("proposal.updated", "提案已更新。", input.actor),
         ],
       };
       await this.replaceTicket(updated);
       await this.recordContextMessage(updated.id, [
-        `Proposal updated for ${updated.id}: ${updated.title}`,
-        `Topic: ${proposal.versionTopic ?? updated.title}`,
-        `Status: ${updated.status}`,
+        `已更新提案 ${updated.id}：${updated.title}`,
+        `主题：${proposal.versionTopic ?? updated.title}`,
+        `状态：${updated.status}`,
       ].join("\n"));
       return updated;
     });
@@ -192,14 +202,14 @@ export class EvolutionController implements EvolutionRunFailureReporter {
         updatedAt: approval.decidedAt,
         timeline: [
           ...ticket.timeline,
-          timeline("approval.approved", "Proposal approved.", approval.decidedBy),
+          timeline("approval.approved", "提案已批准。", approval.decidedBy),
         ],
       };
       await this.replaceTicket(updated);
       await this.recordContextMessage(updated.id, [
-        `Proposal approved for ${updated.id}: ${updated.title}`,
-        `Topic: ${updated.proposal.versionTopic ?? updated.title}`,
-        `Approved by: ${approval.decidedBy}`,
+        `已批准提案 ${updated.id}：${updated.title}`,
+        `主题：${updated.proposal.versionTopic ?? updated.title}`,
+        `批准人：${approval.decidedBy}`,
       ].join("\n"));
       return updated;
     });
@@ -236,14 +246,14 @@ export class EvolutionController implements EvolutionRunFailureReporter {
         updatedAt: approval.decidedAt,
         timeline: [
           ...ticket.timeline,
-          timeline("approval.rejected", "Proposal rejected.", approval.decidedBy),
+          timeline("approval.rejected", "提案已拒绝。", approval.decidedBy),
         ],
       };
       await this.replaceTicket(updated);
       await this.recordContextMessage(updated.id, [
-        `Proposal rejected for ${updated.id}: ${updated.title}`,
-        `Topic: ${updated.proposal.versionTopic ?? updated.title}`,
-        `Rejected by: ${approval.decidedBy}`,
+        `已拒绝提案 ${updated.id}：${updated.title}`,
+        `主题：${updated.proposal.versionTopic ?? updated.title}`,
+        `拒绝人：${approval.decidedBy}`,
       ].join("\n"));
       return updated;
     });
@@ -264,21 +274,21 @@ export class EvolutionController implements EvolutionRunFailureReporter {
         ticket,
         "applying",
         "implementation.started",
-        "Started self-evolution implementation run.",
+        "已启动自进化实现运行。",
         input.actor,
       );
       await this.options.store.appendAudit({
         ...timeline(
           "implementation.started",
-          `Started implementation for ${ticket.id}.`,
+          `已启动 ${ticket.id} 的实现。`,
           actor(input.actor, this.options.defaultActor),
         ),
         ticketId: ticket.id,
       });
       await this.recordContextMessage(updated.id, [
-        `Implementation started for ${updated.id}: ${updated.title}`,
-        `Topic: ${updated.proposal.versionTopic ?? updated.title}`,
-        `Target: ${updated.target}`,
+        `已启动实现 ${updated.id}：${updated.title}`,
+        `主题：${updated.proposal.versionTopic ?? updated.title}`,
+        `目标：${updated.target}`,
       ].join("\n"));
       return updated;
     });
@@ -320,15 +330,15 @@ export class EvolutionController implements EvolutionRunFailureReporter {
       await this.options.store.appendAudit({
         ...timeline(
           input.success ? "implementation.completed" : "implementation.failed",
-          `${input.success ? "Completed" : "Failed"} implementation for ${ticket.id}.`,
+          `${input.success ? "已完成" : "已失败"} ${ticket.id} 的实现。`,
           actor(input.actor, this.options.defaultActor),
         ),
         ticketId: ticket.id,
       });
       await this.recordContextMessage(completed.id, [
-        `${input.success ? "Implementation completed" : "Implementation failed"} for ${completed.id}: ${completed.title}`,
-        `Topic: ${evolutionTopicForTicket(completed)}`,
-        ...(input.summary === undefined ? [] : [`Summary: ${input.summary}`]),
+        `${input.success ? "实现已完成" : "实现已失败"} ${completed.id}：${completed.title}`,
+        `主题：${evolutionTopicForTicket(completed)}`,
+        ...(input.summary === undefined ? [] : [`摘要：${input.summary}`]),
       ].join("\n"));
       return completed;
     });
@@ -389,7 +399,7 @@ export class EvolutionController implements EvolutionRunFailureReporter {
           ...ticket.timeline,
           timeline(
             "runtime_version.created",
-            `Created runtime version ${runtimeVersionName(version)}.`,
+            `已创建运行时代码版本 ${runtimeVersionName(version)}。`,
             version.createdBy,
           ),
         ],
@@ -398,16 +408,16 @@ export class EvolutionController implements EvolutionRunFailureReporter {
       await this.options.store.appendAudit({
         ...timeline(
           "runtime_code.version_created",
-          `Created ${runtimeVersionName(version)} from ${ticket.id}.`,
+          `已从 ${ticket.id} 创建 ${runtimeVersionName(version)}。`,
           version.createdBy,
         ),
         ticketId: ticket.id,
       });
       await this.recordContextMessage(updated.id, [
-        `Runtime code version created: ${runtimeVersionName(version)}`,
-        `Topic: ${version.topic ?? version.label}`,
-        `Ticket: ${ticket.id}`,
-        `Created by: ${version.createdBy}`,
+        `已创建运行时代码版本：${runtimeVersionName(version)}`,
+        `主题：${version.topic ?? version.label}`,
+        `工单：${ticket.id}`,
+        `创建人：${version.createdBy}`,
       ].join("\n"));
       return updated;
     });
@@ -462,7 +472,7 @@ export class EvolutionController implements EvolutionRunFailureReporter {
           ...ticket.timeline,
           timeline(
             "self_instructions.version_created",
-            `Created self-instructions version ${version.id}.`,
+            `已创建自定义指令版本 ${version.id}。`,
             version.createdBy,
           ),
         ],
@@ -471,16 +481,16 @@ export class EvolutionController implements EvolutionRunFailureReporter {
       await this.options.store.appendAudit({
         ...timeline(
           "self_instructions.version_created",
-          `Created ${version.id} from ${ticket.id}.`,
+          `已从 ${ticket.id} 创建 ${version.id}。`,
           version.createdBy,
         ),
         ticketId: ticket.id,
       });
       await this.recordContextMessage(updated.id, [
-        `Self-instructions version created: ${version.id}`,
-        `Topic: ${version.topic ?? version.label}`,
-        `Ticket: ${ticket.id}`,
-        `Created by: ${version.createdBy}`,
+        `已创建自定义指令版本：${version.id}`,
+        `主题：${version.topic ?? version.label}`,
+        `工单：${ticket.id}`,
+        `创建人：${version.createdBy}`,
       ].join("\n"));
       return updated;
     });
@@ -509,7 +519,7 @@ export class EvolutionController implements EvolutionRunFailureReporter {
         ticket,
         "applying",
         "rollout.started",
-        "Applying self-instructions version.",
+        "正在应用自定义指令版本。",
         input.actor,
       );
       const previousVersion = latestVersion(await this.options.store.readSelfVersions());
@@ -535,7 +545,7 @@ export class EvolutionController implements EvolutionRunFailureReporter {
         status: "applied",
         proposal: {
           ...applying.proposal,
-          completionTopic: `Applied self-instructions: ${versionTopic}`,
+          completionTopic: `已应用自定义指令：${versionTopic}`,
         },
         rollout,
         updatedAt: version.createdAt,
@@ -543,7 +553,7 @@ export class EvolutionController implements EvolutionRunFailureReporter {
           ...applying.timeline,
           timeline(
             "rollout.applied",
-            `Applied self-instructions version ${version.id}.`,
+            `已应用自定义指令版本 ${version.id}。`,
             version.createdBy,
           ),
         ],
@@ -552,16 +562,16 @@ export class EvolutionController implements EvolutionRunFailureReporter {
       await this.options.store.appendAudit({
         ...timeline(
           "self_instructions.version_created",
-          `Created ${version.id} from ${ticket.id}.`,
+          `已从 ${ticket.id} 创建 ${version.id}。`,
           version.createdBy,
         ),
         ticketId: ticket.id,
       });
       await this.recordContextMessage(updated.id, [
-        `Self-instructions version applied: ${version.id}`,
-        `Topic: ${evolutionTopicForTicket(updated)}`,
-        `Ticket: ${ticket.id}`,
-        `Applied by: ${version.createdBy}`,
+        `已应用自定义指令版本：${version.id}`,
+        `主题：${evolutionTopicForTicket(updated)}`,
+        `工单：${ticket.id}`,
+        `应用人：${version.createdBy}`,
       ].join("\n"));
       return updated;
     });
@@ -604,8 +614,8 @@ export class EvolutionController implements EvolutionRunFailureReporter {
       const requestedBy = actor(input.actor, this.options.defaultActor);
       const requestedAt = new Date().toISOString();
       const detail = input.commandLabel === undefined
-        ? "Requested runtime restart to activate published code."
-        : `Requested runtime restart via ${input.commandLabel}.`;
+        ? "已请求重启运行时以启用已发布代码。"
+        : `已通过 ${input.commandLabel} 请求重启运行时。`;
       const updated: EvolutionTicket = {
         ...ticket,
         activation: {
@@ -625,16 +635,16 @@ export class EvolutionController implements EvolutionRunFailureReporter {
       await this.options.store.appendAudit({
         ...timeline(
           "runtime_activation.requested",
-          `Requested runtime activation for ${ticket.id}.`,
+          `已请求启用 ${ticket.id} 的运行时版本。`,
           requestedBy,
         ),
         ticketId: ticket.id,
       });
       await this.recordContextMessage(updated.id, [
-        `Runtime activation requested for ${updated.id}: ${updated.title}`,
-        `Topic: ${evolutionTopicForTicket(updated)}`,
-        `Requested by: ${requestedBy}`,
-        ...(input.commandLabel === undefined ? [] : [`Restart: ${input.commandLabel}`]),
+        `已请求启用运行时版本 ${updated.id}：${updated.title}`,
+        `主题：${evolutionTopicForTicket(updated)}`,
+        `请求人：${requestedBy}`,
+        ...(input.commandLabel === undefined ? [] : [`重启命令：${input.commandLabel}`]),
       ].join("\n"));
       return updated;
     });
@@ -672,11 +682,36 @@ export class EvolutionController implements EvolutionRunFailureReporter {
     input: {
       readonly actor?: string;
       readonly commandLabel?: string;
+      readonly confirmPending?: boolean;
       readonly workspaceRoot: string;
     },
   ): Promise<RuntimeCodeVersionActivationResult> {
     return this.enqueue(() =>
       this.activateRuntimeCodeVersionUnlocked(versionId, input)
+    );
+  }
+
+  confirmPendingRuntimeActivation(input: {
+    readonly actor?: string;
+    readonly versionId?: string;
+  }): Promise<ActiveRuntimeCodeVersion | undefined> {
+    return this.enqueue(async () => {
+      const result = await this.confirmPendingRuntimeActivationUnlocked(input);
+      return result.active;
+    });
+  }
+
+  confirmRuntimeCodeVersion(
+    versionId: string,
+    input: {
+      readonly actor?: string;
+    },
+  ): Promise<RuntimeCodeVersionConfirmationResult> {
+    return this.enqueue(() =>
+      this.confirmPendingRuntimeActivationUnlocked({
+        ...input,
+        versionId,
+      })
     );
   }
 
@@ -693,27 +728,185 @@ export class EvolutionController implements EvolutionRunFailureReporter {
       }
       const version = await this.options.store.writeSelfInstructionsVersion({
         instructions: target.instructions,
-        label: `Rollback to ${target.id}`,
-        topic: `Rollback: ${target.topic ?? target.label}`,
+        label: `回滚到 ${target.id}`,
+        topic: `回滚：${target.topic ?? target.label}`,
         createdBy: actor(input.actor, this.options.defaultActor),
       });
       await this.options.store.appendAudit({
         ...timeline(
           "self_instructions.rolled_back",
           input.note === undefined
-            ? `Rolled back to ${target.id}.`
-            : `Rolled back to ${target.id}. ${input.note}`,
+            ? `已回滚到 ${target.id}。`
+            : `已回滚到 ${target.id}。${input.note}`,
           version.createdBy,
         ),
       });
       await this.recordContextMessage(undefined, [
-        `Self-instructions rollback applied: ${version.id}`,
-        `Topic: ${version.topic ?? version.label}`,
-        `Rolled back to: ${target.id}`,
-        `Applied by: ${version.createdBy}`,
+        `已应用自定义指令回滚：${version.id}`,
+        `主题：${version.topic ?? version.label}`,
+        `回滚到：${target.id}`,
+        `应用人：${version.createdBy}`,
       ].join("\n"));
       return version;
     });
+  }
+
+  deleteTicket(
+    ticketId: string,
+    input: {
+      readonly actor?: string;
+    },
+  ): Promise<{ deleted: boolean; ticketId: string }> {
+    return this.enqueue(async () => {
+      const tickets = await this.options.store.readTickets();
+      const ticket = tickets.find((candidate) => candidate.id === ticketId);
+      if (ticket === undefined) {
+        throw new Error(`Unknown evolution ticket: ${ticketId}`);
+      }
+      if (ticket.status === "applying") {
+        throw new Error(
+          "Cannot delete a ticket while its implementation is running",
+        );
+      }
+      const active = await this.options.store.readActiveRuntimeVersion();
+      const pending = await this.options.store.readPendingRuntimeActivation();
+      const versionId = ticket.rollout?.versionId;
+      if (versionId !== undefined) {
+        if (active?.versionId === versionId) {
+          throw new Error(
+            "Cannot delete this ticket because its runtime version is active",
+          );
+        }
+        if (pending?.versionId === versionId) {
+          throw new Error(
+            "Cannot delete this ticket because its runtime version is pending activation",
+          );
+        }
+        const deletedVersion =
+          ticket.target === "self_instructions"
+            ? await this.options.store.deleteSelfVersion(versionId)
+            : await this.options.store.deleteRuntimeVersion(versionId);
+        if (deletedVersion) {
+          await this.options.store.appendAudit({
+            ...timeline(
+              "runtime_version.deleted",
+              `已级联删除 ${ticket.id} 关联的版本 ${versionId}。`,
+              actor(input.actor, this.options.defaultActor),
+            ),
+            ticketId: ticket.id,
+          });
+        }
+      }
+      await this.options.store.deleteTicket(ticketId);
+      const deletedBy = actor(input.actor, this.options.defaultActor);
+      await this.options.store.appendAudit({
+        ...timeline(
+          "ticket.deleted",
+          `已删除工单 ${ticketId}：${ticket.title}。`,
+          deletedBy,
+        ),
+        ticketId,
+      });
+      if (this.options.context !== undefined) {
+        try {
+          await this.options.context.deleteEvolutionContext(ticketId);
+        } catch {
+          // best-effort cleanup of ticket context storage
+        }
+      }
+      return { deleted: true, ticketId };
+    });
+  }
+
+  deleteRuntimeVersion(
+    versionId: string,
+    input: {
+      readonly actor?: string;
+    },
+  ): Promise<{ deleted: boolean; versionId: string }> {
+    return this.enqueue(async () => {
+      const versions = await this.options.store.readRuntimeVersions();
+      const version = versions.find((candidate) => candidate.id === versionId);
+      if (version === undefined) {
+        throw new Error(`Unknown runtime code version: ${versionId}`);
+      }
+      const active = await this.options.store.readActiveRuntimeVersion();
+      const pending = await this.options.store.readPendingRuntimeActivation();
+      if (active?.versionId === versionId) {
+        throw new Error("Cannot delete the active runtime version");
+      }
+      if (pending?.versionId === versionId) {
+        throw new Error(
+          "Cannot delete a pending runtime version; confirm or cancel it first",
+        );
+      }
+      await this.options.store.deleteRuntimeVersion(versionId);
+      await this.detachTicketVersionReferences(versionId);
+      await this.options.store.appendAudit({
+        ...timeline(
+          "runtime_code.version_deleted",
+          `已删除运行时代码版本 ${runtimeVersionName(version)}。`,
+          actor(input.actor, this.options.defaultActor),
+        ),
+        ...(version.sourceTicketId === undefined
+          ? {}
+          : { ticketId: version.sourceTicketId }),
+      });
+      return { deleted: true, versionId };
+    });
+  }
+
+  deleteSelfVersion(
+    versionId: string,
+    input: {
+      readonly actor?: string;
+    },
+  ): Promise<{ deleted: boolean; versionId: string }> {
+    return this.enqueue(async () => {
+      const versions = await this.options.store.readSelfVersions();
+      const version = versions.find((candidate) => candidate.id === versionId);
+      if (version === undefined) {
+        throw new Error(`Unknown self-instructions version: ${versionId}`);
+      }
+      await this.options.store.deleteSelfVersion(versionId);
+      await this.detachTicketVersionReferences(versionId);
+      await this.options.store.appendAudit({
+        ...timeline(
+          "self_instructions.version_deleted",
+          `已删除自定义指令版本 ${version.id}。`,
+          actor(input.actor, this.options.defaultActor),
+        ),
+        ...(version.sourceTicketId === undefined
+          ? {}
+          : { ticketId: version.sourceTicketId }),
+      });
+      return { deleted: true, versionId };
+    });
+  }
+
+  private async detachTicketVersionReferences(versionId: string): Promise<void> {
+    const tickets = await this.options.store.readTickets();
+    const affected = tickets.filter(
+      (ticket) => ticket.rollout?.versionId === versionId,
+    );
+    if (affected.length === 0) {
+      return;
+    }
+    const updatedAt = new Date().toISOString();
+    await this.options.store.writeTickets(tickets.map((ticket) =>
+      ticket.rollout?.versionId === versionId
+        ? omitTicketRollout(ticket, {
+            updatedAt,
+            timeline: [
+              ...ticket.timeline,
+              timeline(
+                "runtime_version.deleted",
+                `已删除关联版本 ${versionId}，移除了该工单的版本引用。`,
+              ),
+            ],
+          })
+        : ticket,
+    ));
   }
 
   ticketUrl(ticketId: string): string | undefined {
@@ -726,7 +919,7 @@ export class EvolutionController implements EvolutionRunFailureReporter {
   private async submitRunFailureUnlocked(
     input: EvolutionRunFailureInput,
   ): Promise<EvolutionSubmissionResult> {
-    const summary = `Run ${input.runId} ended with ${input.errorCode}`;
+    const summary = `运行 ${input.runId} 以 ${input.errorCode} 结束`;
     const source = input.source ?? (
       input.adapter === undefined || input.adapter === "slack"
         ? "slack_error"
@@ -740,8 +933,8 @@ export class EvolutionController implements EvolutionRunFailureReporter {
       target: "self_instructions",
       summary,
       details:
-        `${surface} run failed with reason=${input.reason}, errorCode=${input.errorCode}. ` +
-        "Review whether pibot should adjust its own prompt, policy, tools, or runtime behavior.",
+        `${surface} 运行失败：reason=${input.reason}, errorCode=${input.errorCode}。` +
+        "请评估 pibot 是否需要调整自身提示词、策略、工具或运行时行为。",
       signature: signatureFor("global_agent", "self_instructions", input.errorCode),
       run: {
         runId: input.runId,
@@ -782,7 +975,7 @@ export class EvolutionController implements EvolutionRunFailureReporter {
     await this.options.store.appendSignal(signal);
     const ticket = await this.createOrUpdateTicketForSignal(signal);
     await this.options.store.appendAudit({
-      ...timeline("signal.recorded", `Recorded signal ${signal.id}.`),
+      ...timeline("signal.recorded", `已记录信号 ${signal.id}。`),
       ticketId: ticket.id,
     });
     await this.recordContextMessage(ticket.id, contextMessageForSignal(signal, ticket));
@@ -811,7 +1004,7 @@ export class EvolutionController implements EvolutionRunFailureReporter {
           ...existing.timeline,
           timeline(
             "signal.linked",
-            `Linked ${signal.source} signal ${signal.id}.`,
+            `已关联 ${signal.source} 信号 ${signal.id}。`,
           ),
         ],
       };
@@ -833,8 +1026,8 @@ export class EvolutionController implements EvolutionRunFailureReporter {
       signalIds: [signal.id],
       proposal,
       timeline: [
-        timeline("ticket.created", `Created from signal ${signal.id}.`),
-        timeline("proposal.created", "Generated initial proposal."),
+        timeline("ticket.created", `已由信号 ${signal.id} 创建。`),
+        timeline("proposal.created", "已生成初始提案。"),
       ],
     };
     await this.options.store.writeTickets([...tickets, ticket]);
@@ -929,6 +1122,7 @@ export class EvolutionController implements EvolutionRunFailureReporter {
     input: {
       readonly actor?: string;
       readonly commandLabel?: string;
+      readonly confirmPending?: boolean;
       readonly workspaceRoot: string;
     },
     sourceTicket?: EvolutionTicket,
@@ -942,12 +1136,45 @@ export class EvolutionController implements EvolutionRunFailureReporter {
     const ticket = sourceTicket ??
       tickets.find((candidate) => candidate.id === version.sourceTicketId);
     const currentActive = await this.options.store.readActiveRuntimeVersion();
+    const currentPending = await this.options.store.readPendingRuntimeActivation();
     const emptyPublish: RuntimeCodePublishReport = {
       changedFiles: [],
       deletedFiles: [],
       conflicts: [],
     };
     if (currentActive?.versionId === version.id) {
+      if (currentPending !== undefined) {
+        const publish = await activateRuntimeCodeVersionArchive({
+          archiveRoot: this.options.store.getRuntimeCodeVersionArchiveRoot(version.id),
+          destinationRoot: input.workspaceRoot,
+          currentActiveArchiveRoot:
+            this.options.store.getRuntimeCodeVersionArchiveRoot(
+              currentPending.versionId,
+            ),
+        });
+        if (publish.conflicts.length > 0) {
+          throw new Error(
+            `Cannot restore ${runtimeVersionName(version)} because runtime files changed since the pending trial version: ${publish.conflicts.join(", ")}`,
+          );
+        }
+        await this.options.store.clearPendingRuntimeActivation();
+        const restoredBy = actor(input.actor, this.options.defaultActor);
+        await this.options.store.appendAudit({
+          ...timeline(
+            "runtime_code.version_trial_cancelled",
+            `已取消未确认试运行 ${currentPending.versionId}，恢复 ${runtimeVersionName(version)}。`,
+            restoredBy,
+          ),
+          ...(ticket === undefined ? {} : { ticketId: ticket.id }),
+        });
+        return {
+          version,
+          ...(ticket === undefined ? {} : { ticket }),
+          active: currentActive,
+          publish,
+          alreadyActive: false,
+        };
+      }
       return {
         version,
         ...(ticket === undefined ? {} : { ticket }),
@@ -956,9 +1183,37 @@ export class EvolutionController implements EvolutionRunFailureReporter {
         alreadyActive: true,
       };
     }
+    if (currentPending?.versionId === version.id) {
+      if (input.confirmPending === true) {
+        const confirmed = await this.confirmPendingRuntimeActivationUnlocked({
+          ...(input.actor === undefined ? {} : { actor: input.actor }),
+          versionId: version.id,
+        });
+        return {
+          version,
+          ...(confirmed.ticket === undefined ? {} : { ticket: confirmed.ticket }),
+          ...(confirmed.active === undefined ? {} : { active: confirmed.active }),
+          publish: emptyPublish,
+          alreadyActive: true,
+        };
+      }
+      return {
+        version,
+        ...(ticket === undefined ? {} : { ticket }),
+        ...(currentActive === undefined ? {} : { active: currentActive }),
+        pending: currentPending,
+        publish: emptyPublish,
+        alreadyActive: true,
+      };
+    }
+
+    const archiveRoot = this.options.store.getRuntimeCodeVersionArchiveRoot(
+      version.id,
+    );
+    await this.requireConfirmationCapableRuntimeArchive(version, archiveRoot);
 
     const publish = await activateRuntimeCodeVersionArchive({
-      archiveRoot: this.options.store.getRuntimeCodeVersionArchiveRoot(version.id),
+      archiveRoot,
       destinationRoot: input.workspaceRoot,
       ...(currentActive === undefined
         ? {}
@@ -976,47 +1231,113 @@ export class EvolutionController implements EvolutionRunFailureReporter {
     }
 
     const activatedBy = actor(input.actor, this.options.defaultActor);
-    const active: ActiveRuntimeCodeVersion = {
+    const pending: PendingRuntimeCodeActivation = {
       versionId: version.id,
       activatedAt: new Date().toISOString(),
       activatedBy,
+      confirmationRequired: true,
       ...(currentActive === undefined
         ? {}
         : { previousVersionId: currentActive.versionId }),
       ...optionalString("commandLabel", input.commandLabel),
     };
-    await this.options.store.writeActiveRuntimeVersion(active);
+    await this.options.store.writePendingRuntimeActivation(pending);
 
     const updatedTicket = ticket === undefined
       ? undefined
-      : await this.markRuntimeVersionActivated(ticket, version, active);
+      : await this.markRuntimeVersionActivated(ticket, version, pending);
     await this.options.store.appendAudit({
       ...timeline(
-        "runtime_code.version_activated",
-        `Activated ${runtimeVersionName(version)}.`,
+        "runtime_code.version_trial_started",
+        `已试运行 ${runtimeVersionName(version)}，等待确认后才会成为默认版本。`,
         activatedBy,
       ),
       ...(updatedTicket === undefined ? {} : { ticketId: updatedTicket.id }),
     });
     await this.recordContextMessage(updatedTicket?.id, [
-      `Runtime code version activated: ${runtimeVersionName(version)}`,
-      `Topic: ${version.topic ?? version.label}`,
-      `Activated by: ${activatedBy}`,
-      ...(active.previousVersionId === undefined
+      `已试运行运行时代码版本：${runtimeVersionName(version)}`,
+      `主题：${version.topic ?? version.label}`,
+      `试运行人：${activatedBy}`,
+      "确认前重启会恢复到上一确认版本。",
+      ...(pending.previousVersionId === undefined
         ? []
-        : [`Previous version: ${active.previousVersionId}`]),
+        : [`上一确认版本：${pending.previousVersionId}`]),
       ...(input.commandLabel === undefined
         ? []
-        : [`Apply: ${input.commandLabel}`]),
+        : [`应用命令：${input.commandLabel}`]),
     ].join("\n"));
 
     return {
       version,
       ...(updatedTicket === undefined ? {} : { ticket: updatedTicket }),
-      active,
+      ...(currentActive === undefined ? {} : { active: currentActive }),
+      pending,
       publish,
       alreadyActive: false,
     };
+  }
+
+  private async requireConfirmationCapableRuntimeArchive(
+    version: RuntimeCodeVersion,
+    archiveRoot: string,
+  ): Promise<void> {
+    if (await runtimeCodeArchiveRequiresActivationConfirmation(archiveRoot)) {
+      return;
+    }
+    throw new Error(
+      `Cannot activate ${runtimeVersionName(version)} through normal WebUI activation because its archive predates the required pending confirmation protocol. Use scripts/rollback-runtime-version.js for an intentional emergency rollback.`,
+    );
+  }
+
+  private async confirmPendingRuntimeActivationUnlocked(input: {
+    readonly actor?: string;
+    readonly versionId?: string;
+  }): Promise<RuntimeCodeVersionConfirmationResult> {
+    const pending = await this.options.store.readPendingRuntimeActivation();
+    const versions = await this.options.store.readRuntimeVersions();
+    const version = pending === undefined
+      ? undefined
+      : versions.find((candidate) => candidate.id === pending.versionId);
+    if (input.versionId !== undefined) {
+      if (pending === undefined || pending.versionId !== input.versionId) {
+        throw new Error(`Runtime code version is not pending confirmation: ${input.versionId}`);
+      }
+    }
+    if (pending === undefined) {
+      return { confirmed: false };
+    }
+    if (version === undefined) {
+      throw new Error(`Unknown runtime code version: ${pending.versionId}`);
+    }
+
+    const tickets = await this.options.store.readTickets();
+    const ticket = tickets.find((candidate) =>
+      candidate.id === version.sourceTicketId
+    );
+    const confirmedBy = actor(input.actor, this.options.defaultActor);
+    const active = await this.options.store.confirmPendingRuntimeActivation({
+      actor: confirmedBy,
+    });
+    if (active === undefined) {
+      return { version, ...(ticket === undefined ? {} : { ticket }), confirmed: false };
+    }
+
+    await this.options.store.appendAudit({
+      ...timeline(
+        "runtime_code.version_confirmed",
+        `已确认 ${runtimeVersionName(version)} 作为默认运行时版本。`,
+        confirmedBy,
+      ),
+      ...(ticket === undefined ? {} : { ticketId: ticket.id }),
+    });
+    await this.recordContextMessage(ticket?.id, [
+      `已确认运行时代码版本：${runtimeVersionName(version)}`,
+      `确认人：${confirmedBy}`,
+      ...(active.previousVersionId === undefined
+        ? []
+        : [`上一确认版本：${active.previousVersionId}`]),
+    ].join("\n"));
+    return { version, ...(ticket === undefined ? {} : { ticket }), active, confirmed: true };
   }
 
   private async markRuntimeVersionActivated(
@@ -1037,8 +1358,8 @@ export class EvolutionController implements EvolutionRunFailureReporter {
       timeline: [
         ...ticket.timeline,
         timeline(
-          "runtime_version.activated",
-          `Selected ${runtimeVersionName(version)} as the active runtime version.`,
+          "runtime_version.trial_started",
+          `已试运行 ${runtimeVersionName(version)}，确认前不会覆盖默认运行时版本。`,
           active.activatedBy,
         ),
       ],
@@ -1133,11 +1454,11 @@ function inferManualEvolutionTarget(text: string): EvolutionTarget {
 
 function titleForSignal(signal: EvolutionSignal): string {
   if (signal.run?.errorCode !== undefined) {
-    return `Improve handling for ${signal.run.errorCode}`;
+    return `改进 ${signal.run.errorCode} 的处理`;
   }
-  return signal.summary.length <= 80
+  return signal.summary.length <= 25
     ? signal.summary
-    : `${signal.summary.slice(0, 77)}...`;
+    : `${signal.summary.slice(0, 22)}...`;
 }
 
 function versionTopicForSignal(signal: EvolutionSignal): string {
@@ -1173,16 +1494,17 @@ function completionTopicFromSummary(
     .replace(/^[-*]\s+/u, "")
     .replace(/^#+\s+/u, "")
     .replace(/^Summary:\s*/iu, "")
+    .replace(/^摘要：\s*/u, "")
     .trim();
   if (normalized.length === 0) {
     return undefined;
   }
-  const prefix = success ? "Completed: " : "Failed: ";
+  const prefix = success ? "已完成：" : "已失败：";
   return `${prefix}${truncateTopic(normalized, 180)}`;
 }
 
 function implementationTimelineMessage(success: boolean, ticketId: string): string {
-  return `${success ? "Completed" : "Failed"} implementation for ${ticketId}.`;
+  return `${success ? "已完成" : "已失败"} ${ticketId} 的实现。`;
 }
 
 function truncateTopic(value: string, maxLength: number): string {
@@ -1194,61 +1516,61 @@ function contextMessageForSignal(
   ticket: EvolutionTicket,
 ): string {
   return [
-    `Evolution signal recorded: ${signal.summary}`,
-    `Ticket: ${ticket.id} (${ticket.status})`,
-    `Topic: ${ticket.proposal.versionTopic ?? ticket.title}`,
-    `Source: ${signal.source}`,
-    `Scope/target: ${signal.scope}/${signal.target}`,
-    ...(signal.details === undefined ? [] : [`Details: ${signal.details}`]),
+    `已记录自进化信号：${signal.summary}`,
+    `工单：${ticket.id}（${ticket.status}）`,
+    `主题：${ticket.proposal.versionTopic ?? ticket.title}`,
+    `来源：${signal.source}`,
+    `范围/目标：${signal.scope}/${signal.target}`,
+    ...(signal.details === undefined ? [] : [`详情：${signal.details}`]),
   ].join("\n");
 }
 
 function diagnosisForSignal(signal: EvolutionSignal): string {
   if (signal.run !== undefined) {
     return [
-      `The run ended with reason=${signal.run.reason ?? "unknown"} and errorCode=${signal.run.errorCode ?? "unknown"}.`,
-      "This is treated as an agent-level maintenance signal, not a request to edit the user's workspace.",
+      `本次运行以 reason=${signal.run.reason ?? "unknown"}、errorCode=${signal.run.errorCode ?? "unknown"} 结束。`,
+      "这会被视为 agent 层面的维护信号，不是要求修改用户工作区。",
       signal.target === "self_instructions"
-        ? "The improvement target is self-instructions because it is versioned, reversible, and affects future behavior without changing runtime source code."
-        : `The improvement target is ${signal.target}; validate it in the dedicated self-evolution workflow before rollout.`,
+        ? "改进目标是 self_instructions，因为它可版本化、可回滚，并且能影响未来行为而无需修改运行时代码。"
+        : `改进目标是 ${signal.target}；发布前需要在专用自进化流程里验证。`,
     ].join(" ");
   }
   return [
-    "A maintainer explicitly requested an agent self-evolution review.",
+    "维护者明确请求进行 agent 自进化评审。",
     signal.target === "self_instructions"
-      ? "The request is being handled as a self-instruction change because it concerns the agent's future operating guidance."
-      : `The request is being handled as ${signal.target} because it concerns the runtime/control-plane behavior rather than only future prompt guidance.`,
+      ? "该请求按 self_instructions 处理，因为它涉及 agent 未来的运行指导。"
+      : `该请求按 ${signal.target} 处理，因为它涉及运行时/控制面行为，而不只是未来提示词指导。`,
   ].join(" ");
 }
 
 function proposalSummaryForSignal(signal: EvolutionSignal): string {
   if (signal.target === "runtime_code") {
-    return "Change pibot runtime/WebUI code through the isolated self-evolution implementation workflow.";
+    return "通过隔离的自进化实现流程修改 pibot 运行时/WebUI 代码。";
   }
   if (signal.target === "self_instructions") {
-    return "Adjust pibot's own operating instructions for this recurring or explicit agent-level issue.";
+    return "针对这个重复出现或明确提出的 agent 层面问题，调整 pibot 自身运行指令。";
   }
-  return `Prepare a reviewable ${signal.target} self-evolution change for pibot.`;
+  return `为 pibot 准备一个可评审的 ${signal.target} 自进化变更。`;
 }
 
 function proposalRiskForSignal(signal: EvolutionSignal): string {
   if (signal.target === "runtime_code") {
-    return "The change may affect live WebUI or runtime behavior. Keep the patch narrow, validate it in the isolated workspace, and publish only after checks pass.";
+    return "该变更可能影响线上 WebUI 或运行时行为。保持补丁范围收窄，在隔离工作区验证，并且只在检查通过后发布。";
   }
   if (signal.target === "self_instructions") {
-    return "The change may alter behavior across channels that share the same global agent profile. Keep the wording narrow and rollback if it increases friction or hides useful errors.";
+    return "该变更可能影响共享同一全局 agent profile 的多个入口。保持措辞收窄；如果增加阻力或掩盖有用错误，应回滚。";
   }
-  return "The change may affect shared agent behavior. Keep the proposal narrow and verify the affected surface before rollout.";
+  return "该变更可能影响共享 agent 行为。保持提案范围收窄，并在发布前验证受影响表面。";
 }
 
 function rollbackPlanForSignal(signal: EvolutionSignal): string {
   if (signal.target === "runtime_code") {
-    return "Use the WebUI Runtime Versions panel to activate an earlier runtime version. If version activation reports conflicts, inspect the ticket history and apply a narrow follow-up runtime-code ticket.";
+    return "使用 WebUI 的 Runtime Versions 面板启用更早的运行时版本。如果版本启用报告冲突，检查工单历史，并提交一个范围收窄的后续 runtime_code 工单。";
   }
   if (signal.target === "self_instructions") {
-    return "Use the WebUI Versions panel to restore the previous self-instructions version.";
+    return "使用 WebUI 的 Versions 面板恢复上一个自定义指令版本。";
   }
-  return "Use the WebUI evolution ticket history to apply a narrow follow-up rollback for the affected surface.";
+  return "使用 WebUI 自进化工单历史，为受影响表面提交一个范围收窄的后续回滚。";
 }
 
 function mergeSelfInstructionSection(
@@ -1260,20 +1582,20 @@ function mergeSelfInstructionSection(
   const section = [
     heading,
     "",
-    `Topic: ${versionTopicForSignal(signal)}`,
-    `Signal summary: ${signal.summary}`,
+    `主题：${versionTopicForSignal(signal)}`,
+    `信号摘要：${signal.summary}`,
     "",
-    "- Treat similar future failures as possible agent-level issues before assuming the user workspace is wrong.",
-    "- Preserve the normal task boundary: do not edit user workspace files as part of self-evolution.",
-    "- Prefer a narrow diagnosis, a reversible self-instruction change, and a validation note before proposing runtime code changes.",
-    "- When a WebUI evolution ticket exists, mention the ticket instead of restarting the analysis from scratch.",
+    "- 遇到类似未来失败时，先把它视为可能的 agent 层面问题，再判断是否是用户工作区问题。",
+    "- 保持正常任务边界：不要把修改用户工作区文件作为自进化的一部分。",
+    "- 在提出运行时代码变更前，优先给出范围收窄的诊断、可回滚的自定义指令变更和验证说明。",
+    "- 当 WebUI 自进化工单已经存在时，提及该工单，而不是从头重启分析。",
   ].join("\n");
 
   if (current === undefined || current.length === 0) {
     return [
       "# pibot Self-Instructions",
       "",
-      "These instructions are maintained by the WebUI self-evolution control plane and are injected into future pibot runs.",
+      "这些指令由 WebUI 自进化控制面维护，并会注入未来的 pibot 运行。",
       "",
       section,
       "",
@@ -1301,14 +1623,21 @@ function validateProposal(
       name: "approval_target",
       passed: true,
       message: target === "runtime_code"
-        ? "runtime_code can be implemented in an isolated workspace and published after validation."
-        : `${target} can be approved as a self-evolution task for manual implementation.`,
+        ? "runtime_code 可以在隔离工作区中实现，并在验证后发布。"
+        : `${target} 可以作为自进化任务批准，并由人工实现。`,
     });
+    if (target === "runtime_code") {
+      checks.push({
+        name: "implementation_evidence",
+        passed: true,
+        message: "WebUI、UI、视觉、布局、样式、交互、API 或持久化数据源类 runtime_code 工单在完成前必须提供对应证据：浏览器、截图、DOM、computed CSS、API 调用、存储文件或端到端行为验证；编译通过本身不能证明问题已修复。",
+      });
+    }
   } else {
     checks.push({
       name: "supported_target",
       passed: true,
-      message: "self_instructions can be implemented, versioned, and rolled back.",
+      message: "self_instructions 可以实现、版本化并回滚。",
     });
   }
 
@@ -1317,8 +1646,8 @@ function validateProposal(
     name: "size_limit",
     passed: Buffer.byteLength(text, "utf8") <= 64_000,
     message: target === "self_instructions"
-      ? "Self-instructions must stay within 64 KB."
-      : "Any attached self-instruction draft must stay within 64 KB.",
+      ? "自定义指令必须保持在 64 KB 以内。"
+      : "任何附带的自定义指令草稿都必须保持在 64 KB 以内。",
   });
 
   const passed = checks.every((check) => check.passed);
@@ -1383,6 +1712,20 @@ function replaceById(
   return tickets.map((candidate) =>
     candidate.id === ticket.id ? ticket : candidate
   );
+}
+
+function omitTicketRollout(
+  ticket: EvolutionTicket,
+  patch: {
+    readonly updatedAt: string;
+    readonly timeline: readonly EvolutionTimelineEvent[];
+  },
+): EvolutionTicket {
+  const { rollout: _removedRollout, ...rest } = ticket;
+  return {
+    ...rest,
+    ...patch,
+  };
 }
 
 function unique(values: readonly string[]): readonly string[] {

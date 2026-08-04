@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { LlmMessage, LlmMessageToolCall } from "../core/agent";
 
 export type WebConversationRole = LlmMessage["role"];
+export type WebConversationTitleSource = "placeholder" | "model" | "manual";
 
 export interface WebConversationMessage {
   readonly id: string;
@@ -18,6 +19,9 @@ export interface WebConversationMessage {
 export interface WebConversation {
   readonly id: string;
   readonly title: string;
+  readonly titleSource?: WebConversationTitleSource;
+  readonly titleFailureCount?: number;
+  readonly titleRetryAfter?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly messages: readonly WebConversationMessage[];
@@ -40,11 +44,15 @@ export class FileWebConversationStore {
 
   async create(title: string | undefined): Promise<WebConversation> {
     const now = new Date().toISOString();
+    const normalizedTitle = title === undefined || title.trim().length === 0
+      ? "Untitled session"
+      : title.trim();
     const conversation: WebConversation = {
       id: `web_${Date.now()}_${randomUUID().slice(0, 8)}`,
-      title: title === undefined || title.trim().length === 0
-        ? "Untitled session"
-        : title.trim(),
+      title: normalizedTitle,
+      titleSource: isPlaceholderConversationTitle(normalizedTitle)
+        ? "placeholder"
+        : "manual",
       createdAt: now,
       updatedAt: now,
       messages: [],
@@ -57,6 +65,9 @@ export class FileWebConversationStore {
   async rename(
     conversationId: string,
     title: string,
+    options: {
+      readonly source?: Exclude<WebConversationTitleSource, "placeholder">;
+    } = {},
   ): Promise<WebConversation> {
     const normalizedTitle = normalizeTitle(title);
     const conversations = await this.readAll();
@@ -66,9 +77,53 @@ export class FileWebConversationStore {
     if (existing === undefined) {
       throw new Error(`Unknown WebUI conversation: ${conversationId}`);
     }
+    const source = options.source ?? "manual";
+    if (source === "model" && conversationTitleSource(existing) === "manual") {
+      return existing;
+    }
+    const {
+      titleFailureCount: _titleFailureCount,
+      titleRetryAfter: _titleRetryAfter,
+      ...conversationWithoutTitleFailures
+    } = existing;
+    const updated: WebConversation = {
+      ...conversationWithoutTitleFailures,
+      title: normalizedTitle,
+      titleSource: source,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.writeAll(
+      conversations.map((conversation) =>
+        conversation.id === updated.id ? updated : conversation
+      ),
+    );
+    return updated;
+  }
+
+  async recordTitleGenerationFailure(
+    conversationId: string,
+    retryBaseMs = 300_000,
+  ): Promise<WebConversation> {
+    const conversations = await this.readAll();
+    const existing = conversations.find(
+      (conversation) => conversation.id === conversationId,
+    );
+    if (existing === undefined) {
+      throw new Error(`Unknown WebUI conversation: ${conversationId}`);
+    }
+    if (conversationTitleSource(existing) !== "placeholder") {
+      return existing;
+    }
+    const failureCount = (existing.titleFailureCount ?? 0) + 1;
+    const retryDelayMs = Math.min(
+      3_600_000,
+      Math.max(1, retryBaseMs) * failureCount,
+    );
     const updated: WebConversation = {
       ...existing,
-      title: normalizedTitle,
+      titleSource: "placeholder",
+      titleFailureCount: failureCount,
+      titleRetryAfter: new Date(Date.now() + retryDelayMs).toISOString(),
       updatedAt: new Date().toISOString(),
     };
     await this.writeAll(
@@ -221,6 +276,36 @@ function normalizeTitle(title: string): string {
     throw new Error("Conversation title must be at most 120 characters");
   }
   return normalized;
+}
+
+export function conversationTitleSource(
+  conversation: WebConversation,
+): WebConversationTitleSource {
+  if (conversation.titleSource !== undefined) {
+    return conversation.titleSource;
+  }
+  return isPlaceholderConversationTitle(conversation.title)
+    ? "placeholder"
+    : "manual";
+}
+
+export function conversationTitleRetryReady(
+  conversation: WebConversation,
+  now = Date.now(),
+): boolean {
+  if (conversationTitleSource(conversation) !== "placeholder") {
+    return false;
+  }
+  if (conversation.titleRetryAfter === undefined) {
+    return true;
+  }
+  const retryAfter = Date.parse(conversation.titleRetryAfter);
+  return !Number.isFinite(retryAfter) || retryAfter <= now;
+}
+
+function isPlaceholderConversationTitle(title: string): boolean {
+  const normalized = title.trim();
+  return normalized === "Web session" || normalized === "Untitled session";
 }
 
 function webMessageToLlmMessage(message: WebConversationMessage): LlmMessage {

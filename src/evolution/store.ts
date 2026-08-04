@@ -3,6 +3,7 @@ import {
   appendFile,
   mkdir,
   readFile,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -13,6 +14,7 @@ import type {
   EvolutionSignal,
   EvolutionTicket,
   EvolutionTimelineEvent,
+  PendingRuntimeCodeActivation,
   RuntimeCodeVersion,
 } from "./types";
 
@@ -28,6 +30,7 @@ export interface EvolutionStoreSnapshot {
   readonly selfVersions: readonly AgentSelfVersion[];
   readonly runtimeVersions: readonly RuntimeCodeVersion[];
   readonly activeRuntimeVersion?: ActiveRuntimeCodeVersion;
+  readonly pendingRuntimeActivation?: PendingRuntimeCodeActivation;
 }
 
 interface TicketFile {
@@ -44,6 +47,7 @@ interface RuntimeVersionFile {
 
 interface RuntimeCurrentFile {
   readonly active?: ActiveRuntimeCodeVersion;
+  readonly pending?: PendingRuntimeCodeActivation;
 }
 
 export class FileEvolutionStore {
@@ -75,6 +79,7 @@ export class FileEvolutionStore {
       selfVersions,
       runtimeVersions,
       activeRuntimeVersion,
+      pendingRuntimeActivation,
     ] = await Promise.all([
       this.readSignals(),
       this.readTickets(),
@@ -82,6 +87,7 @@ export class FileEvolutionStore {
       this.readSelfVersions(),
       this.readRuntimeVersions(),
       this.readActiveRuntimeVersion(),
+      this.readPendingRuntimeActivation(),
     ]);
     return {
       signals,
@@ -90,6 +96,9 @@ export class FileEvolutionStore {
       selfVersions,
       runtimeVersions,
       ...(activeRuntimeVersion === undefined ? {} : { activeRuntimeVersion }),
+      ...(pendingRuntimeActivation === undefined
+        ? {}
+        : { pendingRuntimeActivation }),
     };
   }
 
@@ -156,6 +165,40 @@ export class FileEvolutionStore {
     await writeJsonFile(this.runtimeVersionsFile(), { versions });
   }
 
+  async deleteTicket(ticketId: string): Promise<boolean> {
+    const tickets = await this.readTickets();
+    const next = tickets.filter((ticket) => ticket.id !== ticketId);
+    if (next.length === tickets.length) {
+      return false;
+    }
+    await this.writeTickets(next);
+    return true;
+  }
+
+  async deleteRuntimeVersion(versionId: string): Promise<boolean> {
+    const versions = await this.readRuntimeVersions();
+    const next = versions.filter((version) => version.id !== versionId);
+    if (next.length === versions.length) {
+      return false;
+    }
+    await this.writeRuntimeVersions(next);
+    await rm(this.getRuntimeCodeVersionArchiveRoot(versionId), {
+      recursive: true,
+      force: true,
+    });
+    return true;
+  }
+
+  async deleteSelfVersion(versionId: string): Promise<boolean> {
+    const versions = await this.readSelfVersions();
+    const next = versions.filter((version) => version.id !== versionId);
+    if (next.length === versions.length) {
+      return false;
+    }
+    await writeJsonFile(this.selfVersionsFile(), { versions: next });
+    return true;
+  }
+
   async readActiveRuntimeVersion(): Promise<
     ActiveRuntimeCodeVersion | undefined
   > {
@@ -168,7 +211,70 @@ export class FileEvolutionStore {
   async writeActiveRuntimeVersion(
     active: ActiveRuntimeCodeVersion,
   ): Promise<void> {
+    const parsed = await readJsonFile<RuntimeCurrentFile>(
+      this.runtimeCurrentFile(),
+    );
+    await writeJsonFile(this.runtimeCurrentFile(), {
+      active,
+      ...(parsed?.pending === undefined ? {} : { pending: parsed.pending }),
+    });
+  }
+
+  async readPendingRuntimeActivation(): Promise<
+    PendingRuntimeCodeActivation | undefined
+  > {
+    const parsed = await readJsonFile<RuntimeCurrentFile>(
+      this.runtimeCurrentFile(),
+    );
+    return parsed?.pending;
+  }
+
+  async writePendingRuntimeActivation(
+    pending: PendingRuntimeCodeActivation,
+  ): Promise<void> {
+    const parsed = await readJsonFile<RuntimeCurrentFile>(
+      this.runtimeCurrentFile(),
+    );
+    await writeJsonFile(this.runtimeCurrentFile(), {
+      ...(parsed?.active === undefined ? {} : { active: parsed.active }),
+      pending,
+    });
+  }
+
+  async confirmPendingRuntimeActivation(input: {
+    readonly actor: string;
+  }): Promise<ActiveRuntimeCodeVersion | undefined> {
+    const parsed = await readJsonFile<RuntimeCurrentFile>(
+      this.runtimeCurrentFile(),
+    );
+    if (parsed?.pending === undefined) {
+      return undefined;
+    }
+    const active: ActiveRuntimeCodeVersion = {
+      versionId: parsed.pending.versionId,
+      activatedAt: new Date().toISOString(),
+      activatedBy: input.actor,
+      ...(parsed.pending.previousVersionId === undefined
+        ? {}
+        : { previousVersionId: parsed.pending.previousVersionId }),
+      ...(parsed.pending.commandLabel === undefined
+        ? {}
+        : { commandLabel: parsed.pending.commandLabel }),
+    };
     await writeJsonFile(this.runtimeCurrentFile(), { active });
+    return active;
+  }
+
+  async clearPendingRuntimeActivation(): Promise<void> {
+    const parsed = await readJsonFile<RuntimeCurrentFile>(
+      this.runtimeCurrentFile(),
+    );
+    if (parsed === undefined) {
+      return;
+    }
+    await writeJsonFile(this.runtimeCurrentFile(), {
+      ...(parsed.active === undefined ? {} : { active: parsed.active }),
+    });
   }
 
   async writeSelfInstructionsVersion(input: {

@@ -21,7 +21,8 @@
     "test": "npm run build && npm run test:production && npm run test:acceptance",
     "prestart": "npm run build",
     "start": "node dist/main.js",
-    "webui": "node scripts/run-webui.js"
+    "webui": "node scripts/run-webui.js",
+    "rollback:runtime": "node scripts/rollback-runtime-version.js --previous"
   },
   "dependencies": {
     "@slack/socket-mode": "^2.0.4",
