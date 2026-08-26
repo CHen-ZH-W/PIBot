@@ -7,3 +7,4 @@ native/bin/
 .env.*
 !.env.example
 docs/roadmap.md
+docs/pibot-interview-project-details.md

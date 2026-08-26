@@ -47,6 +47,32 @@ export interface RuntimeCodeVersionArchiveReport {
   readonly snapshot: RuntimeCodeWorkspaceSnapshot;
 }
 
+export async function fingerprintRuntimeCodeWorkspaceDiff(input: {
+  readonly stagingRoot: string;
+  readonly baseline: RuntimeCodeWorkspaceSnapshot;
+}): Promise<string> {
+  const after = await snapshotRuntimeCodeWorkspace(path.resolve(input.stagingRoot));
+  const beforeMap = snapshotMap(input.baseline);
+  const afterMap = snapshotMap(after);
+  const changes = [...new Set([...beforeMap.keys(), ...afterMap.keys()])]
+    .sort()
+    .flatMap((filePath) => {
+      const beforeSha256 = beforeMap.get(filePath);
+      const afterSha256 = afterMap.get(filePath);
+      return beforeSha256 === afterSha256
+        ? []
+        : [{
+            path: filePath,
+            operation: afterSha256 === undefined ? "delete" : "write",
+            beforeSha256: beforeSha256 ?? null,
+            afterSha256: afterSha256 ?? null,
+          }];
+    });
+  return createHash("sha256")
+    .update(JSON.stringify(changes))
+    .digest("hex");
+}
+
 const stagingDirectoryName = ".pibot-evolution-workspaces";
 const allowedTopLevelEntries = new Set([
   ".env.example",

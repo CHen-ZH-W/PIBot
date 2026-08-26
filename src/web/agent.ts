@@ -27,7 +27,7 @@ import {
   createAgentRunContext,
   type AgentRunContext,
 } from "../runtime/context";
-import type { RuntimeHook } from "../runtime/hooks";
+import type { RuntimeHook, RuntimeToolCallHookContext } from "../runtime/hooks";
 import {
   addSteeringMessage,
   configureAgentRuntimeState,
@@ -73,6 +73,7 @@ import {
 } from "../evolution/channel-context";
 import {
   createRuntimeCodeStagingWorkspace,
+  fingerprintRuntimeCodeWorkspaceDiff,
   publishRuntimeCodeWorkspace,
   validateRuntimeCodeWorkspace,
   type RuntimeCodePublishReport,
@@ -94,6 +95,13 @@ import {
   type EvolutionTicket,
   type RuntimeCodeVersion,
 } from "../evolution/types";
+import {
+  fingerprintCanonical,
+  fingerprintContext,
+  fingerprintError,
+} from "../workflow/fingerprints";
+import type { FailureExperienceRecord } from "../workflow/types";
+import type { WorkflowOrchestrator } from "../workflow/orchestrator";
 import type {
   FileWebConversationStore,
   WebConversation,
@@ -138,6 +146,7 @@ export interface WebAgentRunnerOptions {
     readonly channelId: SlackChannelId;
   };
   readonly childAgents?: WebChildAgentOptions;
+  readonly workflows?: WorkflowOrchestrator;
 }
 
 export interface WebChildAgentOptions {
@@ -197,6 +206,7 @@ export type WebAgentStreamLoopEvent =
         readonly id: string;
         readonly name: string;
         readonly summary: string;
+        readonly fingerprint: string;
       };
     }
   | {
@@ -205,6 +215,7 @@ export type WebAgentStreamLoopEvent =
       readonly call: {
         readonly id: string;
         readonly name: string;
+        readonly fingerprint: string;
       };
       readonly result: {
         readonly ok: boolean;
@@ -267,6 +278,8 @@ export type WebAgentRunnerEvent =
 export interface WebAgentRunOptions {
   readonly signal?: AbortSignal;
   readonly onEvent?: (event: WebAgentRunnerEvent) => void | Promise<void>;
+  readonly completedToolCallFingerprints?: readonly string[];
+  readonly failureMemoryPolicy?: "rollout" | "experience";
 }
 
 interface QueuedWebFollowUp {
@@ -299,6 +312,8 @@ interface ActiveWebConversationRun {
   resolveControlMessageReady: () => void;
   runContext: AgentRunContext;
   cancelled: boolean;
+  readonly completedToolCallFingerprints: ReadonlySet<string>;
+  readonly failureMemoryPolicy: "rollout" | "experience";
 }
 
 interface ActiveWebEvolutionRun {
@@ -317,6 +332,15 @@ interface PendingWebApproval {
   readonly onEvent?: (event: WebAgentRunnerEvent) => void | Promise<void>;
   readonly signal?: AbortSignal;
   settled: boolean;
+}
+
+interface EvolutionWorkflowAttemptContext {
+  readonly workflowRunId: string;
+  readonly attemptId: string;
+  readonly contextFingerprint: string;
+  readonly failureDigest: readonly FailureExperienceRecord[];
+  readonly completedToolCallFingerprints: readonly string[];
+  readonly blockedReason?: string;
 }
 
 export class WebAgentRunner {
@@ -529,6 +553,10 @@ export class WebAgentRunner {
         state: runtimeState,
       }),
       cancelled: false,
+      completedToolCallFingerprints: new Set(
+        runOptions.completedToolCallFingerprints ?? [],
+      ),
+      failureMemoryPolicy: runOptions.failureMemoryPolicy ?? "rollout",
     };
     this.activeByConversation.set(conversationId, active);
 
@@ -721,6 +749,7 @@ export class WebAgentRunner {
             state: runContext.state,
             describeTool: (name) => runTools.describeTool(name),
           }),
+          new CompletedToolReplayGuard(active.completedToolCallFingerprints),
         ],
       });
       let systemPrompt = buildCodingAgentSystemPrompt({
@@ -841,21 +870,26 @@ export class WebAgentRunner {
       reason = result.reason;
       errorCode = result.error?.code;
       await this.options.sessions.appendRunMessages(prepared, result.messages);
-      await this.recordRunRolloutSummaryBestEffort({
-        key,
-        runId: runContext.runId,
-        userText: text,
-        reason,
-        turns: result.turns,
-        messages: result.messages,
-        ...(result.error === undefined
-          ? {}
-          : {
-              errorCode: result.error.code,
-              errorMessage: result.error.message,
-            }),
-        durationMs: Date.now() - startedAtMs,
-      });
+      if (
+        result.error === undefined ||
+        active.failureMemoryPolicy !== "experience"
+      ) {
+        await this.recordRunRolloutSummaryBestEffort({
+          key,
+          runId: runContext.runId,
+          userText: text,
+          reason,
+          turns: result.turns,
+          messages: result.messages,
+          ...(result.error === undefined
+            ? {}
+            : {
+                errorCode: result.error.code,
+                errorMessage: result.error.message,
+              }),
+          durationMs: Date.now() - startedAtMs,
+        });
+      }
       if (result.error !== undefined) {
         await this.options.sessions.appendContextMessage(key, {
           message: {
@@ -1214,6 +1248,8 @@ export class WebAgentRunner {
     let reason = "unknown";
     let errorCode: string | undefined;
     let implementationStarted = false;
+    let workflowAttempt: EvolutionWorkflowAttemptContext | undefined;
+    let workflowAttemptFinished = false;
 
     try {
       const evolutionSnapshot = await this.options.evolution.readSnapshot();
@@ -1221,6 +1257,27 @@ export class WebAgentRunner {
         evolutionSnapshot.tickets,
         ticketId,
       );
+      const workflowAdmission = await this.beginEvolutionWorkflowAttempt(
+        ticket,
+        evolutionSnapshot.activeRuntimeVersion?.versionId,
+      );
+      if (workflowAdmission?.blockedReason !== undefined) {
+        await emitWebEvent(runOptions.onEvent, {
+          type: "status",
+          conversationId: EVOLUTION_CHANNEL_NAME,
+          runId: runContext.runId,
+          message:
+            `编排器已阻止重复实现：${workflowAdmission.blockedReason}。` +
+            "请先更新工单中的修复策略或等待熔断冷却。",
+        });
+        return {
+          conversationId: EVOLUTION_CHANNEL_NAME,
+          runId: runContext.runId,
+          reason: "blocked",
+          errorCode: workflowAdmission.blockedReason,
+        };
+      }
+      workflowAttempt = workflowAdmission;
       const key = evolutionTicketChannelKey(ticket.id);
       const selfInstructionsTicket = ticket.target === "self_instructions";
       await emitWebEvent(runOptions.onEvent, {
@@ -1262,8 +1319,17 @@ export class WebAgentRunner {
         ticket,
         implementationWorkspaceRoot,
         this.options.workspaceRoot,
+        workflowAttempt?.failureDigest,
       );
       const prepared = await this.options.sessions.prepareChannelRun(key);
+      const implementationHistory = (workflowAttempt?.failureDigest.length ?? 0) > 0
+        ? []
+        : prepared.history;
+      const runPrepared = {
+        ...prepared,
+        history: implementationHistory,
+        generatedMessageStartIndex: implementationHistory.length + 2,
+      };
       await this.options.evolution.beginImplementation(ticket.id, {
         actor: "webui",
       });
@@ -1354,6 +1420,9 @@ export class WebAgentRunner {
             state: runContext.state,
             describeTool: (name) => runTools.describeTool(name),
           }),
+          new CompletedToolReplayGuard(
+            new Set(workflowAttempt?.completedToolCallFingerprints ?? []),
+          ),
         ],
       });
       const systemPrompt = buildCodingAgentSystemPrompt({
@@ -1391,7 +1460,7 @@ export class WebAgentRunner {
         {
           userText: prompt,
           systemPrompt,
-          history: prepared.history,
+          history: implementationHistory,
           tools: runToolSchemas,
           maxTurns: this.options.maxTurns,
           runContext,
@@ -1418,22 +1487,24 @@ export class WebAgentRunner {
 
       reason = result.reason;
       errorCode = result.error?.code;
-      await this.options.sessions.appendRunMessages(prepared, result.messages);
-      await this.recordRunRolloutSummaryBestEffort({
-        key,
-        runId: runContext.runId,
-        userText: ticket.title,
-        reason,
-        turns: result.turns,
-        messages: result.messages,
-        ...(result.error === undefined
-          ? {}
-          : {
-              errorCode: result.error.code,
-              errorMessage: result.error.message,
-            }),
-        durationMs: Date.now() - startedAtMs,
-      });
+      await this.options.sessions.appendRunMessages(runPrepared, result.messages);
+      if (runOptions.failureMemoryPolicy !== "experience") {
+        await this.recordRunRolloutSummaryBestEffort({
+          key,
+          runId: runContext.runId,
+          userText: ticket.title,
+          reason,
+          turns: result.turns,
+          messages: result.messages,
+          ...(result.error === undefined
+            ? {}
+            : {
+                errorCode: result.error.code,
+                errorMessage: result.error.message,
+              }),
+          durationMs: Date.now() - startedAtMs,
+        });
+      }
       if (result.error !== undefined) {
         await this.options.sessions.appendContextMessage(key, {
           message: {
@@ -1519,18 +1590,19 @@ export class WebAgentRunner {
           publish !== undefined &&
           publish.conflicts.length === 0 &&
           runtimeCodePublishHasChanges(publish);
+      const implementationSummary = formatEvolutionImplementationSummary({
+        reason: result.reason,
+        stagingRoot: implementationWorkspaceRoot,
+        ...optionalSummaryField("agentSummary", finalAssistantSummary(result.messages)),
+        ...optionalSummaryField("errorCode", result.error?.code),
+        ...optionalSummaryField("validation", validation),
+        ...optionalSummaryField("publish", publish),
+        ...optionalSummaryField("postRunError", postRunError),
+      });
       await this.options.evolution.finishImplementation(ticket.id, {
         actor: "webui",
         success,
-        summary: formatEvolutionImplementationSummary({
-          reason: result.reason,
-          stagingRoot: implementationWorkspaceRoot,
-          ...optionalSummaryField("agentSummary", finalAssistantSummary(result.messages)),
-          ...optionalSummaryField("errorCode", result.error?.code),
-          ...optionalSummaryField("validation", validation),
-          ...optionalSummaryField("publish", publish),
-          ...optionalSummaryField("postRunError", postRunError),
-        }),
+        summary: implementationSummary,
       });
       if (success && selfInstructionsTicket && selfInstructionsDraft !== undefined) {
         await emitWebEvent(runOptions.onEvent, {
@@ -1566,6 +1638,41 @@ export class WebAgentRunner {
           durationMs: Date.now() - startedAtMs,
         });
       }
+      if (workflowAttempt !== undefined && this.options.workflows !== undefined) {
+        const workflowErrorFingerprint = success
+          ? undefined
+          : fingerprintEvolutionImplementationFailure({
+              ...optionalSummaryField("resultErrorCode", result.error?.code),
+              ...optionalSummaryField("resultErrorMessage", result.error?.message),
+              ...optionalSummaryField("validation", validation),
+              ...optionalSummaryField("publish", publish),
+              ...optionalSummaryField("postRunError", postRunError),
+              summary: implementationSummary,
+            });
+        const diffFingerprint = selfInstructionsTicket
+          ? fingerprintCanonical({
+              before: selfInstructionsStaging?.baselineInstructions ?? "",
+              after: selfInstructionsDraft ?? "",
+            })
+          : runtimeStaging === undefined
+          ? undefined
+          : await fingerprintRuntimeCodeWorkspaceDiff({
+              stagingRoot: runtimeStaging.root,
+              baseline: runtimeStaging.baseline,
+            });
+        await this.options.workflows.finishAttempt({
+          runId: workflowAttempt.workflowRunId,
+          attemptId: workflowAttempt.attemptId,
+          success,
+          ...(workflowErrorFingerprint === undefined
+            ? {}
+            : { resultErrorFingerprint: workflowErrorFingerprint }),
+          ...(diffFingerprint === undefined ? {} : { diffFingerprint }),
+          contextFingerprint: workflowAttempt.contextFingerprint,
+          summary: implementationSummary,
+        });
+        workflowAttemptFinished = true;
+      }
 
       return {
         conversationId: EVOLUTION_CHANNEL_NAME,
@@ -1580,6 +1687,29 @@ export class WebAgentRunner {
           success: false,
           summary: error instanceof Error ? error.message : String(error),
         });
+      }
+      if (
+        workflowAttempt !== undefined &&
+        !workflowAttemptFinished &&
+        this.options.workflows !== undefined
+      ) {
+        const summary = error instanceof Error ? error.message : String(error);
+        await this.options.workflows.finishAttempt({
+          runId: workflowAttempt.workflowRunId,
+          attemptId: workflowAttempt.attemptId,
+          success: false,
+          resultErrorFingerprint: fingerprintError({
+            stepKind: "evolution_implementation",
+            errorCode: error instanceof Error ? error.name : "exception",
+            message: summary,
+          }),
+          diffFingerprint: fingerprintCanonical({
+            state: "diff_unavailable",
+            reason: "implementation_exception",
+          }),
+          contextFingerprint: workflowAttempt.contextFingerprint,
+          summary,
+        }).catch(() => undefined);
       }
       throw error;
     } finally {
@@ -1736,6 +1866,124 @@ export class WebAgentRunner {
     } catch {
       return;
     }
+  }
+
+  private async beginEvolutionWorkflowAttempt(
+    ticket: EvolutionTicket,
+    activeRuntimeVersionId: string | undefined,
+  ): Promise<EvolutionWorkflowAttemptContext | undefined> {
+    const workflows = this.options.workflows;
+    if (workflows === undefined) {
+      return undefined;
+    }
+    const contextFingerprint = fingerprintContext({
+      workspaceRoot: this.options.workspaceRoot,
+      workflowVersion: "evolution-implementation-v1",
+      ...(activeRuntimeVersionId === undefined
+        ? {}
+        : { runtimeVersion: activeRuntimeVersionId }),
+    });
+    const versions = {
+      workflowVersion: "evolution-implementation-v1",
+      runtimeVersion: activeRuntimeVersionId ??
+        process.env.PIBOT_RUNTIME_VERSION ??
+        "workspace",
+      agentVersion: process.env.PIBOT_AGENT_VERSION ?? "webui-evolution-agent-v1",
+      ...(this.options.modelName === undefined
+        ? {}
+        : { modelName: this.options.modelName }),
+    };
+    const run = await workflows.ensureRun({
+      externalKey: `evolution-ticket:${ticket.id}`,
+      kind: "evolution_implementation",
+      lifecycle: "detached",
+      metadata: {
+        ticketId: ticket.id,
+        target: ticket.target,
+        workspaceRoot: this.options.workspaceRoot,
+      },
+      versions,
+    });
+    const previousFailedAttempt = (await workflows.store.readAttempts(run.runId))
+      .slice()
+      .reverse()
+      .find((attempt) =>
+        (attempt.status === "failed" || attempt.status === "interrupted") &&
+        attempt.resultErrorFingerprint !== undefined);
+    const triggerErrorFingerprint = previousFailedAttempt?.resultErrorFingerprint ??
+      (ticket.status === "failed"
+        ? fingerprintError({
+            stepKind: "evolution_implementation",
+            errorCode: "previous_implementation_failed",
+            message: ticket.proposal.completionTopic ?? ticket.title,
+          })
+        : undefined);
+    const step = await workflows.ensureStep({
+      runId: run.runId,
+      stepId: "implementation",
+      kind: "agent_implementation",
+    });
+    const completedCheckpoint = step.checkpoint?.["completedToolCallFingerprints"];
+    const completedToolCallFingerprints = Array.isArray(completedCheckpoint)
+      ? completedCheckpoint.filter(
+          (value): value is string => typeof value === "string",
+        )
+      : [];
+    const strategy = {
+      type: previousFailedAttempt?.status === "interrupted"
+        ? "resume_approved_evolution_from_checkpoint"
+        : "approved_evolution_proposal",
+      target: ticket.target,
+      summary: ticket.proposal.summary,
+      diagnosis: ticket.proposal.diagnosis,
+      versionTopic: ticket.proposal.versionTopic ?? ticket.title,
+    };
+    const failureDigest = await workflows.failureDigest({
+      workflowKind: run.kind,
+      ...(triggerErrorFingerprint === undefined
+        ? {}
+        : { errorFingerprint: triggerErrorFingerprint }),
+      contextFingerprint,
+    });
+    const admission = await workflows.beginAttempt({
+      runId: run.runId,
+      stepId: step.stepId,
+      strategy,
+      ...(triggerErrorFingerprint === undefined
+        ? {}
+        : { triggerErrorFingerprint }),
+      ...(triggerErrorFingerprint === undefined
+        ? {}
+        : { edgeKey: "implementation.retry" }),
+      ...(triggerErrorFingerprint === undefined
+        ? {}
+        : {
+            circuitKey: fingerprintCanonical({
+              workspaceRoot: this.options.workspaceRoot,
+              workflowKind: run.kind,
+              stepKind: step.kind,
+              triggerErrorFingerprint,
+            }),
+          }),
+      versions,
+    });
+    if (!admission.allowed || admission.attempt === undefined) {
+      return {
+        workflowRunId: run.runId,
+        attemptId: "",
+        contextFingerprint,
+        failureDigest,
+        completedToolCallFingerprints,
+        blockedReason: admission.reason ?? "workflow_attempt_rejected",
+      };
+    }
+    return {
+      workflowRunId: run.runId,
+      attemptId: admission.attempt.attemptId,
+      contextFingerprint,
+      failureDigest,
+      completedToolCallFingerprints,
+    };
   }
 
 }
@@ -1928,6 +2176,30 @@ function readInputArray(
   return Array.isArray(value) ? value : [];
 }
 
+function fingerprintToolCall(call: ToolCall): string {
+  return fingerprintCanonical({
+    name: call.name,
+    input: call.input,
+  });
+}
+
+class CompletedToolReplayGuard implements RuntimeHook {
+  constructor(private readonly completed: ReadonlySet<string>) {}
+
+  beforeToolCall(context: RuntimeToolCallHookContext) {
+    const fingerprint = fingerprintToolCall(context.call);
+    if (!this.completed.has(fingerprint)) {
+      return { allowed: true } as const;
+    }
+    return {
+      allowed: false,
+      reason:
+        `Workflow checkpoint already completed this exact tool action ` +
+        `(${context.call.name}, ${fingerprint.slice(0, 12)}); replan from its saved result.`,
+    } as const;
+  }
+}
+
 function toWebAgentStreamLoopEvent(
   event: AgentLoopEvent,
 ): WebAgentStreamLoopEvent {
@@ -1968,6 +2240,7 @@ function toWebAgentStreamLoopEvent(
           id: event.call.id,
           name: event.call.name,
           summary: formatToolCallSummary(event.call),
+          fingerprint: fingerprintToolCall(event.call),
         },
       };
     case "tool_end":
@@ -1977,6 +2250,7 @@ function toWebAgentStreamLoopEvent(
         call: {
           id: event.call.id,
           name: event.call.name,
+          fingerprint: fingerprintToolCall(event.call),
         },
         result: event.result.ok
           ? {
@@ -2207,6 +2481,7 @@ function formatEvolutionImplementationPrompt(
   ticket: EvolutionTicket,
   implementationWorkspaceRoot: string,
   sourceWorkspaceRoot: string,
+  failureDigest: readonly FailureExperienceRecord[] = [],
 ): string {
   if (ticket.target === "self_instructions") {
     return formatSelfInstructionsImplementationPrompt(
@@ -2247,6 +2522,12 @@ function formatEvolutionImplementationPrompt(
     "- 最终回答里报告变更文件、验证命令、失败情况和剩余风险。",
     "",
     formatEvolutionImplementationLoopGuard(ticket),
+    ...(failureDigest.length === 0
+      ? []
+      : [
+          "",
+          formatFailureExperienceDigest(failureDigest),
+        ]),
   ].join("\n");
 }
 
@@ -2471,6 +2752,53 @@ function formatEvolutionImplementationSummary(input: {
   ].join("\n").slice(0, 4000);
 }
 
+function formatFailureExperienceDigest(
+  experiences: readonly FailureExperienceRecord[],
+): string {
+  return [
+    "结构化运行经验（只含失败摘要，不含完整历史 Trace）：",
+    ...experiences.map((experience, index) => [
+      `${index + 1}. error=${experience.errorFingerprint.slice(0, 16)}`,
+      `strategy=${experience.strategyFingerprint.slice(0, 16)}`,
+      ...(experience.diffFingerprint === undefined
+        ? []
+        : [`diff=${experience.diffFingerprint.slice(0, 16)}`]),
+      `summary=${truncateSingleLine(experience.summary, 360)}`,
+    ].join("; ")),
+    "不得重复上面已经失败的错误+策略组合；必须更新工单策略、切换实现路径或报告 blocked。",
+  ].join("\n");
+}
+
+function fingerprintEvolutionImplementationFailure(input: {
+  readonly resultErrorCode?: string;
+  readonly resultErrorMessage?: string;
+  readonly validation?: RuntimeCodeValidationReport | SelfInstructionsValidationReport;
+  readonly publish?: RuntimeCodePublishReport;
+  readonly postRunError?: string;
+  readonly summary: string;
+}): string {
+  const failedCheck = input.validation?.checks.find((check) => !check.passed);
+  const message = [
+    input.resultErrorMessage,
+    input.postRunError,
+    failedCheck?.message,
+    input.publish === undefined || input.publish.conflicts.length === 0
+      ? undefined
+      : `publish conflicts: ${input.publish.conflicts.join(", ")}`,
+    input.summary,
+  ].filter((value): value is string => value !== undefined && value.length > 0)
+    .join("\n");
+  return fingerprintError({
+    stepKind: "evolution_implementation",
+    errorCode: input.resultErrorCode ??
+      (input.publish !== undefined && input.publish.conflicts.length > 0
+        ? "publish_conflict"
+        : "validation_failed"),
+    ...(failedCheck === undefined ? {} : { checkName: failedCheck.name }),
+    message,
+  });
+}
+
 function optionalSummaryField<K extends string, T>(
   key: K,
   value: T | undefined,
@@ -2510,6 +2838,13 @@ const EVOLUTION_IMPLEMENTATION_DISABLED_TOOLS = [
   "enter_plan_mode",
   "update_plan",
   "exit_plan_mode",
+  "enter_coordinator_mode",
+  "exit_coordinator_mode",
+  "tasks_update",
+  "task_update",
+  "agent_spawn",
+  "agent_send",
+  "agent_stop",
 ] as const;
 
 const EVOLUTION_IMPLEMENTATION_DISABLED_TOOL_SET = new Set<string>(

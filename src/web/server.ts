@@ -20,6 +20,8 @@ import type {
   EvolutionTarget,
 } from "../evolution/types";
 import type { RuntimeCodeActivationController } from "../evolution/runtime-activation";
+import type { WorkflowOrchestrator } from "../workflow/orchestrator";
+import type { WorkflowEventRecord, WorkflowRunRecord } from "../workflow/types";
 import {
   importOpenAiSkillPackage,
   scanWorkspaceSkills,
@@ -34,6 +36,7 @@ import {
   type WebConversationRole,
 } from "./conversations";
 import { WEBUI_CSS, WEBUI_HTML, WEBUI_SCRIPT } from "./static";
+import { DetachedWebRunService } from "./runs";
 
 export interface WebUiServerOptions {
   readonly host: string;
@@ -45,6 +48,7 @@ export interface WebUiServerOptions {
   readonly runtimeActivation?: RuntimeCodeActivationController | undefined;
   readonly conversations: FileWebConversationStore;
   readonly agent?: WebAgentRunner;
+  readonly workflows?: WorkflowOrchestrator;
   readonly logger?: AppLogger;
   readonly pibotSkillsRoot?: string;
   readonly disabledSkills?: readonly string[];
@@ -68,6 +72,22 @@ export async function startWebUiServer(
   options: WebUiServerOptions,
 ): Promise<StartedWebUiServer> {
   const logger = options.logger ?? new NoopLogger();
+  const interruptedRuns = await options.workflows?.recoverInterruptedRuns();
+  if ((interruptedRuns ?? 0) > 0) {
+    logger.warn("webui_detached_runs_interrupted_after_restart", {
+      count: interruptedRuns,
+    });
+    const evolution = await options.evolution.readSnapshot();
+    for (const ticket of evolution.tickets.filter((item) =>
+      item.status === "applying")) {
+      await options.evolution.finishImplementation(ticket.id, {
+        actor: "workflow-orchestrator",
+        success: false,
+        summary:
+          "服务端进程在实现期间重启；工作流已保存中断状态和最近工具 checkpoint。",
+      });
+    }
+  }
   const runtimeState: WebUiRuntimeState = {
     instanceId: [
       process.pid,
@@ -77,8 +97,16 @@ export async function startWebUiServer(
     startedAt: new Date().toISOString(),
     pid: process.pid,
   };
+  const detachedRuns = options.agent === undefined || options.workflows === undefined
+    ? undefined
+    : new DetachedWebRunService({
+        agent: options.agent,
+        evolution: options.evolution,
+        workflows: options.workflows,
+        logger,
+      });
   const server = createServer((request, response) => {
-    void routeRequest(options, runtimeState, request, response).catch(
+    void routeRequest(options, runtimeState, detachedRuns, request, response).catch(
       (error: unknown) => {
         logger.warn("webui_request_failed", errorFields(error));
         sendJson(response, 500, { error: errorMessage(error) });
@@ -106,9 +134,143 @@ function browserUrlFor(host: string, port: number): string {
   return `http://${host}:${port}`;
 }
 
+function sendDetachedRunAccepted(
+  response: ServerResponse,
+  run: WorkflowRunRecord,
+  eventCursor: number,
+): void {
+  sendJson(response, 202, {
+    runId: run.runId,
+    status: run.status,
+    eventCursor,
+    eventsUrl: `/api/runs/${encodeURIComponent(run.runId)}/events`,
+    cancelUrl: `/api/runs/${encodeURIComponent(run.runId)}/cancel`,
+  });
+}
+
+async function streamDetachedRunEvents(
+  service: DetachedWebRunService,
+  request: IncomingMessage,
+  response: ServerResponse,
+  runId: string,
+  afterQuery: string | null,
+): Promise<void> {
+  await service.readRun(runId);
+  const headerValue = Array.isArray(request.headers["last-event-id"])
+    ? request.headers["last-event-id"][0]
+    : request.headers["last-event-id"];
+  let lastSeq = parseEventSequence(headerValue ?? afterQuery, runId);
+  let ended = false;
+  let replaying = true;
+  const buffered: WorkflowEventRecord[] = [];
+  let unsubscribe = () => {};
+
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-store",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+  });
+  response.write(": connected\n\n");
+  request.socket.setKeepAlive(true);
+
+  const heartbeat = setInterval(() => {
+    if (!ended && !response.destroyed && !response.writableEnded) {
+      response.write(`: heartbeat ${Date.now()}\n\n`);
+    }
+  }, 15_000);
+  heartbeat.unref();
+
+  const finish = () => {
+    if (ended) {
+      return;
+    }
+    ended = true;
+    clearInterval(heartbeat);
+    unsubscribe();
+    request.off("aborted", finish);
+    response.off("close", finish);
+    if (!response.destroyed && !response.writableEnded) {
+      response.end();
+    }
+  };
+  const emit = (event: WorkflowEventRecord) => {
+    if (ended || event.seq <= lastSeq || response.destroyed) {
+      return;
+    }
+    lastSeq = event.seq;
+    const clientEvent = webClientEvent(event);
+    response.write(
+      `id: ${runId}:${event.seq}\ndata: ${JSON.stringify(clientEvent)}\n\n`,
+    );
+    if (isTerminalClientEvent(clientEvent)) {
+      finish();
+    }
+  };
+
+  request.once("aborted", finish);
+  response.once("close", finish);
+  unsubscribe = service.subscribe(runId, (event) => {
+    if (replaying) {
+      buffered.push(event);
+      return;
+    }
+    emit(event);
+  });
+
+  try {
+    for (const event of await service.readEvents(runId, lastSeq)) {
+      emit(event);
+      if (ended) {
+        return;
+      }
+    }
+    while (buffered.length > 0 && !ended) {
+      const pending = buffered.splice(0).sort((left, right) => left.seq - right.seq);
+      for (const event of pending) {
+        emit(event);
+        if (ended) {
+          return;
+        }
+      }
+    }
+    replaying = false;
+  } catch (error: unknown) {
+    finish();
+    throw error;
+  }
+}
+
+function parseEventSequence(value: string | null | undefined, runId: string): number {
+  if (value === undefined || value === null || value.trim().length === 0) {
+    return 0;
+  }
+  const normalized = value.startsWith(`${runId}:`)
+    ? value.slice(runId.length + 1)
+    : value;
+  const parsed = Number.parseInt(normalized, 10);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function webClientEvent(event: WorkflowEventRecord): Readonly<Record<string, unknown>> {
+  const payloadEvent = event.payload["event"];
+  if (typeof payloadEvent === "object" && payloadEvent !== null) {
+    return {
+      ...(payloadEvent as Readonly<Record<string, unknown>>),
+      workflow: { runId: event.runId, seq: event.seq },
+    };
+  }
+  return { type: "workflow_event", event };
+}
+
+function isTerminalClientEvent(event: Readonly<Record<string, unknown>>): boolean {
+  return event["type"] === "done" || event["type"] === "error";
+}
+
 async function routeRequest(
   options: WebUiServerOptions,
   runtimeState: WebUiRuntimeState,
+  detachedRuns: DetachedWebRunService | undefined,
   request: IncomingMessage,
   response: ServerResponse,
 ): Promise<void> {
@@ -128,6 +290,72 @@ async function routeRequest(
   }
   if (method === "GET" && url.pathname === "/api/health") {
     sendJson(response, 200, { ok: true, runtime: runtimeState });
+    return;
+  }
+  if (method === "POST" && url.pathname === "/api/runs") {
+    if (detachedRuns === undefined) {
+      sendJson(response, 400, { error: "Detached runs are not configured" });
+      return;
+    }
+    const body = await readJsonBody(request);
+    const kind = stringField(body, "kind");
+    const submission = kind === "conversation"
+      ? await detachedRuns.submitConversation({
+          conversationId: stringField(body, "conversationId"),
+          content: stringField(body, "content"),
+        })
+      : kind === "evolution_implementation"
+      ? await detachedRuns.submitEvolutionImplementation(stringField(body, "ticketId"))
+      : undefined;
+    if (submission === undefined) {
+      sendJson(response, 400, { error: `Unsupported detached run kind: ${kind}` });
+      return;
+    }
+    sendDetachedRunAccepted(response, submission.run, submission.eventCursor);
+    return;
+  }
+  const runEventsMatch = matchRoute(
+    url.pathname,
+    /^\/api\/runs\/([^/]+)\/events$/u,
+  );
+  if (method === "GET" && runEventsMatch !== undefined) {
+    if (detachedRuns === undefined) {
+      sendJson(response, 400, { error: "Detached runs are not configured" });
+      return;
+    }
+    await streamDetachedRunEvents(
+      detachedRuns,
+      request,
+      response,
+      runEventsMatch,
+      url.searchParams.get("after"),
+    );
+    return;
+  }
+  const runCancelMatch = matchRoute(
+    url.pathname,
+    /^\/api\/runs\/([^/]+)\/cancel$/u,
+  );
+  if (method === "POST" && runCancelMatch !== undefined) {
+    if (detachedRuns === undefined) {
+      sendJson(response, 400, { error: "Detached runs are not configured" });
+      return;
+    }
+    sendJson(response, 200, { run: await detachedRuns.cancel(runCancelMatch) });
+    return;
+  }
+  const runMatch = matchRoute(url.pathname, /^\/api\/runs\/([^/]+)$/u);
+  if (method === "GET" && runMatch !== undefined) {
+    if (detachedRuns === undefined || options.workflows === undefined) {
+      sendJson(response, 400, { error: "Detached runs are not configured" });
+      return;
+    }
+    const [run, steps, attempts] = await Promise.all([
+      detachedRuns.readRun(runMatch),
+      options.workflows.store.readSteps(runMatch),
+      options.workflows.store.readAttempts(runMatch),
+    ]);
+    sendJson(response, 200, { run, steps, attempts });
     return;
   }
   if (method === "GET" && url.pathname === "/api/state") {
@@ -301,6 +529,17 @@ async function routeRequest(
     /^\/api\/evolution\/tickets\/([^/]+)\/implementation$/u,
   );
   if (method === "POST" && implementationMatch !== undefined) {
+    if (detachedRuns !== undefined) {
+      const submission = await detachedRuns.submitEvolutionImplementation(
+        implementationMatch,
+      );
+      sendDetachedRunAccepted(
+        response,
+        submission.run,
+        submission.eventCursor,
+      );
+      return;
+    }
     await streamEvolutionImplementation(options, response, {
       ticketId: implementationMatch,
     });
@@ -647,6 +886,28 @@ async function routeRequest(
       options.agent !== undefined &&
       url.searchParams.get("stream") === "1"
     ) {
+      if (detachedRuns !== undefined) {
+        const submission = await detachedRuns.submitConversation({
+          conversationId: messageMatch,
+          content,
+        });
+        void generateAndPersistConversationTitle(
+          options,
+          messageMatch,
+          content,
+          (conversation) =>
+            detachedRuns.appendEvent(submission.run.runId, {
+              type: "conversation",
+              conversation,
+            }),
+        );
+        sendDetachedRunAccepted(
+          response,
+          submission.run,
+          submission.eventCursor,
+        );
+        return;
+      }
       await streamAgentConversationMessage(options, request, response, {
         conversationId: messageMatch,
         content,

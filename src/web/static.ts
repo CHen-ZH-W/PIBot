@@ -3771,6 +3771,10 @@ async function streamSessionMessage(conversationId, content) {
     if (!response.ok) {
       throw new Error(await response.text());
     }
+    if (response.status === 202) {
+      await streamDetachedRun(conversationId, await response.json());
+      return;
+    }
     if (!response.body) {
       clearLiveRun(conversationId);
       await refresh();
@@ -3799,6 +3803,98 @@ async function streamSessionMessage(conversationId, content) {
     renderRunNow(conversationId);
     throw error;
   }
+}
+
+async function streamDetachedRun(conversationId, accepted) {
+  var runId = accepted.runId;
+  var eventsUrl = accepted.eventsUrl || ("/api/runs/" + encodeURIComponent(runId) + "/events");
+  var cursor = Number.isSafeInteger(accepted.eventCursor) ? accepted.eventCursor : 0;
+  var lastEventId = runId + ":" + cursor;
+  var terminal = false;
+  var retryMs = 500;
+
+  while (!terminal) {
+    try {
+      const response = await fetch(eventsUrl, {
+        method: "GET",
+        headers: {
+          accept: "text/event-stream",
+          "Last-Event-ID": lastEventId
+        }
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      if (!response.body) {
+        throw new Error("Detached run event stream is unavailable");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (!terminal) {
+        const result = await reader.read();
+        if (result.done) break;
+        buffer += decoder.decode(result.value, { stream: true });
+        const normalized = buffer.replace(/\\r\\n/g, "\\n");
+        const blocks = normalized.split("\\n\\n");
+        buffer = blocks.pop() || "";
+        for (const block of blocks) {
+          const parsed = parseSseEvent(block);
+          if (!parsed) continue;
+          if (parsed.id) lastEventId = parsed.id;
+          terminal = parsed.event.type === "done" || parsed.event.type === "error";
+          applyStreamEvent(conversationId, parsed.event);
+        }
+      }
+      buffer += decoder.decode();
+      if (!terminal && buffer.trim().length > 0) {
+        const parsed = parseSseEvent(buffer);
+        if (parsed) {
+          if (parsed.id) lastEventId = parsed.id;
+          terminal = parsed.event.type === "done" || parsed.event.type === "error";
+          applyStreamEvent(conversationId, parsed.event);
+        }
+      }
+      if (terminal) return;
+
+      const snapshot = await api("/api/runs/" + encodeURIComponent(runId));
+      const status = snapshot.run && snapshot.run.status;
+      if (["succeeded", "failed", "blocked", "cancelled"].includes(status)) {
+        clearLiveRun(conversationId);
+        await refresh({ showLoading: false });
+        if (status !== "succeeded") {
+          throw new Error(snapshot.run.terminalReason || ("Detached run " + status));
+        }
+        return;
+      }
+    } catch (error) {
+      if (terminal) throw error;
+      const live = ensureLiveRun(conversationId);
+      pushLiveStatus(live, "Connection lost; reconnecting to background run...");
+      scheduleLiveRender(conversationId);
+      await sleep(retryMs);
+      retryMs = Math.min(retryMs * 2, 5000);
+      continue;
+    }
+    retryMs = 500;
+  }
+}
+
+function parseSseEvent(block) {
+  const lines = block.split("\\n");
+  let id = "";
+  const data = [];
+  for (const line of lines) {
+    if (line.startsWith(":")) continue;
+    if (line.startsWith("id:")) {
+      id = line.slice(3).trim();
+    } else if (line.startsWith("data:")) {
+      data.push(line.slice(5).trimStart());
+    }
+  }
+  if (data.length === 0) return null;
+  return { id: id, event: JSON.parse(data.join("\\n")) };
 }
 
 async function sendSessionControlMessage(conversationId, content) {
@@ -3884,6 +3980,10 @@ async function streamEvolutionImplementation(ticketId) {
     });
     if (!response.ok) {
       throw new Error(await response.text());
+    }
+    if (response.status === 202) {
+      await streamDetachedRun(EVOLUTION_CONVERSATION_ID, await response.json());
+      return;
     }
     if (!response.body) {
       clearLiveRun(EVOLUTION_CONVERSATION_ID);

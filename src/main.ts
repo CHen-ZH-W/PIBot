@@ -70,6 +70,8 @@ import {
 } from "./web/agent";
 import { FileWebConversationStore } from "./web/conversations";
 import { startWebUiServer } from "./web/server";
+import { WorkflowOrchestrator } from "./workflow/orchestrator";
+import { FileWorkflowStore } from "./workflow/store";
 
 async function main(): Promise<void> {
   const workspaceRoot = process.env.WORKSPACE_ROOT ?? process.cwd();
@@ -157,6 +159,23 @@ async function main(): Promise<void> {
       readPositiveIntegerEnv("SESSION_MAX_MEMORY_INDEX_FILE_BYTES") ?? 8_000,
     maxMemoryAuditFileBytes:
       readPositiveIntegerEnv("SESSION_MAX_MEMORY_AUDIT_FILE_BYTES") ?? 2_000_000,
+  });
+  const workflows = new WorkflowOrchestrator({
+    store: new FileWorkflowStore({
+      rootDir: path.join(storeRoot, "workflows"),
+    }),
+    defaultBudget: {
+      maxTotalAttempts:
+        readPositiveIntegerEnv("WORKFLOW_MAX_TOTAL_ATTEMPTS") ?? 4,
+      maxAttemptsPerStep:
+        readPositiveIntegerEnv("WORKFLOW_MAX_ATTEMPTS_PER_STEP") ?? 4,
+      maxCallsPerEdge:
+        readPositiveIntegerEnv("WORKFLOW_MAX_CALLS_PER_EDGE") ?? 3,
+    },
+    circuitThreshold:
+      readPositiveIntegerEnv("WORKFLOW_CIRCUIT_THRESHOLD") ?? 3,
+    circuitCooldownMs:
+      readPositiveIntegerEnv("WORKFLOW_CIRCUIT_COOLDOWN_MS") ?? 300000,
   });
   const sessionStore = new WorkspaceSessionStore({
     store: workspaceStore,
@@ -398,6 +417,7 @@ async function main(): Promise<void> {
       evolutionContext,
       runtimeActivation,
       conversations,
+      workflows,
       pibotSkillsRoot,
       disabledSkills: readCsvEnv("SKILLS_DISABLED"),
       maxSkills: readPositiveIntegerEnv("SKILLS_MAX_COUNT") ?? 100,
@@ -443,6 +463,7 @@ async function main(): Promise<void> {
             readPositiveIntegerEnv("CHILD_AGENT_MAX_TOKENS") ?? 120000,
         },
         evolution: evolutionController,
+        workflows,
         maxTurns: readPositiveIntegerEnv("AGENT_MAX_TURNS") ?? 80,
         disabledSkills: readCsvEnv("SKILLS_DISABLED"),
         maxSkills: readPositiveIntegerEnv("SKILLS_MAX_COUNT") ?? 100,
