@@ -49,6 +49,10 @@ export function formatSteeringQueuedMessage(): string {
   return "Steering message received for the active run.";
 }
 
+export function formatSteeringRejectedMessage(): string {
+  return "The active user turn is no longer accepting steering. Send the message again to start a new run.";
+}
+
 export function formatModeSwitchMessage(mode: string): string {
   return `Runtime mode switched to \`${sanitizeInlineCode(mode)}\` for the active run.`;
 }

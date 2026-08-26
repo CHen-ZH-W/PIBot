@@ -40,6 +40,7 @@ import {
   formatModeSwitchMessage,
   formatNoActiveRunMessage,
   formatSteeringQueuedMessage,
+  formatSteeringRejectedMessage,
   formatThinkingMessage,
   formatToolEndStatus,
   formatToolEndThreadMessage,
@@ -87,11 +88,6 @@ import {
   type ReflectionWorkflowOptions,
 } from "../runtime/reflection";
 import {
-  addSteeringMessage,
-  type AgentRuntimeState,
-} from "../runtime/mode";
-import {
-  applyModeSwitch,
   isAgentStopCommand as isRunStopCommand,
   parseFollowUpMessage,
   parseModeSwitchMessage,
@@ -100,6 +96,9 @@ import {
   renderModeSwitchSteering,
 } from "../runtime/run-control";
 import type { RuntimeHook } from "../runtime/hooks";
+import {
+  AgentRunController,
+} from "../runtime/run-controller";
 import type { EvolutionRunFailureReporter } from "../evolution/types";
 
 export interface AgentRunnerOptions {
@@ -116,7 +115,8 @@ export interface AgentRunnerOptions {
   ) => Promise<string>;
   readonly sessions: WorkspaceSessionStore;
   readonly tools: readonly LlmToolSchema[];
-  readonly maxTurns: number;
+  readonly maxSteps: number;
+  readonly maxParallelToolCalls?: number;
   readonly model?: string;
   readonly temperature?: number;
   readonly maxOutputTokens?: number;
@@ -147,10 +147,9 @@ interface ActiveRun {
   readonly channelId: SlackChannelId;
   readonly userId: SlackEvent["senderUserId"];
   readonly startedAt: Date;
-  readonly controller: AbortController;
+  readonly control: AgentRunController<PreparedSlackRunInput>;
   readonly context: SlackRunContext;
   readonly runtime: AgentRunContext;
-  cancelled: boolean;
 }
 
 interface RunRenderState {
@@ -172,6 +171,12 @@ interface RunPersistenceState {
 interface PreparedSlackRunInput {
   readonly event: SlackEvent;
   readonly userContentParts: readonly LlmMessageContentPart[];
+  readonly control?: AgentRunController<PreparedSlackRunInput>;
+}
+
+interface SlackUserTurnOutcome {
+  readonly reason: string;
+  readonly errorCode?: string;
 }
 
 /**
@@ -180,7 +185,6 @@ interface PreparedSlackRunInput {
  */
 export class PerChannelAgentRunner implements SlackMessageHandler {
   private readonly activeByChannel = new Map<SlackChannelId, ActiveRun>();
-  private readonly followUpByChannel = new Map<SlackChannelId, PreparedSlackRunInput[]>();
   private readonly updateThrottleMs: number;
   private readonly updateMinChars: number;
   private readonly maxFollowUpQueueSize: number;
@@ -269,99 +273,167 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     };
   }
 
-  private async runAgent(input: PreparedSlackRunInput): Promise<void> {
+  private async runAgent(
+    input: PreparedSlackRunInput,
+  ): Promise<SlackUserTurnOutcome | undefined> {
     const event = input.event;
     const channelId = event.conversation.channelId;
     const sessionKey = {
       teamId: event.conversation.teamId,
       channelId,
     };
-    const existing = this.activeByChannel.get(channelId);
+    const existing = input.control === undefined
+      ? this.activeByChannel.get(channelId)
+      : undefined;
     if (existing !== undefined) {
       const modeSwitch = parseModeSwitchMessage(event.text);
       if (modeSwitch !== undefined) {
-        applyModeSwitch(existing.runtime.state, modeSwitch);
-        addSteeringMessage(
-          existing.runtime.state,
+        const receipt = existing.control.changeMode(
+          modeSwitch,
           renderModeSwitchSteering(modeSwitch),
+          "slack",
         );
         await postSplitMrkdwnMessage(
           this.options.slack,
           replyConversationFor(event),
-          formatModeSwitchMessage(modeSwitch.mode),
+          receipt.accepted
+            ? formatModeSwitchMessage(modeSwitch.mode)
+            : formatSteeringRejectedMessage(),
         );
         return;
       }
 
       const steering = parseSteeringMessage(event.text);
       if (steering !== undefined) {
-        addSteeringMessage(existing.runtime.state, steering);
+        const receipt = existing.control.steer(steering, "slack");
         await postSplitMrkdwnMessage(
           this.options.slack,
           replyConversationFor(event),
-          formatSteeringQueuedMessage(),
+          receipt.accepted
+            ? formatSteeringQueuedMessage()
+            : formatSteeringRejectedMessage(),
         );
         return;
       }
 
       const followUp = parseFollowUpMessage(event.text);
       if (followUp === undefined) {
-        addSteeringMessage(existing.runtime.state, renderInlineSteering(event.text));
+        const receipt = existing.control.steer(
+          renderInlineSteering(event.text),
+          "slack",
+        );
         await postSplitMrkdwnMessage(
           this.options.slack,
           replyConversationFor(event),
-          formatSteeringQueuedMessage(),
+          receipt.accepted
+            ? formatSteeringQueuedMessage()
+            : formatSteeringRejectedMessage(),
         );
         return;
       }
 
-      const position = this.enqueueFollowUp({
-        ...input,
-        event: {
-          ...event,
-          text: followUp,
+      const receipt = existing.control.enqueueFollowUp(
+        {
+          ...input,
+          event: {
+            ...event,
+            text: followUp,
+          },
         },
-      });
+        { text: followUp, source: "slack" },
+      );
       await postSplitMrkdwnMessage(
         this.options.slack,
         replyConversationFor(event),
-        position === undefined
+        !receipt.accepted || receipt.position === undefined
           ? formatBusyMessage()
-          : formatFollowUpQueuedMessage(position),
+          : formatFollowUpQueuedMessage(receipt.position),
       );
       return;
     }
 
-    const controller = new AbortController();
+    if (input.control === undefined) {
+      const initialRuntime = createAgentRunContext({
+        runId: createRunId(),
+        agentId: this.options.agentId ?? ("coding-bot" as AgentId),
+        state: await this.options.sessions.readRuntimeState(sessionKey),
+      });
+      const controlRef: {
+        current?: AgentRunController<PreparedSlackRunInput>;
+      } = {};
+      const control = new AgentRunController<PreparedSlackRunInput>({
+        runContext: initialRuntime,
+        maxFollowUps: this.maxFollowUpQueueSize,
+        onTransition: (transition) =>
+          this.traceRecorder.record(withRun(
+            controlRef.current?.runContext ?? initialRuntime,
+            {
+              type: "runtime.transition",
+              transition,
+            },
+          )).catch(() => undefined),
+      });
+      controlRef.current = control;
+      await this.traceRecorder.record(withRun(initialRuntime, {
+        type: "run.started",
+        channelId,
+        userId: event.senderUserId,
+      })).catch(() => undefined);
+
+      let finalOutcome: SlackUserTurnOutcome = { reason: "unknown" };
+      try {
+        finalOutcome = await control.runUserTurns({
+          initial: { ...input, control },
+          execute: async (turnInput) =>
+            await this.runAgent({ ...turnInput, control }) ?? { reason: "unknown" },
+        });
+        return finalOutcome;
+      } catch (error: unknown) {
+        finalOutcome = {
+          reason: "exception",
+          errorCode: error instanceof Error ? error.name : "unknown",
+        };
+        throw error;
+      } finally {
+        if (this.activeByChannel.get(channelId)?.control === control) {
+          this.activeByChannel.delete(channelId);
+        }
+        await this.traceRecorder.record(withRun(control.runContext, {
+          type: "run.completed",
+          finalUserTurnReason: finalOutcome.reason,
+          ...optionalString("errorCode", finalOutcome.errorCode),
+        })).catch(() => undefined);
+      }
+    }
+
     const context = new SlackRunContext(this.options.slack, event);
     const startedAt = new Date();
-    const runtimeState = await this.options.sessions.readRuntimeState(sessionKey);
-    const runtime = createAgentRunContext({
-      runId: createRunId(),
-      agentId: this.options.agentId ?? ("coding-bot" as AgentId),
-      state: runtimeState,
-    });
+    const control = input.control;
+    const runtime = control.runContext;
     const initialModeSwitch = parseModeSwitchMessage(event.text);
     if (initialModeSwitch !== undefined) {
-      applyModeSwitch(runtime.state, initialModeSwitch);
-      addSteeringMessage(runtime.state, renderModeSwitchSteering(initialModeSwitch));
+      control.changeMode(
+        initialModeSwitch,
+        renderModeSwitchSteering(initialModeSwitch),
+        "slack",
+      );
     }
     const active: ActiveRun = {
       runId: runtime.runId,
       channelId,
       userId: event.senderUserId,
       startedAt,
-      controller,
+      control,
       context,
       runtime,
-      cancelled: false,
     };
     this.activeByChannel.set(channelId, active);
     this.logRun("info", "run_start", active, {
       messageTs: event.messageTs,
     });
     await this.recordTrace(active, {
-      type: "run.started",
+      type: "user_turn.started",
+      userTurnId: runtime.userTurnId,
       channelId,
       userId: event.senderUserId,
       messageTs: event.messageTs,
@@ -383,10 +455,10 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
 
     try {
       await context.startMain(formatThinkingMessage());
-      if (active.cancelled) {
+      if (active.control.cancelled) {
         await this.replaceMainBestEffort(active, formatCancelledMessage(), "cancelled");
         runReason = "cancelled";
-        return;
+        return { reason: runReason };
       }
 
       const renderState: RunRenderState = {
@@ -407,7 +479,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
       allowImmediateRender(renderState);
 
       let preparedRun = await this.options.sessions.prepareRun(event, {
-        signal: controller.signal,
+        signal: active.control.signal,
         onCompactionStart: async (compaction) => {
           await this.renderCompactionStartStatus(
             active,
@@ -421,12 +493,12 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
       const repoStart = await this.safePrepareRepoWorkflow(
         active,
         preparedRun.key,
-        controller.signal,
+        active.control.signal,
       );
       if (repoStart === null) {
         runReason = "repo_error";
         errorCode = "repo_workflow_error";
-        return;
+        return { reason: runReason, errorCode };
       }
 
       const runWorkspaceRoot = await this.resolveRunWorkspaceRoot(
@@ -469,8 +541,6 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         active.runtime,
         workspaceSkills,
       );
-      let contextOverflowRetries = 0;
-      let result;
       let persistence: RunPersistenceState = {
         prepared: preparedRun,
         completedGeneratedMessages: 0,
@@ -481,8 +551,8 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         renderState,
         getPersistence: () => persistence,
       });
-      while (true) {
-        result = await agentLoop.run(
+      const result = await active.control.run({
+        execute: () => agentLoop.run(
           {
             userText: event.text,
             userContentParts: input.userContentParts,
@@ -490,13 +560,16 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
             history: preparedRun.history,
             tools: this.options.tools,
             hooks: [realtimeCompactionHook],
-            maxTurns: this.options.maxTurns,
+            maxSteps: this.options.maxSteps,
+            ...(this.options.maxParallelToolCalls === undefined
+              ? {}
+              : { maxParallelToolCalls: this.options.maxParallelToolCalls }),
             runContext: active.runtime,
             ...optionalString("model", this.options.model),
             ...optionalNumber("temperature", this.options.temperature),
             ...optionalNumber("maxOutputTokens", this.options.maxOutputTokens),
             onEvent: async (agentEvent) => {
-              if (active.cancelled) {
+              if (active.control.cancelled) {
                 return;
               }
 
@@ -508,92 +581,107 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
               );
             },
           },
-          controller.signal,
-        );
-        if (
-          result.error?.code !== "context_overflow" ||
-          contextOverflowRetries >= (this.options.maxContextOverflowRetries ?? 1)
-        ) {
-          break;
-        }
+          active.control.signal,
+        ),
+        lifecycle: {
+          contextRecovery: {
+            maxAttempts: this.options.maxContextOverflowRetries ?? 1,
+            shouldRecover: (attemptResult) =>
+              attemptResult.error?.code === "context_overflow",
+            recover: async (contextOverflowRetries, attemptResult) => {
+              await this.appendRemainingRunMessages(
+                persistence,
+                attemptResult.messages,
+              );
+              appendProgressLine(
+                renderState,
+                "_Context is too large. Compacting history before retry..._",
+              );
+              await this.updateMainNow(active, renderState);
+              const overflowCompaction = await this.options.sessions.forceCompact(
+                preparedRun.key,
+                active.control.signal,
+              );
+              await this.recordCompactionTrace(active, overflowCompaction);
+              await this.renderCompactionStatus(
+                active,
+                renderState,
+                overflowCompaction,
+              );
+              if (overflowCompaction?.triggered !== true) {
+                return false;
+              }
 
-        await this.appendRemainingRunMessages(persistence, result.messages);
-        appendProgressLine(
-          renderState,
-          "_Context is too large. Compacting history before retry..._",
-        );
-        await this.updateMainNow(active, renderState);
-        const overflowCompaction = await this.options.sessions.forceCompact(
-          preparedRun.key,
-          controller.signal,
-        );
-        await this.recordCompactionTrace(active, overflowCompaction);
-        await this.renderCompactionStatus(active, renderState, overflowCompaction);
-        if (overflowCompaction?.triggered !== true) {
-          break;
-        }
-
-        contextOverflowRetries += 1;
-        await this.recordTrace(active, {
-          type: "run.context_overflow_retry",
-          attempt: contextOverflowRetries,
-        });
-        preparedRun = await this.options.sessions.prepareRun(event, {
-          signal: controller.signal,
-          onCompactionStart: async (compaction) => {
-            await this.renderCompactionStartStatus(
-              active,
-              renderState,
-              compaction,
-            );
+              await this.recordTrace(active, {
+                type: "run.context_overflow_retry",
+                attempt: contextOverflowRetries,
+              });
+              preparedRun = await this.options.sessions.prepareRun(event, {
+                signal: active.control.signal,
+                onCompactionStart: async (compaction) => {
+                  await this.renderCompactionStartStatus(
+                    active,
+                    renderState,
+                    compaction,
+                  );
+                },
+              });
+              persistence = {
+                prepared: preparedRun,
+                completedGeneratedMessages: 0,
+              };
+              await this.recordCompactionTrace(active, preparedRun.compaction);
+              await this.renderCompactionStatus(
+                active,
+                renderState,
+                preparedRun.compaction,
+              );
+              systemPrompt = buildCodingAgentSystemPrompt({
+                tools: this.options.tools,
+                memories: preparedRun.memories,
+                workspaceSkills,
+                repoPrompt: formatRepoRunPrompt(repoStart),
+                channelWorkspacePrompt: formatChannelWorkspacePrompt(
+                  runWorkspaceRoot,
+                  repoStart,
+                ),
+                workspaceRoot: runWorkspaceRoot,
+                mode: active.runtime.state.mode,
+                reflectionEnabled: this.options.reflection?.enabled === true,
+                ...(agentSelfInstructions === undefined
+                  ? {}
+                  : { agentSelfInstructions }),
+                ...(this.options.thinkingLanguage === undefined
+                  ? {}
+                  : { thinkingLanguage: this.options.thinkingLanguage }),
+              });
+              usageInput = {
+                systemPrompt,
+                history: preparedRun.history,
+                userText: event.text,
+              };
+              return true;
+            },
           },
-        });
-        persistence = {
-          prepared: preparedRun,
-          completedGeneratedMessages: 0,
-        };
-        await this.recordCompactionTrace(active, preparedRun.compaction);
-        await this.renderCompactionStatus(active, renderState, preparedRun.compaction);
-        systemPrompt = buildCodingAgentSystemPrompt({
-          tools: this.options.tools,
-          memories: preparedRun.memories,
-          workspaceSkills,
-          repoPrompt: formatRepoRunPrompt(repoStart),
-          channelWorkspacePrompt: formatChannelWorkspacePrompt(
-            runWorkspaceRoot,
-            repoStart,
-          ),
-          workspaceRoot: runWorkspaceRoot,
-          mode: active.runtime.state.mode,
-          reflectionEnabled: this.options.reflection?.enabled === true,
-          ...(agentSelfInstructions === undefined
-            ? {}
-            : { agentSelfInstructions }),
-          ...(this.options.thinkingLanguage === undefined
-            ? {}
-            : { thinkingLanguage: this.options.thinkingLanguage }),
-        });
-        usageInput = {
-          systemPrompt,
-          history: preparedRun.history,
-          userText: event.text,
-        };
-      }
-
-      if (active.cancelled) {
-        runReason = "cancelled";
-        return;
-      }
-      result = await this.maybeRunReflection({
-        active,
-        agentLoop,
-        renderState,
-        persistence,
-        initialResult: result,
-        systemPrompt,
-        userText: event.text,
-        signal: controller.signal,
+          reflection: {
+            run: (initialResult) => this.maybeRunReflection({
+              active,
+              agentLoop,
+              renderState,
+              persistence,
+              initialResult,
+              systemPrompt,
+              userText: event.text,
+              signal: active.control.signal,
+            }),
+          },
+        },
       });
+
+      if (active.control.cancelled) {
+        runReason = "cancelled";
+        return { reason: runReason };
+      }
       usageModel = result.model ?? usageModel;
       providerUsage = result.usage;
       generatedMessages = result.messages.slice(
@@ -604,7 +692,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
       const repoSummary = await this.summarizeRepoWorkflow(
         preparedRun.key,
         repoStart,
-        controller.signal,
+        active.control.signal,
       );
 
       await this.appendRemainingRunMessages(persistence, result.messages);
@@ -622,7 +710,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
           formatAgentErrorMessage(result.error),
           "error",
         );
-        return;
+        return { reason: runReason, errorCode };
       }
 
       await this.replaceMainBestEffort(
@@ -654,7 +742,8 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         durationMs: Date.now() - active.startedAt.getTime(),
       });
       await this.recordTrace(active, {
-        type: "run.completed",
+        type: "user_turn.completed",
+        userTurnId: active.runtime.userTurnId,
         reason: runReason,
         ...optionalString("errorCode", errorCode),
         durationMs: Date.now() - active.startedAt.getTime(),
@@ -674,46 +763,15 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
           ...errorFields(error),
         });
       });
-      if (this.activeByChannel.get(channelId) === active) {
-        this.activeByChannel.delete(channelId);
-      }
       await this.options.sessions.syncPendingUserMessages({
         teamId: event.conversation.teamId,
         channelId: event.conversation.channelId,
       });
-      await this.runNextFollowUp(channelId);
     }
-  }
-
-  private enqueueFollowUp(input: PreparedSlackRunInput): number | undefined {
-    const channelId = input.event.conversation.channelId;
-    const queued = this.followUpByChannel.get(channelId) ?? [];
-    if (queued.length >= this.maxFollowUpQueueSize) {
-      return undefined;
-    }
-    queued.push(input);
-    this.followUpByChannel.set(channelId, queued);
-    return queued.length;
-  }
-
-  private async runNextFollowUp(channelId: SlackChannelId): Promise<void> {
-    const queued = this.followUpByChannel.get(channelId);
-    const next = queued?.shift();
-    if (queued !== undefined && queued.length === 0) {
-      this.followUpByChannel.delete(channelId);
-    }
-    if (next === undefined) {
-      return;
-    }
-
-    try {
-      await this.runAgent(next);
-    } catch (error: unknown) {
-      this.logger.error("follow_up_run_failed", {
-        channelId,
-        ...errorFields(error),
-      });
-    }
+    return {
+      reason: runReason,
+      ...optionalString("errorCode", errorCode),
+    };
   }
 
   private async recordRunRolloutSummaryBestEffort(
@@ -728,7 +786,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         runId: active.runtime.runId,
         userText: event.text,
         reason: result.reason,
-        turns: result.turns,
+        steps: result.steps,
         messages: result.messages,
         ...(result.error === undefined
           ? {}
@@ -772,15 +830,19 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     }
 
     const maxFixAttempts = normalizeMaxFixAttempts(options.maxFixAttempts);
-    const maxTurns = options.maxTurns ?? this.options.maxTurns;
+    const maxSteps = options.maxSteps ?? this.options.maxSteps;
     let messages = input.initialResult.messages;
-    let turns = input.initialResult.turns;
+    let steps = input.initialResult.steps;
     let usage = input.initialResult.usage;
     let model = input.initialResult.model;
 
     let fixAttempts = 0;
     let reflectionPass = 0;
     while (true) {
+      input.active.control.recordTransition({
+        type: "start_reflection",
+        attempt: reflectionPass,
+      });
       await this.recordTrace(input.active, {
         type: "reflection.started",
         attempt: reflectionPass,
@@ -800,13 +862,16 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
           systemPrompt: input.systemPrompt,
           history,
           tools: this.options.tools,
-          maxTurns,
+          maxSteps,
+          ...(this.options.maxParallelToolCalls === undefined
+            ? {}
+            : { maxParallelToolCalls: this.options.maxParallelToolCalls }),
           runContext: input.active.runtime,
           ...optionalString("model", this.options.model),
           ...optionalNumber("temperature", this.options.temperature),
           ...optionalNumber("maxOutputTokens", this.options.maxOutputTokens),
           onEvent: async (agentEvent) => {
-            if (input.active.cancelled) {
+            if (input.active.control.cancelled) {
               return;
             }
 
@@ -825,15 +890,15 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         ...messages,
         ...reflectionResult.messages.slice(generatedStartIndex),
       ];
-      turns += reflectionResult.turns;
+      steps += reflectionResult.steps;
       usage = addModelUsage(usage, reflectionResult.usage);
       model = reflectionResult.model ?? model;
 
-      if (reflectionResult.error !== undefined || input.active.cancelled) {
+      if (reflectionResult.error !== undefined || input.active.control.cancelled) {
         return {
           ...input.initialResult,
           messages,
-          turns,
+          steps,
           ...optionalString("model", model),
           ...optionalModelUsage(usage),
           reason: reflectionResult.reason,
@@ -885,7 +950,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     return {
       ...input.initialResult,
       messages,
-      turns,
+      steps,
       ...optionalString("model", model),
       ...optionalModelUsage(usage),
     };
@@ -902,9 +967,18 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
       return;
     }
 
-    active.cancelled = true;
-    active.controller.abort();
-    this.followUpByChannel.delete(event.conversation.channelId);
+    const receipt = active.control.cancel({
+      reason: "user_stop",
+      source: "slack",
+    });
+    if (!receipt.accepted) {
+      await postSplitMrkdwnMessage(
+        this.options.slack,
+        replyConversationFor(event),
+        formatNoActiveRunMessage(),
+      );
+      return;
+    }
     this.logRun("warn", "run_abort_requested", active, {
       requestedByUserId: event.senderUserId,
     });
@@ -922,7 +996,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
 
     let updating = false;
     const timer = setInterval(() => {
-      if (updating || active.cancelled) {
+      if (updating || active.control.cancelled) {
         return;
       }
       updating = true;
@@ -946,7 +1020,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     event: AgentLoopEvent,
   ): Promise<void> {
     switch (event.type) {
-      case "turn_start":
+      case "step_start":
         renderState.currentAssistantText = "";
         await this.updateMainNow(active, renderState);
         allowImmediateRender(renderState);
@@ -1096,7 +1170,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
   }): RuntimeHook {
     return {
       beforeModelCall: async (context) => {
-        if (input.active.cancelled) {
+        if (input.active.control.cancelled) {
           return context.request;
         }
 
@@ -1114,7 +1188,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
           input.event,
           currentUserMessage,
           {
-            signal: input.active.controller.signal,
+            signal: input.active.control.signal,
             onCompactionStart: async (compaction) => {
               await this.renderCompactionStartStatus(
                 input.active,

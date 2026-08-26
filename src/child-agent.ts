@@ -114,7 +114,7 @@ async function main(): Promise<void> {
       systemPrompt: childSystemPrompt(env),
       history: [],
       tools: childToolSchemas(env),
-      maxTurns: childMaxTurns(env),
+      maxSteps: childMaxSteps(env),
       runContext: runtime,
       ...optionalString("model", readOptionalEnv("OPENAI_MODEL")),
       ...optionalNumber("maxOutputTokens", env.maxTokens),
@@ -265,22 +265,23 @@ function childToolApprovalGateOptions(env: ChildAgentEnv) {
   };
 }
 
-function childMaxTurns(env: ChildAgentEnv): number {
-  return resolveChildAgentMaxTurns({
+function childMaxSteps(env: ChildAgentEnv): number {
+  return resolveChildAgentMaxSteps({
     ...optionalNumber(
-      "configuredMaxTurns",
-      readPositiveIntegerEnv("CHILD_AGENT_MAX_TURNS"),
+      "configuredMaxSteps",
+      readPositiveIntegerEnv("CHILD_AGENT_MAX_STEPS") ??
+        readPositiveIntegerEnv("CHILD_AGENT_MAX_TURNS"),
     ),
     maxToolCalls: env.maxToolCalls,
   });
 }
 
-export function resolveChildAgentMaxTurns(options: {
-  readonly configuredMaxTurns?: number;
+export function resolveChildAgentMaxSteps(options: {
+  readonly configuredMaxSteps?: number;
   readonly maxToolCalls: number;
 }): number {
-  if (options.configuredMaxTurns !== undefined) {
-    return Math.max(1, Math.floor(options.configuredMaxTurns));
+  if (options.configuredMaxSteps !== undefined) {
+    return Math.max(1, Math.floor(options.configuredMaxSteps));
   }
   return Math.max(1, Math.floor(options.maxToolCalls));
 }

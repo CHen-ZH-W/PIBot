@@ -231,7 +231,9 @@ Slack message
 
 Registered tools are described once in a tool registry with a JSON schema, risk
 level and execution mode. Read-only tools may run in parallel; file mutations
-are serialized per target file.
+are serialized per target file. Parallel-safe batches use a bounded rolling
+pool (`AGENT_MAX_PARALLEL_TOOL_CALLS`, default `8`) and stop dispatching queued
+calls after cancellation while preserving one tool result per model tool call.
 
 Current built-in tools:
 
@@ -250,15 +252,28 @@ Current built-in tools:
 Slack runtime behavior:
 
 - `stop`, `cancel`, or common Chinese equivalents such as `停止` / `取消`
-  cancels the active run in the channel.
+  requests structured cancellation of the active Run. The first accepted
+  reason wins; repeated or post-terminal cancellation is rejected.
 - Messages sent while a run is active are treated as in-flight steering by
-  default.
-- `steering: ...` explicitly injects an in-flight correction into the active
-  run.
-- `follow-up: ...` queues a message to run after the active run completes.
+  default and enter `NextStepInbox`.
+- `steering: ...` uses the same next-Step path explicitly. PIBot has no
+  separate `inject` control primitive.
+- `follow-up: ...` enters `NextTurnQueue` and starts a new UserTurn under the
+  same Run after the active UserTurn reaches a terminal state.
+- Steering is delivered in receive order and at most once. Once a UserTurn has
+  made its terminal decision, late steering and mode changes are rejected.
+- Both control queues are bounded; cancellation closes them and queued but
+  undelivered entries receive an explicit terminal disposition.
 - Coordinator Mode can be requested with messages such as `coordinator: review
   this diff` or `进入 coordinator 模式`.
 - Long-running tasks update the main Slack message periodically.
+
+The runtime boundary is `Run -> UserTurn -> Step`. `MinimalAgentLoop` owns only
+model calls and repetition. `ToolScheduler` owns serial barriers, bounded
+parallel dispatch, cancellation backpressure, result ordering, and the rule
+that every model tool call receives exactly one tool result. Context recovery
+and reflection are lifecycle policies; tracing and UI transition consumers are
+fail-open observers and cannot change runtime decisions.
 
 ## Configuration
 
@@ -281,7 +296,8 @@ Common variables:
 | `MODEL_RETRY_BASE_DELAY_MS` | `500` | Initial model retry delay |
 | `MODEL_RETRY_MAX_DELAY_MS` | `8000` | Maximum model retry delay |
 | `MODEL_CONTEXT_WINDOW_TOKENS` | `262144` | Active model context window; set this to the smallest configured fallback window when overriding |
-| `AGENT_MAX_TURNS` | `80` | Maximum model/tool turns for one run |
+| `AGENT_MAX_STEPS` | `80` | Maximum Model -> ToolBatch steps for one user turn (`AGENT_MAX_TURNS` remains a legacy fallback) |
+| `AGENT_MAX_PARALLEL_TOOL_CALLS` | `8` | Maximum concurrently dispatched parallel-safe tool calls in one step |
 | `LONG_TASK_STATUS_UPDATE_MS` | `30000` | Slack status refresh interval for long-running tasks |
 | `SESSION_COMPACTION_RESERVE_TOKENS` | `32768` | Buffer reserved for prompt overhead, output and in-run context growth; LLM summary generation uses `floor(0.8 * reserve)` max output tokens |
 | `SESSION_COMPACTION_KEEP_RECENT_TOKENS` | `20000` | Approximate recent-history token budget retained after compaction |
@@ -322,7 +338,7 @@ Common variables:
 | `SKILLS_MAX_FILE_BYTES` | `64000` | Maximum size of each `SKILL.md` file |
 | `REFLECTION_ENABLED` | `false` | Enable post-run verify/critique/fix reflection |
 | `REFLECTION_MAX_FIX_ATTEMPTS` | `2` | Maximum automatic reflection fix attempts |
-| `REFLECTION_MAX_TURNS` | `AGENT_MAX_TURNS` | Maximum turns for a reflection pass |
+| `REFLECTION_MAX_STEPS` | `AGENT_MAX_STEPS` | Maximum steps for a reflection pass (legacy `REFLECTION_MAX_TURNS` remains a fallback) |
 | `REFLECTION_VERIFY_COMMANDS` | empty | Comma-separated verification commands for reflection |
 | `PIBOT_TMUX_PATH` | `tmux` | tmux binary used by child-agent supervisor |
 | `PIBOT_TMUX_SOCKET_PATH` | empty | Optional isolated tmux socket path |
@@ -332,7 +348,7 @@ Common variables:
 | `CHILD_AGENT_MAX_TIMEOUT_MS` | `1800000` | Maximum child-agent timeout |
 | `CHILD_AGENT_MAX_TOOL_CALLS` | `40` | Default child-agent tool-call budget |
 | `CHILD_AGENT_MAX_TOKENS` | `120000` | Default child-agent output/token budget passed to the model |
-| `CHILD_AGENT_MAX_TURNS` | `16` | Maximum model/tool turns for a built-in child agent |
+| `CHILD_AGENT_MAX_STEPS` | child tool-call budget | Maximum Model -> ToolBatch steps for a built-in child agent (`CHILD_AGENT_MAX_TURNS` remains a legacy fallback) |
 | `CHILD_AGENT_CAPTURE_LINES` | `120` | Default tmux pane tail lines captured |
 | `CHILD_AGENT_CAPTURE_MAX_CHARS` | `20000` | Default tmux capture character limit |
 | `CHILD_AGENT_TOOL_APPROVAL_MODE` | inherited | Optional approval mode override for built-in child agents |
@@ -568,9 +584,9 @@ explicitly assigned to that session.
 ## Runtime Trace
 
 Each Slack run appends structured events to `.pibot/trace.jsonl`. Events share
-`runId`, optional `parentRunId`, and `agentId`, and cover model calls, token
+`runId`, `userTurnId`, `stepId`, optional `parentRunId`, and `agentId`, and cover model calls, token
 usage, cost, retries, tool arguments, tool results, duration, approval decisions,
-interception reasons, and final run status.
+interception reasons, explicit runtime transitions, and final run status.
 
 Each Slack run also appends a usage record to `.pibot/usage.jsonl`. Child-agent
 usage is stored in each child run directory and summarized by `agent_collect`.

@@ -16,11 +16,11 @@ const readToolSchema = {
 async function runAcceptance() {
   await runCase(
     "tool call result enters next model context",
-    acceptsToolResultInNextModelTurn,
+    acceptsToolResultInNextModelStep,
   );
   await runCase("unknown tool returns tool error", acceptsUnknownToolAsToolError);
   await runCase("invalid tool arguments return tool error", acceptsInvalidToolArguments);
-  await runCase("maxTurns stops the loop", acceptsMaxTurnsStop);
+  await runCase("maxSteps stops the loop", acceptsMaxStepsStop);
   await runCase(
     "reasoning and completed messages are emitted",
     acceptsReasoningAndCompletedMessageEvents,
@@ -40,7 +40,7 @@ async function runCase(name, test) {
   }
 }
 
-async function acceptsToolResultInNextModelTurn() {
+async function acceptsToolResultInNextModelStep() {
   const events = [];
   const requests = [];
   const model = createScriptedModel([
@@ -84,7 +84,7 @@ async function acceptsToolResultInNextModelTurn() {
     systemPrompt: "Use tools when useful.",
     history: [],
     tools: [readToolSchema],
-    maxTurns: 3,
+    maxSteps: 3,
     onEvent: (event) => {
       events.push(event);
     },
@@ -143,7 +143,7 @@ async function acceptsUnknownToolAsToolError() {
     systemPrompt: "Use tools when useful.",
     history: [],
     tools: [readToolSchema],
-    maxTurns: 3,
+    maxSteps: 3,
     onEvent: (event) => {
       events.push(event);
     },
@@ -166,7 +166,7 @@ async function acceptsUnknownToolAsToolError() {
   );
 }
 
-async function acceptsMaxTurnsStop() {
+async function acceptsMaxStepsStop() {
   const events = [];
   const requests = [];
   const model = {
@@ -198,18 +198,18 @@ async function acceptsMaxTurnsStop() {
     systemPrompt: "Use tools forever.",
     history: [],
     tools: [readToolSchema],
-    maxTurns: 1,
+    maxSteps: 1,
     onEvent: (event) => {
       events.push(event);
     },
   });
 
-  assert.equal(result.reason, "max_turns");
-  assert.equal(result.error.code, "max_turns_exceeded");
+  assert.equal(result.reason, "max_steps");
+  assert.equal(result.error.code, "max_steps_exceeded");
   assert.equal(requests.length, 1);
   assert.equal(
     events.some(
-      (event) => event.type === "agent_end" && event.reason === "max_turns",
+      (event) => event.type === "agent_end" && event.reason === "max_steps",
     ),
     true,
   );
@@ -240,7 +240,7 @@ async function acceptsReasoningAndCompletedMessageEvents() {
     systemPrompt: "Answer briefly.",
     history: [],
     tools: [],
-    maxTurns: 1,
+    maxSteps: 1,
     onEvent: (event) => {
       events.push(event);
     },
@@ -251,7 +251,7 @@ async function acceptsReasoningAndCompletedMessageEvents() {
     events.find((event) => event.type === "reasoning_delta"),
     {
       type: "reasoning_delta",
-      turn: 1,
+      step: 1,
       text: "Inspecting the request.",
     },
   );
@@ -292,7 +292,7 @@ async function acceptsInvalidToolArguments() {
     systemPrompt: "Use tools when useful.",
     history: [],
     tools: [readToolSchema],
-    maxTurns: 3,
+    maxSteps: 3,
   });
   const payload = JSON.parse(
     requests[1].messages.find((message) => message.role === "tool").content,
@@ -304,7 +304,7 @@ async function acceptsInvalidToolArguments() {
   assert.match(payload.error.message, /arguments must be a JSON object/u);
 }
 
-function createScriptedModel(turns, requests, usages = []) {
+function createScriptedModel(steps, requests, usages = []) {
   let index = 0;
 
   return {
@@ -316,7 +316,7 @@ function createScriptedModel(turns, requests, usages = []) {
         model: "fake-model",
       };
 
-      const scriptedEvents = turns[index] ?? [];
+      const scriptedEvents = steps[index] ?? [];
       index += 1;
 
       for (const event of scriptedEvents) {

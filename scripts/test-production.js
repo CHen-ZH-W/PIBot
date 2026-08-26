@@ -46,7 +46,7 @@ const {
   FileChildAgentApprovalResponder,
 } = require("../dist/runtime/child-agent-approvals");
 const {
-  resolveChildAgentMaxTurns,
+  resolveChildAgentMaxSteps,
   resolveChildAgentToolApprovalMode,
 } = require("../dist/child-agent");
 const {
@@ -168,8 +168,8 @@ async function runTests() {
     testChildAgentWriteApprovalMode,
   );
   await runCase(
-    "child agent turn budget follows tool-call budget",
-    testChildAgentTurnBudget,
+    "child agent step budget follows tool-call budget",
+    testChildAgentStepBudget,
   );
   await runCase("Kimi K2.6 usage pricing", testKimiK26UsagePricing);
   await runCase("Kimi stream usage parsing", testKimiStreamUsageParsing);
@@ -1825,7 +1825,7 @@ async function testWebUiSelfEvolutionModelClassification() {
       maxShellTimeoutMs: 1_000,
     },
     evolution,
-    maxTurns: 3,
+    maxSteps: 3,
   });
   const events = [];
 
@@ -1964,7 +1964,7 @@ async function testWebUiActiveRunSteering() {
       maxShellTimeoutMs: 1_000,
     },
     evolution,
-    maxTurns: 3,
+    maxSteps: 3,
   });
   const events = [];
 
@@ -2001,6 +2001,14 @@ async function testWebUiActiveRunSteering() {
       (event) =>
         event.type === "status" &&
         /Steering added to the active run/u.test(event.message),
+    ),
+    true,
+  );
+  assert.equal(
+    events.some(
+      (event) =>
+        event.type === "runtime_transition" &&
+        event.transition.type === "continue_with_steering",
     ),
     true,
   );
@@ -2669,7 +2677,7 @@ async function testWebUiContextOverflowRetry() {
       maxShellTimeoutMs: 1_000,
     },
     evolution,
-    maxTurns: 2,
+    maxSteps: 2,
   });
   const events = [];
 
@@ -2796,7 +2804,7 @@ async function testWebUiPlanModeApproval() {
       maxShellTimeoutMs: 1_000,
     },
     evolution,
-    maxTurns: 6,
+    maxSteps: 6,
   });
   const events = [];
   const run = runner.runUserMessage(conversation.id, "Plan this first", {
@@ -2975,7 +2983,7 @@ async function testWebUiPlanModePersistsAcrossMessages() {
       maxShellTimeoutMs: 1_000,
     },
     evolution,
-    maxTurns: 6,
+    maxSteps: 6,
   });
 
   const firstEvents = [];
@@ -3150,7 +3158,7 @@ async function testWebUiChildAgentRuntimeAvailable() {
       maxConcurrent: 20,
     },
     evolution,
-    maxTurns: 3,
+    maxSteps: 3,
   });
 
   const result = await runner.runUserMessage(
@@ -3246,7 +3254,7 @@ async function testWebUiToolApproval() {
       maxShellTimeoutMs: 1_000,
     },
     evolution,
-    maxTurns: 3,
+    maxSteps: 3,
   });
   const events = [];
   const run = runner.runUserMessage(conversation.id, "Write approved file", {
@@ -3716,16 +3724,16 @@ function testChildAgentWriteApprovalMode() {
   );
 }
 
-function testChildAgentTurnBudget() {
+function testChildAgentStepBudget() {
   assert.equal(
-    resolveChildAgentMaxTurns({
+    resolveChildAgentMaxSteps({
       maxToolCalls: 80,
     }),
     80,
   );
   assert.equal(
-    resolveChildAgentMaxTurns({
-      configuredMaxTurns: 12,
+    resolveChildAgentMaxSteps({
+      configuredMaxSteps: 12,
       maxToolCalls: 80,
     }),
     12,
@@ -3990,7 +3998,7 @@ async function testAgentLoopToolCallFlow() {
     systemPrompt: "Use tools.",
     history: [],
     tools: getCodingToolSchemas(),
-    maxTurns: 3,
+    maxSteps: 3,
   });
 
   assert.equal(result.reason, "completed");

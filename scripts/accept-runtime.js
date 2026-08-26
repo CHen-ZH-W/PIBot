@@ -6,6 +6,23 @@ const {
 const { tmpdir } = require("node:os");
 const { join } = require("node:path");
 const { MinimalAgentLoop } = require("../dist/agent/agent-loop");
+const { createAgentRunContext } = require("../dist/runtime/context");
+const {
+  AgentRunController,
+  driveWithContextRecovery,
+} = require("../dist/runtime/run-controller");
+const {
+  NextStepInbox,
+  NextTurnQueue,
+} = require("../dist/runtime/control");
+const { RuntimeHookRunner } = require("../dist/runtime/hooks");
+const { BoundedToolScheduler } = require("../dist/runtime/tool-scheduler");
+const {
+  createAgentRuntimeState,
+  enterPlanMode,
+  exitPlanMode,
+  RuntimeModeHook,
+} = require("../dist/runtime/mode");
 const {
   OpenAICompatibleProviderAdapter,
   RetryingModelClient,
@@ -27,6 +44,18 @@ const { createSandboxExecutor } = require("../dist/workspace/sandbox");
 async function runAcceptance() {
   await runCase("registry executes a newly registered tool", acceptsRegisteredTool);
   await runCase("parallel tools overlap while file writes serialize", acceptsExecutionModes);
+  await runCase("parallel tool batches apply bounded backpressure", acceptsBoundedParallelTools);
+  await runCase("aborted queued tools keep complete tool-result pairing", acceptsAbortPairing);
+  await runCase("abort wins when a model stream ignores the signal", acceptsAbortAfterModel);
+  await runCase("step context freezes advertised capabilities", acceptsStepContextSnapshot);
+  await runCase("in-flight steering advances to the next step", acceptsSteeringTransition);
+  await runCase("step-end observer steering reaches the next step", acceptsTerminalSteeringRace);
+  await runCase("control mailboxes enforce delivery and terminal boundaries", acceptsControlMailboxes);
+  await runCase("run controller owns control transitions and follow-ups", acceptsRunController);
+  await runCase("context recovery keeps next-step steering open", acceptsRecoverySteering);
+  await runCase("failed user turns terminate before queued follow-ups", acceptsFailurePrecedence);
+  await runCase("cancellation is first-cause and produces one terminal event", acceptsCancellationRace);
+  await runCase("tool hook failures preserve tool-result pairing", acceptsToolHookFailurePairing);
   await runCase("beforeToolCall hook blocks dangerous bash", acceptsHookInterception);
   await runCase("model retries then switches to fallback", acceptsRetryAndFallback);
   await runCase("provider classifies context overflow", acceptsContextOverflow);
@@ -134,7 +163,7 @@ async function acceptsExecutionModes() {
     systemPrompt: "Use tools.",
     history: [],
     tools: [{ name: "read", description: "read", inputSchemaJson: "{}" }],
-    maxTurns: 3,
+    maxSteps: 3,
   });
   assert.equal(maxActiveReads, 2);
 
@@ -173,6 +202,870 @@ async function acceptsExecutionModes() {
     }),
   ]);
   assert.equal(maxActiveWrites, 1);
+}
+
+async function acceptsBoundedParallelTools() {
+  let active = 0;
+  let maxActive = 0;
+  let executed = 0;
+  let modelCalls = 0;
+  const tools = {
+    listTools: () => ["read"],
+    describeTool: () => ({
+      name: "read",
+      riskLevel: "read-only",
+      executionMode: "parallel",
+    }),
+    async executeTool(call) {
+      executed += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await wait(10);
+      active -= 1;
+      return { ok: true, callId: call.id, output: call.input };
+    },
+  };
+  const model = {
+    async *stream() {
+      modelCalls += 1;
+      yield startEvent("bounded-tools");
+      if (modelCalls === 1) {
+        for (let index = 0; index < 7; index += 1) {
+          yield toolCall(`bounded-${index}`, "read", { path: `${index}.txt` });
+        }
+      } else {
+        yield { type: "text_delta", text: "done" };
+      }
+      yield { type: "done" };
+    },
+  };
+
+  const result = await new MinimalAgentLoop({ model, tools }).run({
+    userText: "read seven files",
+    systemPrompt: "Use tools.",
+    history: [],
+    tools: [{ name: "read", description: "read", inputSchemaJson: "{}" }],
+    maxSteps: 2,
+    maxParallelToolCalls: 2,
+  });
+
+  assert.equal(result.reason, "completed");
+  assert.equal(executed, 7);
+  assert.equal(maxActive, 2);
+}
+
+async function acceptsAbortPairing() {
+  const controller = new AbortController();
+  const events = [];
+  let executions = 0;
+  const tools = {
+    listTools: () => ["read"],
+    describeTool: () => ({
+      name: "read",
+      riskLevel: "read-only",
+      executionMode: "parallel",
+    }),
+    async executeTool(call) {
+      executions += 1;
+      controller.abort();
+      await wait(5);
+      return { ok: true, callId: call.id, output: call.input };
+    },
+  };
+  const model = {
+    async *stream() {
+      yield startEvent("abort-pairing");
+      for (let index = 0; index < 3; index += 1) {
+        yield toolCall(`abort-${index}`, "read", { path: `${index}.txt` });
+      }
+      yield { type: "done" };
+    },
+  };
+
+  const result = await new MinimalAgentLoop({ model, tools }).run({
+    userText: "read three files",
+    systemPrompt: "Use tools.",
+    history: [],
+    tools: [{ name: "read", description: "read", inputSchemaJson: "{}" }],
+    maxSteps: 2,
+    maxParallelToolCalls: 1,
+    onEvent: (event) => events.push(event),
+  }, controller.signal);
+  const toolMessages = result.messages.filter((message) => message.role === "tool");
+  const payloads = toolMessages.map((message) => JSON.parse(message.content));
+
+  assert.equal(result.reason, "aborted");
+  assert.equal(executions, 1);
+  assert.equal(toolMessages.length, 3);
+  assert.equal(payloads.filter((payload) => payload.error?.code === "aborted").length, 2);
+  assert.equal(events.filter((event) => event.type === "tool_start").length, 1);
+  assert.equal(events.filter((event) => event.type === "tool_end").length, 3);
+}
+
+async function acceptsAbortAfterModel() {
+  let markStarted;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  let release;
+  const released = new Promise((resolve) => {
+    release = resolve;
+  });
+  const model = {
+    async *stream() {
+      yield startEvent("abort-after-model");
+      markStarted();
+      await released;
+      yield { type: "text_delta", text: "stale completion" };
+      yield { type: "done" };
+    },
+  };
+  const tools = {
+    listTools: () => [],
+    async executeTool() {
+      throw new Error("No tool should execute");
+    },
+  };
+  const controller = new AbortController();
+  const running = new MinimalAgentLoop({ model, tools }).run({
+    userText: "wait",
+    systemPrompt: "Wait.",
+    history: [],
+    tools: [],
+    maxSteps: 1,
+  }, controller.signal);
+
+  await started;
+  controller.abort();
+  release();
+  const result = await running;
+
+  assert.equal(result.reason, "aborted");
+  assert.equal(result.error.code, "aborted");
+  assert.equal(result.steps, 1);
+}
+
+async function acceptsStepContextSnapshot() {
+  const state = createAgentRuntimeState();
+  const stepStarts = [];
+  const toolContexts = [];
+  const requests = [];
+  let executions = 0;
+  const tools = {
+    listTools: () => ["edit"],
+    describeTool: () => ({
+      name: "edit",
+      riskLevel: "mutating",
+      executionMode: "sequential",
+    }),
+    async executeTool(call) {
+      executions += 1;
+      return { ok: true, callId: call.id, output: {} };
+    },
+  };
+  const model = {
+    async *stream(request) {
+      requests.push(request);
+      yield startEvent("step-context");
+      if (requests.length === 1) {
+        enterPlanMode(state);
+        exitPlanMode(state);
+        yield toolCall("edit-after-mode-change", "edit", { path: "a.txt" });
+      } else {
+        yield { type: "text_delta", text: "permission restored next step" };
+      }
+      yield { type: "done" };
+    },
+  };
+  const captureHook = {
+    beforeModelCall({ stepContext }) {
+      stepStarts.push(stepContext);
+    },
+    beforeToolCall({ stepContext }) {
+      toolContexts.push(stepContext);
+    },
+  };
+  const runContext = createAgentRunContext({ state });
+  const result = await new MinimalAgentLoop({
+    model,
+    tools,
+    hooks: [
+      captureHook,
+      new RuntimeModeHook({ state, describeTool: tools.describeTool }),
+    ],
+  }).run({
+    userText: "edit a file",
+    systemPrompt: "Use tools.",
+    history: [],
+    tools: [{ name: "edit", description: "edit", inputSchemaJson: "{}" }],
+    maxSteps: 2,
+    runContext,
+  });
+  const denied = JSON.parse(
+    result.messages.find((message) => message.role === "tool").content,
+  );
+
+  assert.equal(result.reason, "completed");
+  assert.equal(executions, 0);
+  assert.deepEqual(requests[0].tools.map((tool) => tool.name), ["edit"]);
+  assert.deepEqual(requests[1].tools.map((tool) => tool.name), ["edit"]);
+  assert.equal(stepStarts[0].mode, "execute");
+  assert.equal(Object.isFrozen(stepStarts[0]), true);
+  assert.deepEqual(toolContexts[0].advertisedTools, ["edit"]);
+  assert.equal(toolContexts[0].stateVersion < state.version, true);
+  assert.equal(denied.error.code, "permission_denied");
+}
+
+async function acceptsControlMailboxes() {
+  const context = createAgentRunContext();
+  const inbox = new NextStepInbox({ maxEntries: 2, maxBytes: 8 });
+  inbox.openUserTurn(context.userTurnId);
+  const first = inbox.enqueue({
+    id: "steer-1",
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "one",
+    source: "runtime",
+  });
+  const duplicate = inbox.enqueue({
+    id: "steer-1",
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "ignored",
+    source: "runtime",
+  });
+  const second = inbox.enqueue({
+    id: "steer-2",
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "two",
+    source: "runtime",
+  });
+  const overflow = inbox.enqueue({
+    id: "steer-3",
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "x",
+    source: "runtime",
+  });
+  assert.equal(first.accepted, true);
+  assert.equal(duplicate.accepted, true);
+  assert.equal(inbox.history().length, 3);
+  assert.equal(second.accepted, true);
+  assert.equal(overflow.accepted, false);
+  assert.equal(overflow.reason, "next_step_inbox_full");
+  assert.deepEqual(
+    inbox.drain(context.userTurnId, "step-1").map((message) => message.id),
+    ["steer-1", "steer-2"],
+  );
+  assert.deepEqual(inbox.drain(context.userTurnId, "step-2"), []);
+  assert.equal(inbox.enqueue({
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "   ",
+  }).reason, "empty_control_message");
+  inbox.closeUserTurn(context.userTurnId);
+  assert.equal(inbox.enqueue({
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "late",
+  }).reason, "user_turn_completed");
+
+  const byteInbox = new NextStepInbox({ maxEntries: 2, maxBytes: 3 });
+  byteInbox.openUserTurn(context.userTurnId);
+  assert.equal(byteInbox.enqueue({
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "四",
+  }).accepted, true);
+  assert.equal(byteInbox.enqueue({
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "a",
+  }).reason, "next_step_inbox_bytes_exceeded");
+
+  const queue = new NextTurnQueue({ maxEntries: 2, maxBytes: 5 });
+  assert.equal(queue.enqueue("first", {
+    id: "turn-1",
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "ab",
+  }).position, 1);
+  assert.equal(queue.enqueue("second", {
+    id: "turn-2",
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "cd",
+  }).position, 2);
+  assert.equal(queue.enqueue("overflow", {
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "e",
+  }).reason, "next_turn_queue_full");
+  assert.equal(queue.dequeue().payload, "first");
+  queue.close("run_completed", "expired");
+  assert.equal(queue.size, 0);
+  assert.equal(queue.history().find((record) =>
+    record.message.id === "turn-2").status, "expired");
+  assert.equal(queue.enqueue("late", {
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "late",
+  }).reason, "run_completed");
+
+  const byteQueue = new NextTurnQueue({ maxEntries: 3, maxBytes: 4 });
+  assert.equal(byteQueue.enqueue("first", {
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "abc",
+  }).accepted, true);
+  assert.equal(byteQueue.enqueue("second", {
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "二",
+  }).reason, "next_turn_queue_bytes_exceeded");
+}
+
+async function acceptsRunController() {
+  const transitions = [];
+  const initial = createAgentRunContext();
+  const controller = new AgentRunController({
+    runContext: initial,
+    maxFollowUps: 2,
+    onTransition: (transition) => transitions.push(transition),
+  });
+  const firstUserTurnId = controller.runContext.userTurnId;
+
+  controller.steer("new constraint");
+  assert.equal(controller.followUp("first"), 1);
+  assert.equal(controller.followUp("second"), 2);
+  assert.equal(controller.followUp("overflow"), undefined);
+
+  const recoveryController = new AgentRunController({
+    runContext: createAgentRunContext(),
+    maxFollowUps: 0,
+  });
+  let driverExecutions = 0;
+  const recovered = await driveWithContextRecovery(recoveryController, {
+    maxAttempts: 1,
+    async execute() {
+      driverExecutions += 1;
+      return { needsRecovery: driverExecutions === 1 };
+    },
+    needsRecovery: (result) => result.needsRecovery,
+    recover: async () => true,
+  });
+  assert.equal(recovered.needsRecovery, false);
+  assert.equal(driverExecutions, 2);
+
+  let runAttempts = 0;
+  const drivenTurns = [];
+  const finalResult = await controller.runUserTurns({
+    initial: "current",
+    async execute(value, context) {
+      drivenTurns.push({ value, userTurnId: context.userTurnId });
+      return controller.run({
+        async execute() {
+          runAttempts += 1;
+          return runAttempts === 1
+            ? {
+                reason: "error",
+                messages: [],
+                steps: 1,
+                error: {
+                  code: "context_overflow",
+                  message: "compact",
+                  retryable: true,
+                },
+              }
+            : { reason: "completed", messages: [], steps: 1 };
+        },
+        lifecycle: value === "current"
+          ? {
+              contextRecovery: {
+                maxAttempts: 1,
+                shouldRecover: (result) =>
+                  result.error?.code === "context_overflow",
+                recover: async () => true,
+              },
+            }
+          : undefined,
+      });
+    },
+  });
+  assert.equal(finalResult.reason, "completed");
+  assert.equal(runAttempts, 4);
+  assert.deepEqual(
+    drivenTurns.map((turn) => turn.value),
+    ["current", "first", "second"],
+  );
+  assert.equal(drivenTurns[0].userTurnId, firstUserTurnId);
+  assert.equal(new Set(drivenTurns.map((turn) => turn.userTurnId)).size, 3);
+  assert.equal(controller.runContext.runId, initial.runId);
+  assert.equal(controller.queuedFollowUps, 0);
+  assert.equal(
+    transitions.filter((transition) =>
+      transition.type === "complete_user_turn").length,
+    3,
+  );
+  assert.equal(
+    transitions.filter((transition) =>
+      transition.type === "start_followup_turn").length,
+    2,
+  );
+  assert.equal(
+    transitions.filter((transition) =>
+      transition.type === "recover_context").length,
+    1,
+  );
+  assert.equal(
+    transitions.filter((transition) => transition.type === "complete_run").length,
+    1,
+  );
+
+  const lateCancel = controller.cancel({
+    reason: "user_stop",
+    source: "runtime",
+  });
+  await controller.flushTransitions();
+  assert.equal(lateCancel.accepted, false);
+  assert.equal(lateCancel.reason, "run_already_terminal");
+  assert.equal(controller.cancelled, false);
+  assert.equal(controller.queuedFollowUps, 0);
+  assert.equal(transitions.at(-1).type, "complete_run");
+  const completedMode = controller.runContext.state.mode;
+  assert.equal(controller.changeMode(
+    { mode: "coordinator", goal: "too late" },
+    "too late",
+  ).accepted, false);
+  assert.equal(controller.runContext.state.mode, completedMode);
+  const lateFollowUp = controller.enqueueFollowUp("too late");
+  assert.equal(lateFollowUp.accepted, false);
+  assert.equal(lateFollowUp.reason, "run_completed");
+
+  const cancelled = new AgentRunController({
+    runContext: createAgentRunContext(),
+    maxFollowUps: 1,
+  });
+  cancelled.followUp("discarded");
+  const firstCancel = cancelled.cancel({
+    reason: "user_stop",
+    source: "runtime",
+  });
+  const repeatedCancel = cancelled.cancel({
+    reason: "timeout",
+    source: "runtime",
+  });
+  assert.equal(firstCancel.accepted, true);
+  assert.equal(firstCancel.cancellation.reason, "user_stop");
+  assert.equal(repeatedCancel.accepted, false);
+  assert.equal(repeatedCancel.cancellation.reason, "user_stop");
+  assert.equal(cancelled.cancelled, true);
+  assert.equal(cancelled.queuedFollowUps, 0);
+  assert.equal(cancelled.transitions.at(-1).type, "cancel_requested");
+}
+
+async function acceptsCancellationRace() {
+  const controller = new AgentRunController({
+    runContext: createAgentRunContext(),
+    maxFollowUps: 1,
+    observers: [{
+      onEvent() {
+        throw new Error("observer failure must be fail-open");
+      },
+    }],
+  });
+  controller.followUp("discard me");
+  let markStarted;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  let release;
+  const released = new Promise((resolve) => {
+    release = resolve;
+  });
+  const running = controller.runUserTurns({
+    initial: "current",
+    execute: () => controller.run({
+      async execute() {
+        markStarted();
+        await released;
+        return {
+          reason: "aborted",
+          messages: [],
+          steps: 1,
+          error: {
+            code: "aborted",
+            message: "stopped",
+            retryable: false,
+          },
+        };
+      },
+    }),
+  });
+  await started;
+  const first = controller.cancel({ reason: "user_stop", source: "runtime" });
+  const racing = controller.cancel({ reason: "timeout", source: "runtime" });
+  release();
+  await running;
+  const late = controller.cancel({ reason: "shutdown", source: "runtime" });
+  await controller.flushTransitions();
+
+  assert.equal(first.accepted, true);
+  assert.equal(racing.accepted, false);
+  assert.equal(racing.cancellation.reason, "user_stop");
+  assert.equal(late.accepted, false);
+  assert.equal(late.reason, "run_already_terminal");
+  assert.equal(controller.queuedFollowUps, 0);
+  assert.equal(controller.transitions.filter((event) =>
+    event.type === "cancel_requested").length, 1);
+  assert.equal(controller.transitions.filter((event) =>
+    event.type === "abort_user_turn").length, 1);
+  assert.equal(controller.transitions.filter((event) =>
+    event.type === "abort_run").length, 1);
+  assert.equal(controller.steer("too late").accepted, false);
+  assert.equal(controller.enqueueFollowUp("too late").accepted, false);
+}
+
+async function acceptsFailurePrecedence() {
+  const controller = new AgentRunController({
+    runContext: createAgentRunContext(),
+    maxFollowUps: 1,
+  });
+  controller.followUp("must expire");
+  const result = await controller.runUserTurns({
+    initial: "current",
+    execute: () => controller.run({
+      execute: async () => ({
+        reason: "error",
+        messages: [],
+        steps: 1,
+        error: {
+          code: "unknown",
+          message: "terminal failure",
+          retryable: false,
+        },
+      }),
+    }),
+  });
+
+  assert.equal(result.reason, "error");
+  assert.equal(controller.queuedFollowUps, 0);
+  assert.equal(controller.transitions.filter((event) =>
+    event.type === "fail_user_turn").length, 1);
+  assert.equal(controller.transitions.filter((event) =>
+    event.type === "start_followup_turn").length, 0);
+  assert.equal(controller.transitions.filter((event) =>
+    event.type === "fail_run").length, 1);
+}
+
+async function acceptsRecoverySteering() {
+  const requests = [];
+  const model = {
+    async *stream(request) {
+      requests.push(request);
+      yield startEvent("recovery-steering");
+      if (requests.length === 1) {
+        yield {
+          type: "error",
+          error: {
+            code: "context_overflow",
+            message: "compact first",
+            retryable: true,
+          },
+        };
+        return;
+      }
+      yield { type: "text_delta", text: "recovered" };
+      yield { type: "done" };
+    },
+  };
+  const tools = {
+    listTools: () => [],
+    async executeTool() {
+      throw new Error("No tool should execute");
+    },
+  };
+  const controller = new AgentRunController({
+    runContext: createAgentRunContext(),
+    maxFollowUps: 0,
+  });
+  const loop = new MinimalAgentLoop({ model, tools });
+  let recoveryReceipt;
+  const result = await controller.run({
+    execute: () => loop.run({
+      userText: "recover",
+      systemPrompt: "Recover.",
+      history: [],
+      tools: [],
+      maxSteps: 1,
+      runContext: controller.runContext,
+    }),
+    lifecycle: {
+      contextRecovery: {
+        maxAttempts: 1,
+        shouldRecover: (attempt) =>
+          attempt.error?.code === "context_overflow",
+        async recover() {
+          recoveryReceipt = controller.steer("new recovery constraint");
+          return true;
+        },
+      },
+    },
+  });
+
+  assert.equal(result.reason, "completed");
+  assert.equal(result.steps, 2);
+  assert.equal(recoveryReceipt.accepted, true);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].messages.some((message) =>
+    message.role === "user" && /new recovery constraint/u.test(message.content)), true);
+}
+
+async function acceptsToolHookFailurePairing() {
+  let executions = 0;
+  const context = createAgentRunContext();
+  const stepContext = {
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    stepId: "hook-step",
+    step: 1,
+    stateVersion: context.state.version,
+    mode: context.state.mode,
+    advertisedTools: ["read"],
+    controlMessages: [],
+    steeringMessages: [],
+  };
+  const scheduler = new BoundedToolScheduler({
+    maxParallelToolCalls: 1,
+    tools: {
+      listTools: () => ["read"],
+      describeTool: () => ({
+        name: "read",
+        riskLevel: "read-only",
+        executionMode: "parallel",
+      }),
+      async executeTool(call) {
+        executions += 1;
+        return { ok: true, callId: call.id, output: {} };
+      },
+    },
+    hooks: new RuntimeHookRunner([{
+      beforeToolCall() {
+        throw new Error("policy hook failed");
+      },
+      onToolFailure() {
+        throw new Error("failure hook failed");
+      },
+    }]),
+  });
+  const results = await scheduler.schedule({
+    run: context,
+    stepContext,
+    calls: [{ id: "hook-call", name: "read", input: {} }],
+    onEvent(event) {
+      if (event.type === "tool_start" || event.type === "tool_end") {
+        throw new Error("presentation observer failed");
+      }
+    },
+  });
+
+  assert.equal(executions, 0);
+  assert.equal(results.length, 1);
+  assert.equal(results[0].callId, "hook-call");
+  assert.equal(results[0].ok, false);
+  assert.equal(results[0].error.code, "execution_failed");
+  assert.match(results[0].error.message, /failure hook failed/u);
+
+  const identityScheduler = new BoundedToolScheduler({
+    maxParallelToolCalls: 1,
+    tools: {
+      listTools: () => ["read"],
+      describeTool: () => ({
+        name: "read",
+        riskLevel: "read-only",
+        executionMode: "parallel",
+      }),
+      async executeTool(call) {
+        return { ok: true, callId: call.id, output: {} };
+      },
+    },
+    hooks: new RuntimeHookRunner([{
+      beforeToolCall({ call }) {
+        return { allowed: true, call: { ...call, id: "rewritten-call" } };
+      },
+      afterToolCall({ result }) {
+        return { ...result, callId: "rewritten-result" };
+      },
+    }]),
+  });
+  const identityResults = await identityScheduler.schedule({
+    run: context,
+    stepContext,
+    calls: [{ id: "model-call", name: "read", input: {} }],
+  });
+  assert.equal(identityResults.length, 1);
+  assert.equal(identityResults[0].callId, "model-call");
+
+  const metadataFailure = await new BoundedToolScheduler({
+    maxParallelToolCalls: 1,
+    tools: {
+      listTools: () => ["read"],
+      describeTool() {
+        throw new Error("metadata unavailable");
+      },
+      async executeTool() {
+        throw new Error("must not dispatch without metadata");
+      },
+    },
+    hooks: new RuntimeHookRunner(),
+  }).schedule({
+    run: context,
+    stepContext,
+    calls: [{ id: "metadata-call", name: "read", input: {} }],
+  });
+  assert.equal(metadataFailure.length, 1);
+  assert.equal(metadataFailure[0].callId, "metadata-call");
+  assert.equal(metadataFailure[0].ok, false);
+  assert.match(metadataFailure[0].error.message, /metadata unavailable/u);
+}
+
+async function acceptsSteeringTransition() {
+  let releaseFirstStep;
+  const firstStepReleased = new Promise((resolve) => {
+    releaseFirstStep = resolve;
+  });
+  let markFirstStepStarted;
+  const firstStepStarted = new Promise((resolve) => {
+    markFirstStepStarted = resolve;
+  });
+  const requests = [];
+  const stepContexts = [];
+  const model = {
+    async *stream(request) {
+      requests.push(request);
+      yield startEvent("steering-transition");
+      if (requests.length === 1) {
+        markFirstStepStarted();
+        await firstStepReleased;
+        yield { type: "text_delta", text: "stale answer" };
+      } else {
+        assert.equal(
+          request.messages.some(
+            (message) =>
+              message.role === "user" && /new requirement/u.test(message.content),
+          ),
+          true,
+        );
+        yield { type: "text_delta", text: "updated answer" };
+      }
+      yield { type: "done" };
+    },
+  };
+  const tools = {
+    listTools: () => [],
+    async executeTool() {
+      throw new Error("No tool should execute");
+    },
+  };
+  const state = createAgentRuntimeState();
+  const controller = new AgentRunController({
+    runContext: createAgentRunContext({
+      state,
+      onTransition() {
+        throw new Error("diagnostic observer failure");
+      },
+    }),
+    maxFollowUps: 0,
+  });
+  const running = new MinimalAgentLoop({
+    model,
+    tools,
+    hooks: [
+      {
+        beforeModelCall({ stepContext }) {
+          stepContexts.push(stepContext);
+        },
+      },
+      new RuntimeModeHook({ state }),
+    ],
+  }).run({
+    userText: "answer once",
+    systemPrompt: "Follow steering.",
+    history: [],
+    tools: [],
+    maxSteps: 2,
+    runContext: controller.runContext,
+  });
+
+  await firstStepStarted;
+  controller.steer("use the new requirement");
+  releaseFirstStep();
+  const result = await running;
+
+  assert.equal(result.reason, "completed");
+  assert.equal(requests.length, 2);
+  assert.deepEqual(stepContexts.map((context) => context.step), [1, 2]);
+  assert.equal(new Set(stepContexts.map((context) => context.stepId)).size, 2);
+  assert.equal(
+    controller.transitions.some(
+      (transition) => transition.type === "continue_with_steering",
+    ),
+    true,
+  );
+}
+
+async function acceptsTerminalSteeringRace() {
+  let terminalReceipt;
+  let controller;
+  controller = new AgentRunController({
+    runContext: createAgentRunContext(),
+    maxFollowUps: 0,
+    observers: [{
+      onEvent(event) {
+        if (event.type === "complete_user_turn") {
+          terminalReceipt = controller.steer("arrived after user-turn terminal");
+        }
+      },
+    }],
+  });
+  const model = {
+    async *stream() {
+      yield startEvent("terminal-steering-race");
+      yield { type: "text_delta", text: "done" };
+      yield { type: "done" };
+    },
+  };
+  const tools = {
+    listTools: () => [],
+    async executeTool() {
+      throw new Error("No tool should execute");
+    },
+  };
+  let lateReceipt;
+  let stepEnds = 0;
+  const result = await controller.run({
+    execute: () => new MinimalAgentLoop({ model, tools }).run({
+      userText: "finish",
+      systemPrompt: "Finish.",
+      history: [],
+      tools: [],
+      maxSteps: 2,
+      runContext: controller.runContext,
+      onEvent(event) {
+        if (event.type === "step_end" && stepEnds === 0) {
+          stepEnds += 1;
+          lateReceipt = controller.steer("arrived after terminal decision");
+        }
+      },
+    }),
+  });
+
+  assert.equal(result.reason, "completed");
+  assert.equal(result.steps, 2);
+  assert.equal(lateReceipt.accepted, true);
+  assert.equal(terminalReceipt.accepted, false);
+  assert.equal(terminalReceipt.reason, "user_turn_completed");
 }
 
 async function acceptsHookInterception() {
@@ -222,7 +1115,7 @@ async function acceptsHookInterception() {
     systemPrompt: "Use tools.",
     history: [],
     tools: [{ name: "bash", description: "bash", inputSchemaJson: "{}" }],
-    maxTurns: 3,
+    maxSteps: 3,
   });
   assert.equal(result.reason, "completed");
   assert.equal(executions, 0);
@@ -314,11 +1207,11 @@ async function acceptsTraceReplay() {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "pibot-runtime-trace-"));
   const traceFile = join(workspaceRoot, "trace.jsonl");
   const recorder = new JsonlTraceRecorder({ filePath: traceFile });
-  const run = {
+  const run = createAgentRunContext({
     runId: "run-trace-1",
     parentRunId: "run-parent-1",
     agentId: "coding-bot",
-  };
+  });
   await recorder.record(withRun(run, { type: "run.started" }));
   const approvalGate = createToolApprovalGate("workspace-write", {
     onDecision: createTraceApprovalObserver(recorder, run),
@@ -366,7 +1259,7 @@ async function acceptsTraceReplay() {
     systemPrompt: "Use tools.",
     history: [],
     tools: getCodingToolSchemas(),
-    maxTurns: 3,
+    maxSteps: 3,
     runContext: run,
   });
   await recorder.record(withRun(run, {

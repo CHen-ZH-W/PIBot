@@ -1389,7 +1389,7 @@ function shouldCreateFailureSignal(reason: string, errorCode: string): boolean {
 
 function severityForError(errorCode: string): EvolutionSeverity {
   if (
-    errorCode === "max_turns_exceeded" ||
+    errorCode === "max_steps_exceeded" ||
     errorCode === "context_overflow" ||
     errorCode === "tool_execution_failed"
   ) {

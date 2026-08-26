@@ -250,7 +250,7 @@ async function acceptsRunnerCompactionStatus() {
     }),
     sessions: fixture.session,
     tools: [],
-    maxTurns: 1,
+    maxSteps: 1,
     updateThrottleMs: 0,
     updateMinChars: 0,
   });
@@ -324,7 +324,7 @@ async function acceptsRuntimeCompaction() {
     }),
     sessions: fixture.session,
     tools,
-    maxTurns: 3,
+    maxSteps: 3,
     traceRecorder: {
       async record(event) {
         traces.push(event);
@@ -415,7 +415,7 @@ async function acceptsOverflowRetry() {
     }),
     sessions: fixture.session,
     tools: [],
-    maxTurns: 2,
+    maxSteps: 2,
     traceRecorder: {
       async record(event) {
         traces.push(event);

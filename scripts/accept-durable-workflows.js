@@ -276,7 +276,7 @@ async function acceptsDetachedRunReplay() {
         runId: "agent-run-1",
         event: {
           type: "tool_end",
-          turn: 1,
+          step: 1,
           call: {
             id: "tool-1",
             name: "read",

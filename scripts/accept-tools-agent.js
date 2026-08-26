@@ -230,7 +230,7 @@ async function runLoop(workspaceRoot, model, userText, events = []) {
     systemPrompt: "Use tools to inspect and edit the workspace.",
     history: [],
     tools: getCodingToolSchemas(),
-    maxTurns: 5,
+    maxSteps: 5,
     onEvent: (event) => {
       events.push(event);
     },

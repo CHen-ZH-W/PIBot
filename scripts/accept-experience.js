@@ -164,7 +164,7 @@ async function acceptsImageAttachmentInput() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 1,
+    maxSteps: 1,
     attachmentDownloader: {
       async downloadForEvent() {
         return {
@@ -381,7 +381,7 @@ async function acceptsSteeringMessage() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: [{ name: "read", description: "read", inputSchemaJson: "{}" }],
-    maxTurns: 3,
+    maxSteps: 3,
   });
 
   const activeRun = runner.handleSlackMessage(slackEvent("start long task"));
@@ -483,7 +483,7 @@ async function acceptsLocalizedStopCancellation() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: [{ name: "read", description: "read", inputSchemaJson: "{}" }],
-    maxTurns: 3,
+    maxSteps: 3,
   });
 
   const activeRun = runner.handleSlackMessage(slackEvent("start long task"));
@@ -543,7 +543,7 @@ async function acceptsReasoningProgressUpdates() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 1,
+    maxSteps: 1,
   });
 
   await runner.handleSlackMessage(slackEvent("show progress"));
@@ -617,7 +617,7 @@ async function acceptsInterleavedProgressTimeline() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: [{ name: "read", description: "read", inputSchemaJson: "{}" }],
-    maxTurns: 2,
+    maxSteps: 2,
     updateThrottleMs: 0,
     updateMinChars: 0,
   });
@@ -684,7 +684,7 @@ async function acceptsLongUnicodeProgressByteLimit() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 1,
+    maxSteps: 1,
     updateThrottleMs: 0,
     updateMinChars: 0,
   });
@@ -743,7 +743,7 @@ async function acceptsLongFinalResponseThreading() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 1,
+    maxSteps: 1,
     updateThrottleMs: 0,
     updateMinChars: 0,
   });
@@ -819,7 +819,7 @@ async function acceptsProgressClearsOldContent() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 1,
+    maxSteps: 1,
     updateThrottleMs: 0,
     updateMinChars: 0,
   });
@@ -880,7 +880,7 @@ async function acceptsReasoningProgressOmitsCode() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 1,
+    maxSteps: 1,
     updateThrottleMs: 0,
     updateMinChars: 0,
   });
@@ -935,7 +935,7 @@ async function acceptsSlackProgressUpdateFailureDoesNotAbort() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 1,
+    maxSteps: 1,
     updateThrottleMs: 0,
     updateMinChars: 0,
   });
@@ -1030,7 +1030,7 @@ async function acceptsRealtimeGeneratedContext() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: [{ name: "read", description: "read", inputSchemaJson: "{}" }],
-    maxTurns: 2,
+    maxSteps: 2,
   });
 
   const activeRun = runner.handleSlackMessage(slackEvent("read README"));
@@ -1107,7 +1107,7 @@ async function acceptsLongRunningStatus() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 1,
+    maxSteps: 1,
     longTaskStatusUpdateMs: 20,
   });
 

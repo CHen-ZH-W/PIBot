@@ -373,7 +373,12 @@ async function main(): Promise<void> {
       (await workspaceStore.ensureChannelDirectory(key)).channelDir,
     sessions: sessionStore,
     tools: getCodingToolSchemas(),
-    maxTurns: readPositiveIntegerEnv("AGENT_MAX_TURNS") ?? 80,
+    maxSteps:
+      readPositiveIntegerEnv("AGENT_MAX_STEPS") ??
+      readPositiveIntegerEnv("AGENT_MAX_TURNS") ??
+      80,
+    maxParallelToolCalls:
+      readPositiveIntegerEnv("AGENT_MAX_PARALLEL_TOOL_CALLS") ?? 8,
     maxContextOverflowRetries:
       readNonNegativeIntegerEnv("SESSION_COMPACTION_MAX_OVERFLOW_RETRIES") ?? 1,
     longTaskStatusUpdateMs:
@@ -387,8 +392,10 @@ async function main(): Promise<void> {
       enabled: readBooleanEnv("REFLECTION_ENABLED") ?? false,
       maxFixAttempts:
         readNonNegativeIntegerEnv("REFLECTION_MAX_FIX_ATTEMPTS") ?? 2,
-      maxTurns:
+      maxSteps:
+        readPositiveIntegerEnv("REFLECTION_MAX_STEPS") ??
         readPositiveIntegerEnv("REFLECTION_MAX_TURNS") ??
+        readPositiveIntegerEnv("AGENT_MAX_STEPS") ??
         readPositiveIntegerEnv("AGENT_MAX_TURNS") ??
         80,
       verifyCommands: readCsvEnv("REFLECTION_VERIFY_COMMANDS"),
@@ -464,7 +471,12 @@ async function main(): Promise<void> {
         },
         evolution: evolutionController,
         workflows,
-        maxTurns: readPositiveIntegerEnv("AGENT_MAX_TURNS") ?? 80,
+        maxSteps:
+          readPositiveIntegerEnv("AGENT_MAX_STEPS") ??
+          readPositiveIntegerEnv("AGENT_MAX_TURNS") ??
+          80,
+        maxParallelToolCalls:
+          readPositiveIntegerEnv("AGENT_MAX_PARALLEL_TOOL_CALLS") ?? 8,
         disabledSkills: readCsvEnv("SKILLS_DISABLED"),
         maxSkills: readPositiveIntegerEnv("SKILLS_MAX_COUNT") ?? 100,
         maxSkillFileBytes:

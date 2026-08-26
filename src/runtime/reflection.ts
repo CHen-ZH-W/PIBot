@@ -1,7 +1,7 @@
 export interface ReflectionWorkflowOptions {
   readonly enabled: boolean;
   readonly maxFixAttempts?: number;
-  readonly maxTurns?: number;
+  readonly maxSteps?: number;
   readonly verifyCommands?: readonly string[];
 }
 

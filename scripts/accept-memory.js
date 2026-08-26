@@ -186,7 +186,7 @@ async function acceptsRunRolloutSummarySedimentation() {
     runId: "run-memory-sedimentation",
     userText: "Fix the memory sedimentation path.",
     reason: "completed",
-    turns: 2,
+    steps: 2,
     messages: [
       {
         role: "assistant",

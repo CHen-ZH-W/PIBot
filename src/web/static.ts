@@ -2013,7 +2013,8 @@ function ensureLiveRun(conversationId) {
       toolChips: [],
       approvals: [],
       blocks: [],
-      runId: null
+      runId: null,
+      userTurnId: null
     };
   }
   return state.liveRuns[conversationId];
@@ -4028,6 +4029,7 @@ function applyStreamEvent(conversationId, event) {
   if (event.type === "run_start") {
     const live = ensureLiveRun(conversationId);
     live.runId = event.runId || null;
+    live.userTurnId = event.userTurnId || null;
     live.assistantText = "";
     live.reasoningText = "";
     live.approvals = [];

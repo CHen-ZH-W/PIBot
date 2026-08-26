@@ -120,7 +120,15 @@ edit a real repo, create
 ```text
 WebUI / Slack
   -> session and context storage
-  -> AgentLoop
+  -> AgentRunController
+     -> NextStepInbox (active-message / `steer:` -> next Step)
+     -> NextTurnQueue (explicit `follow-up:` -> next UserTurn)
+     -> RunCancellation (first cancellation reason wins)
+     -> lifecycle policies + fail-open transition observers
+  -> Run
+     -> UserTurn
+        -> Step (model call)
+           -> ToolScheduler (serial barriers + bounded parallel batch)
   -> OpenAI-compatible provider
   -> ToolRegistry and approval hooks
   -> workspace tools, sandbox, memory, Skills, and child agents

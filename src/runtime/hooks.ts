@@ -5,7 +5,7 @@ import type {
   ToolMetadata,
   ToolResult,
 } from "../core/tools";
-import type { AgentRunContext } from "./context";
+import type { AgentRunContext, AgentStepContext } from "./context";
 
 export interface RuntimeModelCallResult {
   readonly model?: string;
@@ -19,7 +19,8 @@ export interface RuntimeModelCallResult {
 
 export interface RuntimeModelCallHookContext {
   readonly run: AgentRunContext;
-  readonly turn: number;
+  readonly step: number;
+  readonly stepContext: AgentStepContext;
   readonly request: ModelRequest;
 }
 
@@ -30,7 +31,8 @@ export interface RuntimeAfterModelCallHookContext
 
 export interface RuntimeToolCallHookContext {
   readonly run: AgentRunContext;
-  readonly turn: number;
+  readonly step: number;
+  readonly stepContext: AgentStepContext;
   readonly call: ToolCall;
   readonly metadata?: ToolMetadata;
   readonly startedAtMs: number;
@@ -45,7 +47,7 @@ export interface RuntimeAfterToolCallHookContext
 export interface RuntimeStopHookContext {
   readonly run: AgentRunContext;
   readonly reason: AgentEndReason;
-  readonly turns: number;
+  readonly steps: number;
   readonly error?: AgentLoopError;
 }
 

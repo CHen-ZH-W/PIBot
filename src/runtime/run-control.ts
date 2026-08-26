@@ -2,6 +2,7 @@ import { isStopCommandText } from "../core/commands";
 import {
   enterCoordinatorMode,
   exitCoordinatorMode,
+  setAgentRuntimeMode,
   type AgentMode,
   type AgentRuntimeState,
 } from "./mode";
@@ -85,7 +86,7 @@ export function applyModeSwitch(
   if (state.mode === "coordinator") {
     exitCoordinatorMode(state);
   } else {
-    state.mode = request.mode;
+    setAgentRuntimeMode(state, request.mode);
   }
 }
 

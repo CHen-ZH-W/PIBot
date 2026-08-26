@@ -12,7 +12,7 @@ export interface RunRolloutSummaryRequest {
   readonly runId: AgentRunId;
   readonly userText: string;
   readonly reason: string;
-  readonly turns: number;
+  readonly steps: number;
   readonly messages: readonly LlmMessage[];
   readonly errorCode?: string;
   readonly errorMessage?: string;
@@ -59,7 +59,7 @@ function formatRunRolloutSummary(request: RunRolloutSummaryRequest): string {
     `- Created at: ${createdAt}`,
     `- Run ID: ${request.runId}`,
     `- End reason: ${request.reason}`,
-    `- Turns: ${request.turns}`,
+    `- Steps: ${request.steps}`,
     ...(request.durationMs === undefined
       ? []
       : [`- Duration: ${request.durationMs} ms`]),

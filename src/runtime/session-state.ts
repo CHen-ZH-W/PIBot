@@ -101,6 +101,7 @@ function applyToolOutputSnapshot(
   if (mode === "plan") {
     const updatedAt = readString(output.updatedAt) ?? current?.plan?.updatedAt;
     return {
+      version: (current?.version ?? 0) + 1,
       mode,
       plan: {
         planPath: readString(output.planPath) ?? current?.plan?.planPath ?? "PLAN.md",
@@ -119,6 +120,7 @@ function applyToolOutputSnapshot(
     const enteredAt =
       readString(output.enteredAt) ?? current?.coordinator?.enteredAt ?? createdAt;
     return {
+      version: (current?.version ?? 0) + 1,
       mode,
       ...(current?.plan === undefined ? {} : { plan: current.plan }),
       coordinator: {
@@ -132,6 +134,7 @@ function applyToolOutputSnapshot(
   const approvedAt = readString(output.approvedAt) ?? current?.plan?.approvedAt;
   const exitedAt = readString(output.exitedAt) ?? current?.coordinator?.exitedAt;
   return {
+    version: (current?.version ?? 0) + 1,
     mode,
     plan: {
       ...optionalString("planPath", current?.plan?.planPath),
@@ -165,6 +168,7 @@ function parseSnapshot(
     return undefined;
   }
   return {
+    ...optionalNonNegativeInteger("version", value.version),
     mode,
     ...(isJsonObject(value.plan)
       ? {
@@ -209,6 +213,15 @@ function optionalString<Key extends string>(
   return value === undefined ? {} : { [key]: value } as {
     readonly [Property in Key]: string;
   };
+}
+
+function optionalNonNegativeInteger<Key extends string>(
+  key: Key,
+  value: unknown,
+): { readonly [Property in Key]: number } | object {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0
+    ? { [key]: value } as { readonly [Property in Key]: number }
+    : {};
 }
 
 function parseJsonObject(value: string): JsonObject | undefined {

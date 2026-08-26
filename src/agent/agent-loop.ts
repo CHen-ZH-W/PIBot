@@ -6,17 +6,28 @@ import type {
 } from "../core/agent";
 import type {
   ToolCall,
-  ToolError,
   ToolResult,
   UnparsedToolCall,
 } from "../core/tools";
 import type { ToolExecutor } from "../ports/tools";
-import { createAgentRunContext, type AgentRunContext } from "../runtime/context";
+import {
+  captureAgentStepContext,
+  createAgentRunContext,
+  agentNextStepInbox,
+  withAdvertisedStepTools,
+  type AgentRunContext,
+  type AgentStepContext,
+} from "../runtime/context";
 import {
   RuntimeHookRunner,
   type RuntimeHook,
   type RuntimeModelCallResult,
 } from "../runtime/hooks";
+import {
+  BoundedToolScheduler,
+  type ToolScheduler,
+} from "../runtime/tool-scheduler";
+import { decideAfterStep } from "../runtime/decisions";
 import type {
   ModelClient,
   ModelRequest,
@@ -37,6 +48,8 @@ export interface MinimalAgentLoopDependencies {
   readonly model: ModelClient;
   readonly tools: ToolExecutor;
   readonly hooks?: readonly RuntimeHook[];
+  readonly maxParallelToolCalls?: number;
+  readonly toolScheduler?: ToolScheduler;
 }
 
 export interface MinimalAgentLoopInput {
@@ -46,7 +59,8 @@ export interface MinimalAgentLoopInput {
   readonly history: readonly LlmMessage[];
   readonly tools: readonly LlmToolSchema[];
   readonly hooks?: readonly RuntimeHook[];
-  readonly maxTurns: number;
+  readonly maxSteps: number;
+  readonly maxParallelToolCalls?: number;
   readonly runContext?: AgentRunContext;
   readonly model?: string;
   readonly temperature?: number;
@@ -57,13 +71,14 @@ export interface MinimalAgentLoopInput {
 export interface AgentLoopResult {
   readonly reason: AgentEndReason;
   readonly messages: readonly LlmMessage[];
-  readonly turns: number;
+  readonly steps: number;
   readonly model?: string;
   readonly usage?: ModelUsage;
   readonly error?: AgentLoopError;
 }
 
-interface TurnModelResult extends RuntimeModelCallResult {
+interface StepModelResult extends RuntimeModelCallResult {
+  readonly stepContext: AgentStepContext;
   readonly assistantText: string;
   readonly reasoningContent?: string;
   readonly toolCalls: readonly ModelToolCall[];
@@ -87,19 +102,29 @@ export class MinimalAgentLoop {
     input: MinimalAgentLoopInput,
     signal?: AbortSignal,
   ): Promise<AgentLoopResult> {
-    const maxTurns = Math.max(1, input.maxTurns);
+    const maxSteps = positiveInteger(input.maxSteps, 1, "maxSteps");
+    const maxParallelToolCalls = positiveInteger(
+      input.maxParallelToolCalls ?? this.dependencies.maxParallelToolCalls,
+      8,
+      "maxParallelToolCalls",
+    );
     const run = input.runContext ?? createAgentRunContext();
     const hooks = new RuntimeHookRunner([
       ...(input.hooks ?? []),
       ...this.baseHooks,
     ]);
+    const toolScheduler = this.dependencies.toolScheduler ?? new BoundedToolScheduler({
+      tools: this.dependencies.tools,
+      hooks,
+      maxParallelToolCalls,
+    });
     let messages = initialMessages(input);
-    let completedTurns = 0;
+    let completedSteps = 0;
     const usage = createModelUsageAccumulator();
 
     await emit(input.onEvent, {
       type: "agent_start",
-      maxTurns,
+      maxSteps,
     });
 
     if (isSignalAborted(signal)) {
@@ -115,22 +140,23 @@ export class MinimalAgentLoop {
       );
     }
 
-    for (let turn = 1; turn <= maxTurns; turn += 1) {
-      completedTurns = turn;
+    for (let attemptStep = 1; attemptStep <= maxSteps; attemptStep += 1) {
+      completedSteps = attemptStep;
+      const stepContext = captureAgentStepContext(run, input.model);
       await emit(input.onEvent, {
-        type: "turn_start",
-        turn,
+        type: "step_start",
+        step: stepContext.step,
       });
 
-      const modelResult = await this.runModelTurn(
+      const modelResult = await this.runModelStep(
         hooks,
         run,
         input,
         messages,
-        turn,
+        stepContext,
         signal,
       );
-      addModelTurnUsage(usage, modelResult);
+      addModelStepUsage(usage, modelResult);
       const assistantMessage = toAssistantMessage(
         modelResult.assistantText,
         modelResult.reasoningContent,
@@ -139,112 +165,174 @@ export class MinimalAgentLoop {
       messages = [...messages, assistantMessage];
       await emit(input.onEvent, {
         type: "message_completed",
-        turn,
+        step: modelResult.stepContext.step,
         message: assistantMessage,
       });
 
-      if (modelResult.aborted) {
-        await emitTurnEnd(input.onEvent, turn, "aborted", modelResult.assistantText);
+      if (modelResult.aborted || isSignalAborted(signal)) {
+        await emitStepEnd(
+          input.onEvent,
+          modelResult.stepContext.step,
+          "aborted",
+          modelResult.assistantText,
+        );
         return this.end(
           hooks,
           run,
           input.onEvent,
           "aborted",
           messages,
-          completedTurns,
+          completedSteps,
           usage,
           abortedError(),
         );
       }
 
       if (modelResult.error !== undefined) {
-        await emitTurnEnd(input.onEvent, turn, "error", modelResult.assistantText);
+        await emitStepEnd(
+          input.onEvent,
+          modelResult.stepContext.step,
+          "error",
+          modelResult.assistantText,
+        );
         return this.end(
           hooks,
           run,
           input.onEvent,
           "error",
           messages,
-          completedTurns,
+          completedSteps,
           usage,
           modelResult.error,
         );
       }
 
       if (modelResult.toolCalls.length === 0) {
-        await emitTurnEnd(input.onEvent, turn, "completed", modelResult.assistantText);
+        const decision = decideAfterStep(
+          {
+            type: "model_completed",
+            pendingSteering: hasPendingSteering(run),
+          },
+          attemptStep < maxSteps,
+        );
+        if (decision.type === "continue_with_steering") {
+          emitTransition(run, decision);
+          await emitStepEnd(
+            input.onEvent,
+            modelResult.stepContext.step,
+            "steering",
+            modelResult.assistantText,
+          );
+          continue;
+        }
+        await emitStepEnd(
+          input.onEvent,
+          modelResult.stepContext.step,
+          "completed",
+          modelResult.assistantText,
+        );
+        if (attemptStep < maxSteps && hasPendingSteering(run)) {
+          emitTransition(run, { type: "continue_with_steering" });
+          continue;
+        }
         return this.end(
           hooks,
           run,
           input.onEvent,
           "completed",
           messages,
-          completedTurns,
+          completedSteps,
           usage,
         );
       }
 
       const calls = modelResult.toolCalls.map((call) =>
-        this.toExecutableToolCall(input, call));
-      const results = await this.executeToolCalls(
-        hooks,
+        this.toExecutableToolCall(modelResult.stepContext, call));
+      const results = await toolScheduler.schedule({
         run,
         calls,
-        turn,
-        input.onEvent,
-        signal,
-      );
+        stepContext: modelResult.stepContext,
+        ...(input.onEvent === undefined ? {} : { onEvent: input.onEvent }),
+        ...(signal === undefined ? {} : { signal }),
+      });
       const toolMessages = results.map(toolResultMessage);
       messages = [...messages, ...toolMessages];
       for (const message of toolMessages) {
         await emit(input.onEvent, {
           type: "message_completed",
-          turn,
+          step: modelResult.stepContext.step,
           message,
         });
       }
 
       if (isSignalAborted(signal)) {
-        await emitTurnEnd(input.onEvent, turn, "aborted", modelResult.assistantText);
+        await emitStepEnd(
+          input.onEvent,
+          modelResult.stepContext.step,
+          "aborted",
+          modelResult.assistantText,
+        );
         return this.end(
           hooks,
           run,
           input.onEvent,
           "aborted",
           messages,
-          completedTurns,
+          completedSteps,
           usage,
           abortedError(),
         );
       }
 
-      await emitTurnEnd(input.onEvent, turn, "tool_calls", modelResult.assistantText);
+      if (attemptStep < maxSteps) {
+        const decision = decideAfterStep(
+          {
+            type: "tool_batch_completed",
+            pendingSteering: hasPendingSteering(run),
+          },
+          true,
+        );
+        if (decision.type === "continue_step") {
+          emitTransition(run, {
+            ...decision,
+            step: modelResult.stepContext.step,
+          });
+        } else if (decision.type === "continue_with_steering") {
+          emitTransition(run, decision);
+        }
+      }
+      await emitStepEnd(
+        input.onEvent,
+        modelResult.stepContext.step,
+        "tool_calls",
+        modelResult.assistantText,
+      );
     }
 
     return this.end(
       hooks,
       run,
       input.onEvent,
-      "max_turns",
+      "max_steps",
       messages,
-      completedTurns,
+      completedSteps,
       usage,
       {
-        code: "max_turns_exceeded",
-        message: `Agent stopped after reaching maxTurns=${maxTurns}`,
+        code: "max_steps_exceeded",
+        message: `Agent stopped after reaching maxSteps=${maxSteps}`,
         retryable: false,
       },
     );
   }
 
-  private async runModelTurn(
+  private async runModelStep(
     hooks: RuntimeHookRunner,
     run: AgentRunContext,
     input: MinimalAgentLoopInput,
     messages: readonly LlmMessage[],
-    turn: number,
+    initialStepContext: AgentStepContext,
     signal: AbortSignal | undefined,
-  ): Promise<TurnModelResult> {
+  ): Promise<StepModelResult> {
     let assistantText = "";
     let reasoningContent = "";
     let model: string | undefined;
@@ -255,20 +343,26 @@ export class MinimalAgentLoop {
     const toolCalls: ModelToolCall[] = [];
     const startedAtMs = Date.now();
     const baseRequest: ModelRequest = {
-      messages,
+      messages: withStepControlMessages(messages, initialStepContext),
       tools: input.tools,
       ...optionalString("model", input.model),
       ...optionalNumber("temperature", input.temperature),
       ...optionalNumber("maxOutputTokens", input.maxOutputTokens),
     };
     let request = baseRequest;
+    let stepContext = initialStepContext;
 
     try {
       request = await hooks.beforeModelCall({
         run,
-        turn,
+        step: initialStepContext.step,
+        stepContext: initialStepContext,
         request: baseRequest,
       });
+      stepContext = withAdvertisedStepTools(
+        initialStepContext,
+        request.tools.map((tool) => tool.name),
+      );
       for await (const modelEvent of this.dependencies.model.stream(request, signal)) {
         switch (modelEvent.type) {
           case "start":
@@ -277,12 +371,17 @@ export class MinimalAgentLoop {
             break;
           case "retry":
             retryCount += 1;
+            emitTransition(run, {
+              type: "retry_model",
+              step: stepContext.step,
+              attempt: retryCount,
+            });
             break;
           case "reasoning_delta":
             reasoningContent += modelEvent.text;
             await emit(input.onEvent, {
               type: "reasoning_delta",
-              turn,
+              step: stepContext.step,
               text: modelEvent.text,
             });
             break;
@@ -290,7 +389,7 @@ export class MinimalAgentLoop {
             assistantText += modelEvent.text;
             await emit(input.onEvent, {
               type: "message_delta",
-              turn,
+              step: stepContext.step,
               text: modelEvent.text,
             });
             break;
@@ -303,7 +402,8 @@ export class MinimalAgentLoop {
             break;
           case "error": {
             const error = modelErrorToAgentLoopError(modelEvent.error);
-            const result = modelTurnResult({
+            const result = modelStepResult({
+              stepContext,
               assistantText,
               reasoningContent,
               toolCalls,
@@ -315,14 +415,15 @@ export class MinimalAgentLoop {
               startedAtMs,
               error,
             });
-            await this.afterModelCall(hooks, run, turn, request, result);
+            await this.afterModelCall(hooks, run, stepContext, request, result);
             return result;
           }
         }
       }
     } catch (error: unknown) {
       const agentError = unknownToAgentLoopError(error);
-      const result = modelTurnResult({
+      const result = modelStepResult({
+        stepContext,
         assistantText,
         reasoningContent,
         toolCalls,
@@ -334,11 +435,12 @@ export class MinimalAgentLoop {
         startedAtMs,
         error: agentError,
       });
-      await this.afterModelCall(hooks, run, turn, request, result);
+      await this.afterModelCall(hooks, run, stepContext, request, result);
       return result;
     }
 
-    const result = modelTurnResult({
+    const result = modelStepResult({
+      stepContext,
       assistantText,
       reasoningContent,
       toolCalls,
@@ -349,30 +451,31 @@ export class MinimalAgentLoop {
       retryCount,
       startedAtMs,
     });
-    await this.afterModelCall(hooks, run, turn, request, result);
+    await this.afterModelCall(hooks, run, stepContext, request, result);
     return result;
   }
 
   private async afterModelCall(
     hooks: RuntimeHookRunner,
     run: AgentRunContext,
-    turn: number,
+    stepContext: AgentStepContext,
     request: ModelRequest,
-    result: TurnModelResult,
+    result: StepModelResult,
   ): Promise<void> {
     await hooks.afterModelCall({
       run,
-      turn,
+      step: stepContext.step,
+      stepContext,
       request,
       result,
     });
   }
 
   private toExecutableToolCall(
-    input: MinimalAgentLoopInput,
+    stepContext: AgentStepContext,
     modelToolCall: ModelToolCall,
   ): ToolCall {
-    const availableToolNames = new Set(input.tools.map((tool) => tool.name));
+    const availableToolNames = new Set(stepContext.advertisedTools);
     if (
       !availableToolNames.has(modelToolCall.name) ||
       !this.dependencies.tools.listTools().includes(modelToolCall.name)
@@ -397,124 +500,20 @@ export class MinimalAgentLoop {
         };
   }
 
-  private async executeToolCalls(
-    hooks: RuntimeHookRunner,
-    run: AgentRunContext,
-    calls: readonly ToolCall[],
-    turn: number,
-    onEvent: AgentLoopEventHandler | undefined,
-    signal: AbortSignal | undefined,
-  ): Promise<readonly ToolResult[]> {
-    const results: ToolResult[] = [];
-    let pending: Promise<void>[] = [];
-    const flush = async () => {
-      await Promise.all(pending);
-      pending = [];
-    };
-
-    for (const [index, call] of calls.entries()) {
-      const execute = async () => {
-        results[index] = await this.executeToolCall(
-          hooks,
-          run,
-          call,
-          turn,
-          onEvent,
-          signal,
-        );
-      };
-      if (
-        !isInvalidToolCall(call) &&
-        this.dependencies.tools.describeTool?.(call.name)?.executionMode === "parallel"
-      ) {
-        pending.push(execute());
-        continue;
-      }
-      await flush();
-      await execute();
-    }
-    await flush();
-    return results;
-  }
-
-  private async executeToolCall(
-    hooks: RuntimeHookRunner,
-    run: AgentRunContext,
-    originalCall: ToolCall,
-    turn: number,
-    onEvent: AgentLoopEventHandler | undefined,
-    signal: AbortSignal | undefined,
-  ): Promise<ToolResult> {
-    const startedAtMs = Date.now();
-    const metadata = this.dependencies.tools.describeTool?.(originalCall.name);
-    await emit(onEvent, {
-      type: "tool_start",
-      turn,
-      call: originalCall,
-    });
-
-    let call = originalCall;
-    let result: ToolResult;
-    try {
-      const decision = await hooks.beforeToolCall({
-        run,
-        turn,
-        call,
-        ...optionalMetadata(metadata),
-        startedAtMs,
-      });
-      if (!decision.allowed) {
-        result = deniedToolResult(call, decision.reason);
-      } else {
-        call = decision.call ?? call;
-        result = isInvalidToolCall(call)
-          ? invalidToolResult(call)
-          : await safelyExecuteTool(this.dependencies.tools, call, signal);
-      }
-    } catch (error: unknown) {
-      result = {
-        ok: false,
-        callId: call.id,
-        error: toToolError(error),
-      };
-    }
-
-    const hookContext = {
-      run,
-      turn,
-      call,
-      ...optionalMetadata(metadata),
-      startedAtMs,
-      result,
-      durationMs: Date.now() - startedAtMs,
-    };
-    result = result.ok
-      ? await hooks.afterToolCall(hookContext)
-      : await hooks.onToolFailure(hookContext);
-
-    await emit(onEvent, {
-      type: "tool_end",
-      turn,
-      call,
-      result,
-    });
-    return result;
-  }
-
   private async end(
     hooks: RuntimeHookRunner,
     run: AgentRunContext,
     onEvent: AgentLoopEventHandler | undefined,
     reason: AgentEndReason,
     messages: readonly LlmMessage[],
-    turns: number,
+    steps: number,
     usage: ModelUsageAccumulator,
     error?: AgentLoopError,
   ): Promise<AgentLoopResult> {
     await hooks.onStop({
       run,
       reason,
-      turns,
+      steps,
       ...optionalAgentError(error),
     });
     await emit(onEvent, {
@@ -526,7 +525,7 @@ export class MinimalAgentLoop {
     return {
       reason,
       messages,
-      turns,
+      steps,
       ...optionalString("model", usage.model),
       ...optionalCompleteModelUsage(usage),
       ...optionalAgentError(error),
@@ -534,7 +533,8 @@ export class MinimalAgentLoop {
   }
 }
 
-function modelTurnResult(input: {
+function modelStepResult(input: {
+  readonly stepContext: AgentStepContext;
   readonly assistantText: string;
   readonly reasoningContent: string;
   readonly toolCalls: readonly ModelToolCall[];
@@ -545,8 +545,9 @@ function modelTurnResult(input: {
   readonly retryCount: number;
   readonly startedAtMs: number;
   readonly error?: AgentLoopError | undefined;
-}): TurnModelResult {
+}): StepModelResult {
   return {
+    stepContext: input.stepContext,
     assistantText: input.assistantText,
     ...optionalNonEmptyString("reasoningContent", input.reasoningContent),
     toolCalls: input.toolCalls,
@@ -574,18 +575,18 @@ function createModelUsageAccumulator(): ModelUsageAccumulator {
   };
 }
 
-function addModelTurnUsage(accumulator: ModelUsageAccumulator, turn: TurnModelResult): void {
-  accumulator.model = turn.model ?? accumulator.model;
-  if (turn.usage === undefined) {
+function addModelStepUsage(accumulator: ModelUsageAccumulator, step: StepModelResult): void {
+  accumulator.model = step.model ?? accumulator.model;
+  if (step.usage === undefined) {
     accumulator.complete = false;
     return;
   }
   accumulator.usage = {
-    inputTokens: accumulator.usage.inputTokens + turn.usage.inputTokens,
+    inputTokens: accumulator.usage.inputTokens + step.usage.inputTokens,
     cachedInputTokens:
-      accumulator.usage.cachedInputTokens + turn.usage.cachedInputTokens,
-    outputTokens: accumulator.usage.outputTokens + turn.usage.outputTokens,
-    totalTokens: accumulator.usage.totalTokens + turn.usage.totalTokens,
+      accumulator.usage.cachedInputTokens + step.usage.cachedInputTokens,
+    outputTokens: accumulator.usage.outputTokens + step.usage.outputTokens,
+    totalTokens: accumulator.usage.totalTokens + step.usage.totalTokens,
   };
 }
 
@@ -658,61 +659,6 @@ function invalidToolCall(call: UnparsedToolCall, message: string): ToolCall {
   };
 }
 
-function isInvalidToolCall(call: ToolCall): boolean {
-  return call.reason?.startsWith("invalid_tool_call:") === true;
-}
-
-function invalidToolResult(call: ToolCall): ToolResult {
-  return {
-    ok: false,
-    callId: call.id,
-    error: {
-      code: "invalid_input",
-      message: call.reason?.replace(/^invalid_tool_call:/u, "") ?? "Invalid tool call",
-      retryable: false,
-    },
-  };
-}
-
-function deniedToolResult(call: ToolCall, message: string): ToolResult {
-  return {
-    ok: false,
-    callId: call.id,
-    error: {
-      code: "permission_denied",
-      message,
-      retryable: false,
-    },
-  };
-}
-
-async function safelyExecuteTool(
-  tools: ToolExecutor,
-  call: ToolCall,
-  signal: AbortSignal | undefined,
-): Promise<ToolResult> {
-  try {
-    return await tools.executeTool(call, signal);
-  } catch (error: unknown) {
-    return {
-      ok: false,
-      callId: call.id,
-      error: toToolError(error),
-    };
-  }
-}
-
-function toToolError(error: unknown): ToolError {
-  return {
-    code: "execution_failed",
-    message:
-      error instanceof Error
-        ? error.message
-        : "Unknown tool execution error",
-    retryable: false,
-  };
-}
-
 function parseJsonObject(value: string): UnknownRecord | null {
   try {
     const parsed: unknown = JSON.parse(value);
@@ -727,11 +673,48 @@ function isRecord(value: unknown): value is UnknownRecord {
 }
 
 function isAbortError(error: unknown): boolean {
-  return error instanceof DOMException && error.name === "AbortError";
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function isSignalAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
+}
+
+function hasPendingSteering(run: AgentRunContext): boolean {
+  return (
+    agentNextStepInbox(run).hasPending(run.userTurnId) ||
+    run.state.steering.messages.length > 0
+  );
+}
+
+function withStepControlMessages(
+  messages: readonly LlmMessage[],
+  stepContext: AgentStepContext,
+): readonly LlmMessage[] {
+  if (stepContext.steeringMessages.length === 0) {
+    return messages;
+  }
+  return [
+    ...messages,
+    ...stepContext.steeringMessages.map(
+      (message): LlmMessage => ({
+        role: "user",
+        content: `Steering message received during this run:\n${message}`,
+      }),
+    ),
+  ];
+}
+
+function emitTransition(
+  run: AgentRunContext,
+  transition: Parameters<NonNullable<AgentRunContext["onTransition"]>>[0],
+): void {
+  try {
+    const observation = run.onTransition?.(transition);
+    void Promise.resolve(observation).catch(() => undefined);
+  } catch {
+    // Transition observers are diagnostic and must not change run behavior.
+  }
 }
 
 function unknownToAgentLoopError(error: unknown): AgentLoopError {
@@ -753,13 +736,13 @@ function abortedError(): AgentLoopError {
   };
 }
 
-async function emitTurnEnd(
+async function emitStepEnd(
   handler: AgentLoopEventHandler | undefined,
-  turn: number,
-  reason: "completed" | "tool_calls" | "aborted" | "error",
+  step: number,
+  reason: "completed" | "tool_calls" | "steering" | "aborted" | "error",
   assistantText: string,
 ): Promise<void> {
-  await emit(handler, { type: "turn_end", turn, reason, assistantText });
+  await emit(handler, { type: "step_end", step, reason, assistantText });
 }
 
 async function emit(
@@ -767,6 +750,20 @@ async function emit(
   event: AgentLoopEvent,
 ): Promise<void> {
   await handler?.(event);
+}
+
+function positiveInteger(
+  value: number | undefined,
+  fallback: number,
+  name: string,
+): number {
+  if (value === undefined) {
+    return fallback;
+  }
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
 }
 
 function optionalNumber<Key extends string>(
@@ -812,10 +809,4 @@ function optionalAgentError(
   error: AgentLoopError | undefined,
 ): { readonly error: AgentLoopError } | object {
   return error === undefined ? {} : { error };
-}
-
-function optionalMetadata(
-  metadata: ReturnType<NonNullable<ToolExecutor["describeTool"]>>,
-): { readonly metadata: NonNullable<typeof metadata> } | object {
-  return metadata === undefined ? {} : { metadata };
 }

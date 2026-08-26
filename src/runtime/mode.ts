@@ -34,7 +34,12 @@ export interface PlanModeApprovalRequester {
 }
 
 export interface AgentRuntimeState {
+  version: number;
   mode: AgentMode;
+  readonly modeTransitions: Array<{
+    readonly version: number;
+    readonly mode: AgentMode;
+  }>;
   readonly plan: {
     enteredAt?: string;
     updatedAt?: string;
@@ -57,6 +62,7 @@ export interface AgentRuntimeState {
 }
 
 export interface AgentRuntimeStateSnapshot {
+  readonly version?: number;
   readonly mode: AgentMode;
   readonly plan?: {
     readonly enteredAt?: string;
@@ -91,6 +97,7 @@ export function createAgentRuntimeStateFromSnapshot(
       ? {}
       : { planPath: snapshot.plan.planPath }),
   });
+  state.version = snapshot.version ?? 0;
   copyOptionalString(snapshot.plan?.enteredAt, (value) => {
     state.plan.enteredAt = value;
   });
@@ -119,6 +126,7 @@ export function snapshotAgentRuntimeState(
   state: AgentRuntimeState,
 ): AgentRuntimeStateSnapshot {
   return {
+    version: state.version,
     mode: state.mode,
     plan: {
       planPath: state.plan.planPath,
@@ -153,7 +161,9 @@ export function createAgentRuntimeState(
   options: CreateAgentRuntimeStateOptions = {},
 ): AgentRuntimeState {
   return {
+    version: 0,
     mode: options.mode ?? "execute",
+    modeTransitions: [],
     plan: {
       planPath: options.planPath ?? "PLAN.md",
       ...(options.planApproval === undefined
@@ -195,12 +205,13 @@ export function configureAgentRuntimeState(
 }
 
 export function enterPlanMode(state: AgentRuntimeState): void {
-  state.mode = "plan";
+  setAgentRuntimeMode(state, "plan");
   state.plan.enteredAt = new Date().toISOString();
   delete state.plan.approvedAt;
 }
 
 export function markPlanUpdated(state: AgentRuntimeState): void {
+  bumpAgentRuntimeStateVersion(state);
   state.plan.updatedAt = new Date().toISOString();
   delete state.plan.approvedAt;
 }
@@ -209,7 +220,7 @@ export function exitPlanMode(
   state: AgentRuntimeState,
   summary: string | undefined,
 ): void {
-  state.mode = "execute";
+  setAgentRuntimeMode(state, "execute");
   state.plan.approvedAt = new Date().toISOString();
   if (summary === undefined) {
     delete state.plan.approvalSummary;
@@ -222,7 +233,7 @@ export function enterCoordinatorMode(
   state: AgentRuntimeState,
   goal: string | undefined,
 ): void {
-  state.mode = "coordinator";
+  setAgentRuntimeMode(state, "coordinator");
   state.coordinator.enteredAt = new Date().toISOString();
   delete state.coordinator.exitedAt;
   if (goal === undefined || goal.trim().length === 0) {
@@ -233,7 +244,7 @@ export function enterCoordinatorMode(
 }
 
 export function exitCoordinatorMode(state: AgentRuntimeState): void {
-  state.mode = "execute";
+  setAgentRuntimeMode(state, "execute");
   state.coordinator.exitedAt = new Date().toISOString();
 }
 
@@ -241,7 +252,24 @@ export function addSteeringMessage(
   state: AgentRuntimeState,
   message: string,
 ): void {
+  bumpAgentRuntimeStateVersion(state);
   state.steering.messages.push(message);
+}
+
+export function bumpAgentRuntimeStateVersion(state: AgentRuntimeState): void {
+  state.version += 1;
+}
+
+export function setAgentRuntimeMode(
+  state: AgentRuntimeState,
+  mode: AgentMode,
+): void {
+  bumpAgentRuntimeStateVersion(state);
+  state.mode = mode;
+  state.modeTransitions.push({
+    version: state.version,
+    mode,
+  });
 }
 
 export function isPlanControlTool(name: string): boolean {
@@ -288,8 +316,8 @@ export class RuntimeModeHook implements RuntimeHook {
   constructor(private readonly options: RuntimeModeHookOptions) {}
 
   beforeModelCall(context: RuntimeModelCallHookContext) {
-    const request = withRuntimeMessages(context.request, this.options.state);
-    if (this.options.state.mode === "execute") {
+    const request = withRuntimeMessages(context.request, context.stepContext);
+    if (context.stepContext.mode === "execute") {
       return request;
     }
 
@@ -297,7 +325,7 @@ export class RuntimeModeHook implements RuntimeHook {
       ...request,
       tools: request.tools.filter((tool) =>
         isToolAllowedInMode(
-          this.options.state.mode,
+          context.stepContext.mode,
           tool.name,
           this.options.describeTool?.(tool.name),
         )),
@@ -307,7 +335,29 @@ export class RuntimeModeHook implements RuntimeHook {
   beforeToolCall(context: {
     readonly call: ToolCall;
     readonly metadata?: ToolMetadata;
+    readonly stepContext: RuntimeModelCallHookContext["stepContext"];
   }) {
+    if (!context.stepContext.advertisedTools.includes(context.call.name)) {
+      return {
+        allowed: false as const,
+        reason: `Tool ${context.call.name} was not advertised for step ${context.stepContext.stepId}`,
+      };
+    }
+    const tightening = this.options.state.modeTransitions.find(
+      (transition) =>
+        transition.version > context.stepContext.stateVersion &&
+        !isToolAllowedInMode(
+          transition.mode,
+          context.call.name,
+          context.metadata,
+        ),
+    );
+    if (tightening !== undefined) {
+      return {
+        allowed: false as const,
+        reason: modeDeniedReason(tightening.mode, context.call.name),
+      };
+    }
     if (
       isToolAllowedInMode(
         this.options.state.mode,
@@ -437,41 +487,34 @@ const TASK_CONTROL_TOOL_NAMES = new Set([
 
 function withRuntimeMessages(
   request: RuntimeModelCallHookContext["request"],
-  state: AgentRuntimeState,
+  stepContext: RuntimeModelCallHookContext["stepContext"],
 ): RuntimeModelCallHookContext["request"] {
   const modeMessage: LlmMessage = {
     role: "system",
-    content: renderRuntimeModeMessage(state),
+    content: renderRuntimeModeMessage(
+      stepContext.mode,
+      stepContext.coordinatorGoal,
+    ),
   };
-  const steeringMessages = drainSteeringMessages(state).map(
-    (message): LlmMessage => ({
-      role: "user",
-      content: `Steering message received during this run:\n${message}`,
-    }),
-  );
   const [first, ...rest] = request.messages;
   if (first?.role === "system") {
     return {
       ...request,
-      messages: [first, modeMessage, ...rest, ...steeringMessages],
+      messages: [first, modeMessage, ...rest],
     };
   }
 
   return {
     ...request,
-    messages: [modeMessage, ...request.messages, ...steeringMessages],
+    messages: [modeMessage, ...request.messages],
   };
 }
 
-function drainSteeringMessages(state: AgentRuntimeState): readonly string[] {
-  if (state.steering.messages.length === 0) {
-    return [];
-  }
-  return state.steering.messages.splice(0, state.steering.messages.length);
-}
-
-function renderRuntimeModeMessage(state: AgentRuntimeState): string {
-  if (state.mode === "plan") {
+function renderRuntimeModeMessage(
+  mode: AgentMode,
+  coordinatorGoal: string | undefined,
+): string {
+  if (mode === "plan") {
     return [
       "Runtime mode: plan.",
       "Use only read-only exploration tools plus update_plan/tasks_update/task_update.",
@@ -479,15 +522,15 @@ function renderRuntimeModeMessage(state: AgentRuntimeState): string {
     ].join(" ");
   }
 
-  if (state.mode === "coordinator") {
+  if (mode === "coordinator") {
     return [
       "Runtime mode: coordinator.",
       "Act as a coordinator: decompose work, spawn focused read-only child agents, observe tmux panes, collect structured results, and summarize.",
       "Do not directly edit files or run shell commands in the main agent while coordinating; use child-agent control tools plus read-only inspection and task control tools.",
       "Collect terminal child agents before retrying; failed, stopped, or timed-out children should be summarized or replaced deliberately instead of polled repeatedly.",
-      ...(state.coordinator.goal === undefined
+      ...(coordinatorGoal === undefined
         ? []
-        : [`Coordinator goal: ${state.coordinator.goal}`]),
+        : [`Coordinator goal: ${coordinatorGoal}`]),
     ].join(" ");
   }
 

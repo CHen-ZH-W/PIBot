@@ -235,7 +235,7 @@ function createRunner(fixture, model, slack) {
       }),
     sessions: new WorkspaceSessionStore({ store: fixture.store }),
     tools: getCodingToolSchemas(),
-    maxTurns: 4,
+    maxSteps: 4,
     repoWorkflow: new ChannelRepoWorkflow({
       workspaceRoot: fixture.workspaceRoot,
       store: fixture.store,

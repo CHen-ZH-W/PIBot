@@ -81,7 +81,10 @@ export class TraceRuntimeHook implements RuntimeHook {
   async beforeModelCall(context: RuntimeModelCallHookContext): Promise<void> {
     await this.record(withRun(context.run, {
       type: "model.started",
-      turn: context.turn,
+      step: context.step,
+      stepId: context.stepContext.stepId,
+      userTurnId: context.stepContext.userTurnId,
+      stateVersion: context.stepContext.stateVersion,
       messageCount: context.request.messages.length,
       toolCount: context.request.tools.length,
       requestedModel: context.request.model,
@@ -98,7 +101,8 @@ export class TraceRuntimeHook implements RuntimeHook {
       type: context.result.error === undefined
         ? "model.completed"
         : "model.failed",
-      turn: context.turn,
+      step: context.step,
+      stepId: context.stepContext.stepId,
       provider: context.result.provider,
       model: context.result.model,
       finishReason: context.result.finishReason,
@@ -113,7 +117,8 @@ export class TraceRuntimeHook implements RuntimeHook {
   async beforeToolCall(context: RuntimeToolCallHookContext): Promise<void> {
     await this.record(withRun(context.run, {
       type: "tool.started",
-      turn: context.turn,
+      step: context.step,
+      stepId: context.stepContext.stepId,
       toolCallId: context.call.id,
       tool: context.call.name,
       args: sanitizeTraceValue(context.call.input),
@@ -134,7 +139,7 @@ export class TraceRuntimeHook implements RuntimeHook {
     await this.record(withRun(context.run, {
       type: "agent.stopped",
       reason: context.reason,
-      turns: context.turns,
+      steps: context.steps,
       error: context.error,
     }));
   }
@@ -145,7 +150,8 @@ export class TraceRuntimeHook implements RuntimeHook {
   ): Promise<void> {
     await this.record(withRun(context.run, {
       type,
-      turn: context.turn,
+      step: context.step,
+      stepId: context.stepContext.stepId,
       toolCallId: context.call.id,
       tool: context.call.name,
       durationMs: context.durationMs,
@@ -190,6 +196,7 @@ export function withRun(
   return {
     ...event,
     runId: run.runId,
+    userTurnId: run.userTurnId,
     ...(run.parentRunId === undefined ? {} : { parentRunId: run.parentRunId }),
     agentId: run.agentId,
   };

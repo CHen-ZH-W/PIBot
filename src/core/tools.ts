@@ -417,6 +417,7 @@ export interface ToolError {
     | "permission_denied"
     | "invalid_input"
     | "timeout"
+    | "aborted"
     | "conflict"
     | "execution_failed";
   readonly message: string;

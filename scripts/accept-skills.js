@@ -316,7 +316,7 @@ async function acceptsIndexedSkillRead() {
     tools: getCodingToolSchemas(),
     disabledSkills: ["disabled-skill"],
     pibotSkillsRoot,
-    maxTurns: 3,
+    maxSteps: 3,
   });
 
   await runner.handleSlackMessage(slackEvent("Check whether this release is ready"));
@@ -391,7 +391,7 @@ async function acceptsPromptGuidedSkillCreation() {
     sessions,
     tools: getCodingToolSchemas(),
     pibotSkillsRoot,
-    maxTurns: 3,
+    maxSteps: 3,
   });
 
   await runner.handleSlackMessage(slackEvent("Create a reusable focused-test skill"));

@@ -155,7 +155,7 @@ async function acceptsPlanModeApproval() {
     systemPrompt: "Use Plan Mode for complex changes.",
     history: [],
     tools: getCodingToolSchemas(),
-    maxTurns: 5,
+    maxSteps: 5,
     runContext: { runId: "run-plan", agentId: "agent-plan", state: runtime },
   });
 
@@ -241,7 +241,7 @@ async function acceptsSlackPlanApprovalResumesOutput() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 6,
+    maxSteps: 6,
     updateThrottleMs: 0,
     updateMinChars: 0,
   });
@@ -374,7 +374,7 @@ async function acceptsSlackPlanModePersistsAcrossMessages() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 6,
+    maxSteps: 6,
     updateThrottleMs: 0,
     updateMinChars: 0,
   });
@@ -396,6 +396,7 @@ async function acceptsSlackPlanModePersistsAcrossMessages() {
     await readFile(join(channelDir, "runtime-state.json"), "utf8"),
   );
   assert.equal(persistedPlanState.state.mode, "plan");
+  assert.equal(persistedPlanState.state.version > 0, true);
   await rm(join(channelDir, "runtime-state.json"), { force: true });
 
   const secondRun = runner.handleSlackMessage(slackEvent("No changes needed"));
@@ -414,6 +415,7 @@ async function acceptsSlackPlanModePersistsAcrossMessages() {
     await readFile(join(channelDir, "runtime-state.json"), "utf8"),
   );
   assert.equal(persistedExecuteState.state.mode, "execute");
+  assert.equal(persistedExecuteState.state.version > 0, true);
   assert.equal(
     slack.events.some(
       (event) =>
@@ -517,11 +519,11 @@ async function acceptsReflectionFixBudget() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 2,
+    maxSteps: 2,
     reflection: {
       enabled: true,
       maxFixAttempts: 2,
-      maxTurns: 2,
+      maxSteps: 2,
       verifyCommands: ["npm test"],
     },
   });
@@ -609,7 +611,7 @@ async function acceptsCoordinatorModeToolPolicy() {
     systemPrompt: "Use Coordinator Mode for multi-agent work.",
     history: [],
     tools: getCodingToolSchemas(),
-    maxTurns: 5,
+    maxSteps: 5,
     runContext: {
       runId: "run-coordinator",
       agentId: "agent-coordinator",
@@ -660,7 +662,7 @@ async function acceptsSlackCoordinatorModeRequest() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 1,
+    maxSteps: 1,
   });
 
   await runner.handleSlackMessage(
@@ -672,6 +674,7 @@ async function acceptsSlackCoordinatorModeRequest() {
 
 async function acceptsFollowUpQueue() {
   const workspaceRoot = await createWorkspace("pibot-workflows-followup-");
+  const traces = [];
   let releaseFirst;
   const firstStarted = new Promise((resolve) => {
     releaseFirst = resolve;
@@ -719,7 +722,12 @@ async function acceptsFollowUpQueue() {
     resolveChannelWorkspaceRoot: async () => workspaceRoot,
     sessions,
     tools: getCodingToolSchemas(),
-    maxTurns: 2,
+    maxSteps: 2,
+    traceRecorder: {
+      async record(event) {
+        traces.push(event);
+      },
+    },
   });
 
   const firstRun = runner.handleSlackMessage(slackEvent("first request"));
@@ -729,6 +737,12 @@ async function acceptsFollowUpQueue() {
   await firstRun;
 
   assert.equal(requests.length, 2);
+  const userTurns = traces.filter((event) => event.type === "user_turn.started");
+  assert.equal(traces.filter((event) => event.type === "run.started").length, 1);
+  assert.equal(traces.filter((event) => event.type === "run.completed").length, 1);
+  assert.equal(userTurns.length, 2);
+  assert.equal(new Set(userTurns.map((event) => event.runId)).size, 1);
+  assert.equal(new Set(userTurns.map((event) => event.userTurnId)).size, 2);
   assert.equal(
     slack.events.some(
       (event) =>

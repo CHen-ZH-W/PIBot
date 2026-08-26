@@ -2,8 +2,13 @@ import type { LlmMessage } from "../core/agent";
 import type { ToolCall, ToolResult } from "../core/tools";
 import type { ModelError } from "./model";
 
-export type AgentEndReason = "completed" | "max_turns" | "aborted" | "error";
-export type TurnEndReason = "completed" | "tool_calls" | "aborted" | "error";
+export type AgentEndReason = "completed" | "max_steps" | "aborted" | "error";
+export type StepEndReason =
+  | "completed"
+  | "tool_calls"
+  | "steering"
+  | "aborted"
+  | "error";
 
 export interface AgentLoopError {
   readonly code:
@@ -12,7 +17,7 @@ export interface AgentLoopError {
     | "invalid_tool_arguments"
     | "tool_execution_failed"
     | "context_overflow"
-    | "max_turns_exceeded"
+    | "max_steps_exceeded"
     | "aborted"
     | "unknown";
   readonly message: string;
@@ -22,42 +27,42 @@ export interface AgentLoopError {
 export type AgentLoopEvent =
   | {
       readonly type: "agent_start";
-      readonly maxTurns: number;
+      readonly maxSteps: number;
     }
   | {
-      readonly type: "turn_start";
-      readonly turn: number;
+      readonly type: "step_start";
+      readonly step: number;
     }
   | {
       readonly type: "message_delta";
-      readonly turn: number;
+      readonly step: number;
       readonly text: string;
     }
   | {
       readonly type: "reasoning_delta";
-      readonly turn: number;
+      readonly step: number;
       readonly text: string;
     }
   | {
       readonly type: "message_completed";
-      readonly turn: number;
+      readonly step: number;
       readonly message: LlmMessage;
     }
   | {
       readonly type: "tool_start";
-      readonly turn: number;
+      readonly step: number;
       readonly call: ToolCall;
     }
   | {
       readonly type: "tool_end";
-      readonly turn: number;
+      readonly step: number;
       readonly call: ToolCall;
       readonly result: ToolResult;
     }
   | {
-      readonly type: "turn_end";
-      readonly turn: number;
-      readonly reason: TurnEndReason;
+      readonly type: "step_end";
+      readonly step: number;
+      readonly reason: StepEndReason;
       readonly assistantText: string;
     }
   | {

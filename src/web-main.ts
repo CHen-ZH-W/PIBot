@@ -200,7 +200,12 @@ async function main(): Promise<void> {
       },
       evolution,
       workflows,
-      maxTurns: readPositiveIntegerEnv("AGENT_MAX_TURNS") ?? 80,
+      maxSteps:
+        readPositiveIntegerEnv("AGENT_MAX_STEPS") ??
+        readPositiveIntegerEnv("AGENT_MAX_TURNS") ??
+        80,
+      maxParallelToolCalls:
+        readPositiveIntegerEnv("AGENT_MAX_PARALLEL_TOOL_CALLS") ?? 8,
       disabledSkills: readCsvEnv("SKILLS_DISABLED"),
       maxSkills: readPositiveIntegerEnv("SKILLS_MAX_COUNT") ?? 100,
       maxSkillFileBytes:
