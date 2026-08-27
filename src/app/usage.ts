@@ -26,6 +26,11 @@ export interface UsageTokenCounts {
 
 export interface CalculatedUsage extends UsageTokenCounts {
   readonly uncachedInputTokens: number;
+  readonly cacheHitRatio: number;
+  readonly uncachedInputCost: number;
+  readonly cachedInputCost: number;
+  readonly outputCost: number;
+  readonly cacheSavings: number;
   readonly cost: number;
   readonly currency: UsageCurrency;
 }
@@ -43,10 +48,12 @@ export interface UsageRecord {
   readonly inputTokens: number;
   readonly cachedInputTokens: number;
   readonly uncachedInputTokens: number;
+  readonly cacheHitRatio: number;
   readonly outputTokens: number;
   readonly totalTokens: number;
   readonly pricingStrategy: string;
   readonly cost: number;
+  readonly cacheSavings: number;
   readonly currency: UsageCurrency;
   readonly estimated: boolean;
 }
@@ -80,6 +87,7 @@ export class NoopUsageRecorder implements UsageRecorder {
 
 export function estimateRunUsage(input: {
   readonly systemPrompt: string;
+  readonly dynamicContext?: string;
   readonly history: readonly LlmMessage[];
   readonly userText: string;
   readonly generatedMessages: readonly LlmMessage[];
@@ -88,6 +96,7 @@ export function estimateRunUsage(input: {
   const inputTokens = estimateTokenCount(
     [
       input.systemPrompt,
+      input.dynamicContext ?? "",
       input.userText,
       ...input.history.map((message) => message.content),
     ].join("\n"),
@@ -124,13 +133,30 @@ export function calculateUsage(
       cachedInputTokens * pricing.cachedInputCostPerMillionTokens +
       outputTokens * pricing.outputCostPerMillionTokens) /
     1_000_000;
+  const uncachedInputCost =
+    uncachedInputTokens * pricing.inputCostPerMillionTokens / 1_000_000;
+  const cachedInputCost =
+    cachedInputTokens * pricing.cachedInputCostPerMillionTokens / 1_000_000;
+  const outputCost =
+    outputTokens * pricing.outputCostPerMillionTokens / 1_000_000;
+  const cacheSavings =
+    cachedInputTokens * Math.max(
+      0,
+      pricing.inputCostPerMillionTokens -
+        pricing.cachedInputCostPerMillionTokens,
+    ) / 1_000_000;
 
   return {
     inputTokens,
     cachedInputTokens,
     uncachedInputTokens,
+    cacheHitRatio: inputTokens === 0 ? 0 : cachedInputTokens / inputTokens,
     outputTokens,
     totalTokens,
+    uncachedInputCost,
+    cachedInputCost,
+    outputCost,
+    cacheSavings,
     cost,
     currency: pricing.currency,
   };
@@ -163,6 +189,41 @@ export function defaultUsagePricingForModel(
   };
 }
 
+export function usagePricingFromEnv(
+  defaults: UsagePricing,
+  env: NodeJS.ProcessEnv = process.env,
+): UsagePricing {
+  const currency = readUsageCurrency(env.USAGE_COST_CURRENCY);
+  const inputCost = readNonNegativeNumber(
+    "USAGE_INPUT_COST_PER_1M_TOKENS",
+    env.USAGE_INPUT_COST_PER_1M_TOKENS,
+  );
+  const cachedInputCost = readNonNegativeNumber(
+    "USAGE_CACHED_INPUT_COST_PER_1M_TOKENS",
+    env.USAGE_CACHED_INPUT_COST_PER_1M_TOKENS,
+  );
+  const outputCost = readNonNegativeNumber(
+    "USAGE_OUTPUT_COST_PER_1M_TOKENS",
+    env.USAGE_OUTPUT_COST_PER_1M_TOKENS,
+  );
+  const overridden =
+    currency !== undefined ||
+    inputCost !== undefined ||
+    cachedInputCost !== undefined ||
+    outputCost !== undefined;
+
+  return {
+    strategy: overridden ? `${defaults.strategy}+env` : defaults.strategy,
+    currency: currency ?? defaults.currency,
+    inputCostPerMillionTokens:
+      inputCost ?? defaults.inputCostPerMillionTokens,
+    cachedInputCostPerMillionTokens:
+      cachedInputCost ?? defaults.cachedInputCostPerMillionTokens,
+    outputCostPerMillionTokens:
+      outputCost ?? defaults.outputCostPerMillionTokens,
+  };
+}
+
 export function estimateTokenCount(text: string): number {
   if (text.length === 0) {
     return 0;
@@ -179,6 +240,31 @@ function zeroUsdPricing(): UsagePricing {
     cachedInputCostPerMillionTokens: 0,
     outputCostPerMillionTokens: 0,
   };
+}
+
+function readUsageCurrency(value: string | undefined): UsageCurrency | undefined {
+  const normalized = value?.trim().toUpperCase();
+  if (normalized === undefined || normalized.length === 0) {
+    return undefined;
+  }
+  if (normalized === "CNY" || normalized === "USD") {
+    return normalized;
+  }
+  throw new Error("USAGE_COST_CURRENCY must be one of: CNY, USD");
+}
+
+function readNonNegativeNumber(
+  name: string,
+  value: string | undefined,
+): number | undefined {
+  if (value === undefined || value.trim().length === 0) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative number`);
+  }
+  return parsed;
 }
 
 function nonNegative(value: number): number {

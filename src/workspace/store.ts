@@ -51,6 +51,7 @@ export type WorkspaceStoreWarningCode =
   | "invalid_log_record"
   | "invalid_context_record"
   | "compaction_failed"
+  | "tool_result_archive_failed"
   | "memory_curation_failed";
 
 /**

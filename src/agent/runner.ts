@@ -62,6 +62,7 @@ import type {
   SessionCompactionResult,
   SessionCompactionStart,
 } from "../workspace/compaction";
+import type { MicrocompactResult } from "../workspace/microcompact";
 import {
   scanWorkspaceSkills,
   type WorkspaceSkill,
@@ -70,7 +71,7 @@ import type { AgentLoopResult, MinimalAgentLoop } from "./agent-loop";
 import type { AgentLoopEvent } from "./events";
 import type { ModelRequest, ModelUsage } from "./model";
 import {
-  buildCodingAgentSystemPrompt,
+  buildCodingAgentPromptParts,
   formatChannelWorkspacePrompt,
 } from "./system-prompt";
 import type { AgentRunContext } from "../runtime/context";
@@ -96,6 +97,7 @@ import {
   renderModeSwitchSteering,
 } from "../runtime/run-control";
 import type { RuntimeHook } from "../runtime/hooks";
+import { WorkingSetHook } from "../runtime/working-set";
 import {
   AgentRunController,
 } from "../runtime/run-controller";
@@ -510,7 +512,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         runWorkspaceRoot,
       );
       const agentSelfInstructions = await this.loadAgentSelfInstructions(active);
-      let systemPrompt = buildCodingAgentSystemPrompt({
+      let promptParts = buildCodingAgentPromptParts({
         tools: this.options.tools,
         memories: preparedRun.memories,
         workspaceSkills,
@@ -529,8 +531,11 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
           ? {}
           : { thinkingLanguage: this.options.thinkingLanguage }),
       });
+      let systemPrompt = promptParts.stableSystemPrompt;
+      let dynamicContext = promptParts.dynamicContext;
       usageInput = {
         systemPrompt,
+        ...(dynamicContext === undefined ? {} : { dynamicContext }),
         history: preparedRun.history,
         userText: event.text,
       };
@@ -551,15 +556,25 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         renderState,
         getPersistence: () => persistence,
       });
+      const workingSetHook = runWorkspaceRoot === undefined
+        ? undefined
+        : new WorkingSetHook({ workspaceRoot: runWorkspaceRoot });
+      const toolResultArchiveHook =
+        this.options.sessions.createToolResultArchiveHook(preparedRun.key);
       const result = await active.control.run({
         execute: () => agentLoop.run(
           {
             userText: event.text,
             userContentParts: input.userContentParts,
             systemPrompt,
+            ...(dynamicContext === undefined ? {} : { dynamicContext }),
             history: preparedRun.history,
             tools: this.options.tools,
-            hooks: [realtimeCompactionHook],
+            postHooks: [
+              realtimeCompactionHook,
+              ...(workingSetHook === undefined ? [] : [workingSetHook]),
+              toolResultArchiveHook,
+            ],
             maxSteps: this.options.maxSteps,
             ...(this.options.maxParallelToolCalls === undefined
               ? {}
@@ -636,7 +651,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
                 renderState,
                 preparedRun.compaction,
               );
-              systemPrompt = buildCodingAgentSystemPrompt({
+              promptParts = buildCodingAgentPromptParts({
                 tools: this.options.tools,
                 memories: preparedRun.memories,
                 workspaceSkills,
@@ -655,8 +670,11 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
                   ? {}
                   : { thinkingLanguage: this.options.thinkingLanguage }),
               });
+              systemPrompt = promptParts.stableSystemPrompt;
+              dynamicContext = promptParts.dynamicContext;
               usageInput = {
                 systemPrompt,
+                ...(dynamicContext === undefined ? {} : { dynamicContext }),
                 history: preparedRun.history,
                 userText: event.text,
               };
@@ -671,6 +689,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
               persistence,
               initialResult,
               systemPrompt,
+              ...(dynamicContext === undefined ? {} : { dynamicContext }),
               userText: event.text,
               signal: active.control.signal,
             }),
@@ -816,6 +835,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     readonly persistence: RunPersistenceState;
     readonly initialResult: AgentLoopResult;
     readonly systemPrompt: string;
+    readonly dynamicContext?: string;
     readonly userText: string;
     readonly signal: AbortSignal;
   }): Promise<AgentLoopResult> {
@@ -860,6 +880,9 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
             verifyCommands: options.verifyCommands ?? [],
           }),
           systemPrompt: input.systemPrompt,
+          ...(input.dynamicContext === undefined
+            ? {}
+            : { dynamicContext: input.dynamicContext }),
           history,
           tools: this.options.tools,
           maxSteps,
@@ -1188,6 +1211,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
           input.event,
           currentUserMessage,
           {
+            modelRequest: context.request,
             signal: input.active.control.signal,
             onCompactionStart: async (compaction) => {
               await this.renderCompactionStartStatus(
@@ -1198,8 +1222,15 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
             },
           },
         );
+        await this.recordMicrocompactionTrace(
+          input.active,
+          refreshed.microcompaction,
+        );
         if (refreshed.compaction?.triggered !== true) {
-          return context.request;
+          return this.options.sessions.replaceModelHistoryMessages(
+            context.request,
+            refreshed.messages,
+          );
         }
 
         await this.recordCompactionTrace(input.active, refreshed.compaction);
@@ -1208,7 +1239,16 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
           input.renderState,
           refreshed.compaction,
         );
-        return requestWithSessionMessages(context.request, refreshed.messages);
+        return this.options.sessions.replaceModelHistoryMessages(
+          context.request,
+          refreshed.messages,
+        );
+      },
+      afterModelCall: (context) => {
+        this.options.sessions.observePromptCacheUsage(
+          input.getPersistence().prepared.key,
+          context.result.usage,
+        );
       },
     };
   }
@@ -1384,6 +1424,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     usageInput:
       | {
           readonly systemPrompt: string;
+          readonly dynamicContext?: string;
           readonly history: readonly LlmMessage[];
           readonly userText: string;
         }
@@ -1424,10 +1465,12 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         inputTokens: usage.inputTokens,
         cachedInputTokens: usage.cachedInputTokens,
         uncachedInputTokens: usage.uncachedInputTokens,
+        cacheHitRatio: usage.cacheHitRatio,
         outputTokens: usage.outputTokens,
         totalTokens: usage.totalTokens,
         pricingStrategy: this.usagePricing.strategy,
         cost: usage.cost,
+        cacheSavings: usage.cacheSavings,
         currency: usage.currency,
         estimated: providerUsage === undefined,
       });
@@ -1510,8 +1553,16 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     await this.recordTrace(active, {
       type: "session.compacted",
       reason: result.reason,
+      promptCacheEpochBoundary: true,
       summaryStrategy: result.summaryStrategy,
+      summaryHierarchy: result.summaryHierarchy,
       estimatedTokensBefore: result.estimatedTokensBefore,
+      estimatedHistoryTokensBefore: result.estimatedHistoryTokensBefore,
+      additionalInputTokens: result.additionalInputTokens,
+      protectedUserIntentTokensBefore:
+        result.protectedUserIntentTokensBefore,
+      protectedUserIntentTokensAfter:
+        result.protectedUserIntentTokensAfter,
       estimatedTokensAfter: result.estimatedTokensAfter,
       compactionTriggerTokens: result.compactionTriggerTokens,
       keepRecentTokens: result.keepRecentTokens,
@@ -1520,6 +1571,33 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
       coveredThroughLineNumber: result.coveredThroughLineNumber,
       summaryUsage: result.summaryUsage,
       fallbackReason: result.fallbackReason,
+    });
+  }
+
+  private async recordMicrocompactionTrace(
+    active: ActiveRun,
+    result: MicrocompactResult | undefined,
+  ): Promise<void> {
+    if (result?.triggered !== true) {
+      return;
+    }
+    await this.recordTrace(active, {
+      type: "session.microcompacted",
+      reason: result.reason,
+      pressure: result.pressure,
+      cacheState: result.cacheState,
+      cacheEpoch: result.cacheEpoch,
+      cacheAgeMs: result.cacheAgeMs,
+      recentCacheHitRatio: result.recentCacheHitRatio,
+      estimatedTokensBefore: result.estimatedTokensBefore,
+      estimatedTokensAfter: result.estimatedTokensAfter,
+      estimatedHistoryTokensBefore: result.estimatedHistoryTokensBefore,
+      estimatedHistoryTokensAfter: result.estimatedHistoryTokensAfter,
+      reclaimedTokens: result.reclaimedTokens,
+      protectedPrefixTokens: result.protectedPrefixTokens,
+      estimatedInvalidatedSuffixTokens:
+        result.estimatedInvalidatedSuffixTokens,
+      compactedItems: result.compactedItems,
     });
   }
 }
@@ -1627,7 +1705,7 @@ function formatCompactionStartStatus(event: SessionCompactionStart): string {
     event.reason === "context_overflow"
       ? "Compacting context after overflow"
       : "Compacting context now";
-  return `_${reason}: ${formatTokenCount(event.estimatedTokensBefore)} in history._`;
+  return `_${reason}: ${formatTokenCount(event.estimatedTokensBefore)} estimated input (${formatTokenCount(event.estimatedHistoryTokensBefore)} history)._`;
 }
 
 function formatCompactionStatus(result: SessionCompactionResult): string {
@@ -1794,24 +1872,6 @@ function currentRunUserMessage(
 ): LlmMessage | undefined {
   const message = request.messages[prepared.history.length + 1];
   return message?.role === "user" ? message : undefined;
-}
-
-function requestWithSessionMessages(
-  request: ModelRequest,
-  messages: readonly LlmMessage[],
-): ModelRequest {
-  const leadingSystemMessages: LlmMessage[] = [];
-  for (const message of request.messages) {
-    if (message.role !== "system") {
-      break;
-    }
-    leadingSystemMessages.push(message);
-  }
-
-  return {
-    ...request,
-    messages: [...leadingSystemMessages, ...messages],
-  };
 }
 
 function optionalModelUsage(

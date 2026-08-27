@@ -1,6 +1,11 @@
 import * as path from "node:path";
 import { ConsoleJsonLogger, errorFields } from "./app/logging";
 import {
+  calculateUsage,
+  defaultUsagePricingForModel,
+  usagePricingFromEnv,
+} from "./app/usage";
+import {
   OpenAICompatibleProviderAdapter,
   RetryingModelClient,
 } from "./agent/model";
@@ -12,9 +17,11 @@ import {
   defaultChildAgentCommandTemplate,
   TmuxChildAgentSupervisor,
 } from "./runtime/tmux-agents";
+import { JsonlTraceRecorder, TraceRuntimeHook } from "./runtime/trace";
 import { createCodingToolExecutor, getCodingToolSchemas, type CodingToolExecutorOptions, type ToolApprovalMode } from "./tools";
 import { FileChildAgentRunStore } from "./workspace/child-agents";
 import { createLlmSessionCompactor } from "./workspace/compaction";
+import { ContextManager } from "./workspace/context-manager";
 import { ChannelRepoWorkflow } from "./workspace/repo";
 import { createSandboxExecutor, type SandboxExecutor } from "./workspace/sandbox";
 import { WorkspaceSessionStore } from "./workspace/session";
@@ -36,6 +43,34 @@ async function main(): Promise<void> {
   const port = readPositiveIntegerEnv("PIBOT_WEBUI_PORT") ?? 8787;
   const logger = new ConsoleJsonLogger();
   const configuredModel = readOptionalEnv("OPENAI_MODEL");
+  const modelContextWindowTokens =
+    readPositiveIntegerEnv("MODEL_CONTEXT_WINDOW_TOKENS") ??
+    defaultModelContextWindowTokens();
+  const sessionCompactionReserveTokens =
+    readPositiveIntegerEnv("SESSION_COMPACTION_RESERVE_TOKENS") ?? 32768;
+  const contextManager = new ContextManager({
+    ...((readBooleanEnv("SESSION_MICROCOMPACT_ENABLED") ?? true)
+      ? {
+          microcompact: {
+            contextWindowTokens: modelContextWindowTokens,
+            reserveTokens: sessionCompactionReserveTokens,
+            protectRecentTokens:
+              readNonNegativeIntegerEnv(
+                "SESSION_MICROCOMPACT_PROTECT_RECENT_TOKENS",
+              ) ?? 12_000,
+            minReclaimTokens:
+              readPositiveIntegerEnv("SESSION_MICROCOMPACT_MIN_RECLAIM_TOKENS") ??
+              512,
+            maxItems:
+              readPositiveIntegerEnv("SESSION_MICROCOMPACT_MAX_ITEMS") ?? 12,
+            warmCacheTtlMs:
+              readPositiveIntegerEnv(
+                "SESSION_MICROCOMPACT_WARM_CACHE_TTL_MS",
+              ) ?? 300_000,
+          },
+        }
+      : {}),
+  });
   const titleModelName = resolveConversationTitleModelName(
     configuredModel,
     readOptionalEnv("PIBOT_TITLE_MODEL"),
@@ -106,12 +141,10 @@ async function main(): Promise<void> {
   );
   const sessionStore = new WorkspaceSessionStore({
     store: workspaceStore,
+    contextManager,
     compactor: createLlmSessionCompactor({
-      contextWindowTokens:
-        readPositiveIntegerEnv("MODEL_CONTEXT_WINDOW_TOKENS") ??
-        defaultModelContextWindowTokens(),
-      reserveTokens:
-        readPositiveIntegerEnv("SESSION_COMPACTION_RESERVE_TOKENS") ?? 32768,
+      contextWindowTokens: modelContextWindowTokens,
+      reserveTokens: sessionCompactionReserveTokens,
       keepRecentTokens:
         readPositiveIntegerEnv("SESSION_COMPACTION_KEEP_RECENT_TOKENS") ?? 20000,
       model,
@@ -120,6 +153,33 @@ async function main(): Promise<void> {
         ? {}
         : { modelName: process.env.OPENAI_MODEL }),
     }),
+  });
+  const usagePricing = usagePricingFromEnv(
+    defaultUsagePricingForModel(configuredModel, process.env.OPENAI_BASE_URL),
+  );
+  const traceRecorder = new JsonlTraceRecorder({
+    filePath: path.join(storeRoot, "trace.jsonl"),
+    maxFileBytes:
+      readPositiveIntegerEnv("PIBOT_TRACE_MAX_FILE_BYTES") ?? 20_000_000,
+  });
+  const traceHook = new TraceRuntimeHook({
+    recorder: traceRecorder,
+    contextBudget: {
+      contextWindowTokens: modelContextWindowTokens,
+      reserveTokens: sessionCompactionReserveTokens,
+    },
+    calculateCost: (usage) => {
+      const calculated = calculateUsage(usage, usagePricing);
+      return {
+        cost: calculated.cost,
+        currency: calculated.currency,
+        cacheHitRatio: calculated.cacheHitRatio,
+        cacheSavings: calculated.cacheSavings,
+        uncachedInputCost: calculated.uncachedInputCost,
+        cachedInputCost: calculated.cachedInputCost,
+        outputCost: calculated.outputCost,
+      };
+    },
   });
   const evolutionContext = new SessionEvolutionContextRecorder(sessionStore);
   const evolution = new EvolutionController({
@@ -174,6 +234,7 @@ async function main(): Promise<void> {
       model,
       tools: getCodingToolSchemas(),
       sandboxExecutor: sandbox.executor,
+      sandboxLabel: sandbox.label,
       toolApprovalMode: readToolApprovalModeEnv(),
       approvalTimeoutMs,
       toolLimits: codingToolLimitsFromEnv(),
@@ -206,6 +267,7 @@ async function main(): Promise<void> {
         80,
       maxParallelToolCalls:
         readPositiveIntegerEnv("AGENT_MAX_PARALLEL_TOOL_CALLS") ?? 8,
+      runtimeHooks: [traceHook],
       disabledSkills: readCsvEnv("SKILLS_DISABLED"),
       maxSkills: readPositiveIntegerEnv("SKILLS_MAX_COUNT") ?? 100,
       maxSkillFileBytes:

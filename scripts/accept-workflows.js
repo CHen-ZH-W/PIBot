@@ -630,7 +630,9 @@ async function acceptsSlackCoordinatorModeRequest() {
   const model = {
     async *stream(request) {
       requests.push(request);
-      const system = request.messages.find((message) => message.role === "system");
+      const system = request.messages.find((message) =>
+        message.role === "system" &&
+        message.content.includes("Current runtime mode is coordinator"));
       assert.notEqual(system, undefined);
       assert.match(system.content, /Current runtime mode is coordinator/u);
       assert.match(system.content, /In Coordinator Mode/u);

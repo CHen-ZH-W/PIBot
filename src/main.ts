@@ -5,8 +5,7 @@ import {
   calculateUsage,
   defaultUsagePricingForModel,
   JsonlUsageRecorder,
-  type UsageCurrency,
-  type UsagePricing,
+  usagePricingFromEnv,
 } from "./app/usage";
 import { MinimalAgentLoop } from "./agent/agent-loop";
 import {
@@ -32,6 +31,7 @@ import {
   type ToolApprovalMode,
 } from "./tools";
 import { createLlmSessionCompactor } from "./workspace/compaction";
+import { ContextManager } from "./workspace/context-manager";
 import { ChannelRepoWorkflow } from "./workspace/repo";
 import {
   createSandboxExecutor,
@@ -56,6 +56,7 @@ import { FileTaskStore } from "./workspace/tasks";
 import { FileChildAgentRunStore } from "./workspace/child-agents";
 import { ChildAgentRuntime } from "./runtime/child-agents";
 import { FileChildAgentApprovalResponder } from "./runtime/child-agent-approvals";
+import { createRuntimeWorldStateProvider } from "./runtime/world-state";
 import {
   defaultChildAgentCommandTemplate,
   TmuxChildAgentSupervisor,
@@ -86,6 +87,31 @@ async function main(): Promise<void> {
   const modelContextWindowTokens =
     readPositiveIntegerEnv("MODEL_CONTEXT_WINDOW_TOKENS") ??
     defaultModelContextWindowTokens();
+  const sessionCompactionReserveTokens =
+    readPositiveIntegerEnv("SESSION_COMPACTION_RESERVE_TOKENS") ?? 32768;
+  const contextManager = new ContextManager({
+    ...((readBooleanEnv("SESSION_MICROCOMPACT_ENABLED") ?? true)
+      ? {
+          microcompact: {
+            contextWindowTokens: modelContextWindowTokens,
+            reserveTokens: sessionCompactionReserveTokens,
+            protectRecentTokens:
+              readNonNegativeIntegerEnv(
+                "SESSION_MICROCOMPACT_PROTECT_RECENT_TOKENS",
+              ) ?? 12_000,
+            minReclaimTokens:
+              readPositiveIntegerEnv("SESSION_MICROCOMPACT_MIN_RECLAIM_TOKENS") ??
+              512,
+            maxItems:
+              readPositiveIntegerEnv("SESSION_MICROCOMPACT_MAX_ITEMS") ?? 12,
+            warmCacheTtlMs:
+              readPositiveIntegerEnv(
+                "SESSION_MICROCOMPACT_WARM_CACHE_TTL_MS",
+              ) ?? 300_000,
+          },
+        }
+      : {}),
+  });
   const sandbox = createSandboxExecutorFromEnv(workspaceRoot);
   const approvalMode = readToolApprovalModeEnv();
   const approvalTimeoutMs =
@@ -179,10 +205,10 @@ async function main(): Promise<void> {
   });
   const sessionStore = new WorkspaceSessionStore({
     store: workspaceStore,
+    contextManager,
     compactor: createLlmSessionCompactor({
       contextWindowTokens: modelContextWindowTokens,
-      reserveTokens:
-        readPositiveIntegerEnv("SESSION_COMPACTION_RESERVE_TOKENS") ?? 32768,
+      reserveTokens: sessionCompactionReserveTokens,
       keepRecentTokens:
         readPositiveIntegerEnv("SESSION_COMPACTION_KEEP_RECENT_TOKENS") ?? 20000,
       model,
@@ -230,11 +256,20 @@ async function main(): Promise<void> {
   });
   const traceHook = new TraceRuntimeHook({
     recorder: traceRecorder,
+    contextBudget: {
+      contextWindowTokens: modelContextWindowTokens,
+      reserveTokens: sessionCompactionReserveTokens,
+    },
     calculateCost: (usage) => {
       const calculated = calculateUsage(usage, usagePricing);
       return {
         cost: calculated.cost,
         currency: calculated.currency,
+        cacheHitRatio: calculated.cacheHitRatio,
+        cacheSavings: calculated.cacheSavings,
+        uncachedInputCost: calculated.uncachedInputCost,
+        cachedInputCost: calculated.cachedInputCost,
+        outputCost: calculated.outputCost,
       };
     },
   });
@@ -363,6 +398,14 @@ async function main(): Promise<void> {
           new RuntimeModeHook({
             state: runContext.state,
             describeTool: (name) => runTools.describeTool(name),
+            worldState: createRuntimeWorldStateProvider({
+              workspaceRoot: runWorkspaceRoot,
+              sandboxLabel: sandbox.label,
+              approvalMode,
+              pendingApprovalCount: () =>
+                approvalBroker.pendingApprovalCount(approvalContext.conversation),
+              childAgents,
+            }),
           }),
           traceHook,
         ],
@@ -446,6 +489,7 @@ async function main(): Promise<void> {
         model,
         tools: getCodingToolSchemas(),
         sandboxExecutor: sandbox.executor,
+        sandboxLabel: sandbox.label,
         toolApprovalMode: approvalMode,
         toolLimits: codingToolLimits,
         childAgents: {
@@ -477,6 +521,7 @@ async function main(): Promise<void> {
           80,
         maxParallelToolCalls:
           readPositiveIntegerEnv("AGENT_MAX_PARALLEL_TOOL_CALLS") ?? 8,
+        runtimeHooks: [traceHook],
         disabledSkills: readCsvEnv("SKILLS_DISABLED"),
         maxSkills: readPositiveIntegerEnv("SKILLS_MAX_COUNT") ?? 100,
         maxSkillFileBytes:
@@ -558,20 +603,6 @@ function defaultModelContextWindowTokens(): number {
   return 262_144;
 }
 
-function readNonNegativeNumberEnv(name: string): number | undefined {
-  const value = process.env[name];
-  if (value === undefined || value.length === 0) {
-    return undefined;
-  }
-
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    throw new Error(`${name} must be a non-negative number`);
-  }
-
-  return parsed;
-}
-
 function readNonNegativeIntegerEnv(name: string): number | undefined {
   const value = process.env[name];
   if (value === undefined || value.length === 0) {
@@ -584,31 +615,6 @@ function readNonNegativeIntegerEnv(name: string): number | undefined {
   }
 
   return parsed;
-}
-
-function usagePricingFromEnv(defaults: UsagePricing): UsagePricing {
-  const currency = readUsageCurrencyEnv("USAGE_COST_CURRENCY");
-  const inputCost = readNonNegativeNumberEnv("USAGE_INPUT_COST_PER_1M_TOKENS");
-  const cachedInputCost = readNonNegativeNumberEnv(
-    "USAGE_CACHED_INPUT_COST_PER_1M_TOKENS",
-  );
-  const outputCost = readNonNegativeNumberEnv("USAGE_OUTPUT_COST_PER_1M_TOKENS");
-  const overridden =
-    currency !== undefined ||
-    inputCost !== undefined ||
-    cachedInputCost !== undefined ||
-    outputCost !== undefined;
-
-  return {
-    strategy: overridden ? `${defaults.strategy}+env` : defaults.strategy,
-    currency: currency ?? defaults.currency,
-    inputCostPerMillionTokens:
-      inputCost ?? defaults.inputCostPerMillionTokens,
-    cachedInputCostPerMillionTokens:
-      cachedInputCost ?? defaults.cachedInputCostPerMillionTokens,
-    outputCostPerMillionTokens:
-      outputCost ?? defaults.outputCostPerMillionTokens,
-  };
 }
 
 function codingToolLimitsFromEnv(): Required<Pick<
@@ -650,19 +656,6 @@ function readToolApprovalModeEnv(): ToolApprovalMode {
   throw new Error(
     "TOOL_APPROVAL_MODE must be one of: read-only, workspace-write, approval-required, full-access",
   );
-}
-
-function readUsageCurrencyEnv(name: string): UsageCurrency | undefined {
-  const value = readOptionalEnv(name)?.toUpperCase();
-  if (value === undefined) {
-    return undefined;
-  }
-
-  if (value === "CNY" || value === "USD") {
-    return value;
-  }
-
-  throw new Error(`${name} must be one of: CNY, USD`);
 }
 
 function optionalBotUserId(

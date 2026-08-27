@@ -21,6 +21,13 @@ export interface BuildCodingAgentSystemPromptOptions {
   readonly now?: Date;
 }
 
+export interface CodingAgentPromptParts {
+  /** Cross-run stable instructions. Keep this as the first model message. */
+  readonly stableSystemPrompt: string;
+  /** Refreshable run context. A runtime hook appends it to the dynamic tail. */
+  readonly dynamicContext?: string;
+}
+
 /**
  * Builds a compact but explicit coding-agent prompt. Detailed Skill bodies and
  * memory topics remain on disk until the model decides they are relevant.
@@ -28,6 +35,20 @@ export interface BuildCodingAgentSystemPromptOptions {
 export function buildCodingAgentSystemPrompt(
   options: BuildCodingAgentSystemPromptOptions,
 ): string {
+  const parts = buildCodingAgentPromptParts(options);
+  return [parts.stableSystemPrompt, parts.dynamicContext]
+    .filter((part): part is string => part !== undefined && part.length > 0)
+    .join("\n\n");
+}
+
+/**
+ * Separates cache-stable instructions from refreshable run facts. Callers that
+ * own a model loop should pass stableSystemPrompt as the first message and
+ * dynamicContext through the loop's dynamic-tail projection.
+ */
+export function buildCodingAgentPromptParts(
+  options: BuildCodingAgentSystemPromptOptions,
+): CodingAgentPromptParts {
   const selfEvolutionRoutingGuidance = renderSelfEvolutionRoutingGuidance(
     options.tools,
   );
@@ -45,33 +66,45 @@ export function buildCodingAgentSystemPrompt(
     options.thinkingLanguage.length > 0
       ? [renderThinkingLanguageGuidance(options.thinkingLanguage)]
       : []),
-    renderModeGuidance(options.mode ?? "execute"),
+    renderModeGuidance(),
     renderPlanExecuteGuidance(),
     renderMultiAgentGuidance(),
     ...(options.reflectionEnabled === true ? [renderReflectionGuidance()] : []),
     renderMemoryGuidance(),
     renderSkillGuidance(),
   ];
+  const dynamicParts: string[] = [];
   const memoryPrompt = renderMemoryPrompt(options.memories);
   if (memoryPrompt !== undefined) {
-    promptParts.push(memoryPrompt);
+    dynamicParts.push(memoryPrompt);
   }
   if (options.repoPrompt !== undefined) {
-    promptParts.push(options.repoPrompt);
+    dynamicParts.push(options.repoPrompt);
   }
   if (options.channelWorkspacePrompt !== undefined) {
-    promptParts.push(options.channelWorkspacePrompt);
+    dynamicParts.push(options.channelWorkspacePrompt);
   }
   const skillIndex = renderWorkspaceSkillIndex(options.workspaceSkills);
   if (skillIndex !== undefined) {
-    promptParts.push(skillIndex);
+    dynamicParts.push(skillIndex);
   }
-  promptParts.push(`Current date: ${formatDate(options.now ?? new Date())}`);
+  dynamicParts.push(`Runtime mode at run start: ${options.mode ?? "execute"}`);
+  dynamicParts.push(`Current date: ${formatDate(options.now ?? new Date())}`);
   if (options.workspaceRoot !== undefined) {
-    promptParts.push(`Current working directory: ${options.workspaceRoot}`);
+    dynamicParts.push(`Current working directory: ${options.workspaceRoot}`);
   }
 
-  return promptParts.join("\n\n");
+  return {
+    stableSystemPrompt: promptParts.join("\n\n"),
+    ...(dynamicParts.length === 0
+      ? {}
+      : {
+          dynamicContext: [
+            "Refreshable run context follows. Prefer newer World State and Working Set lanes when they disagree with this run-start snapshot.",
+            ...dynamicParts,
+          ].join("\n\n"),
+        }),
+  };
 }
 
 function renderAgentSelfInstructions(instructions: string): string {
@@ -162,10 +195,10 @@ function renderSelfEvolutionRoutingGuidance(
   ].join("\n");
 }
 
-function renderModeGuidance(mode: AgentMode): string {
+function renderModeGuidance(): string {
   return [
     "Work modes:",
-    `- Current runtime mode is ${mode}. The runtime enforces this mode before every model and tool call.`,
+    "- The current runtime mode is supplied in the refreshable World State lane. The runtime enforces that mode before every model and tool call.",
     "- For complex, ambiguous, risky, or multi-file tasks, call enter_plan_mode before editing.",
     "- When the user asks for Coordinator Mode or multi-agent orchestration, use enter_coordinator_mode or continue coordinating if the runtime mode is already coordinator.",
     "- In Plan Mode, inspect the workspace with read-only tools, keep PLAN.md and tasks.json current with update_plan or task tools, and call exit_plan_mode when the plan is ready for user approval. Never ask the user to approve a plan in plain text instead of calling exit_plan_mode.",

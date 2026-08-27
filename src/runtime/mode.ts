@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { LlmMessage, LlmToolSchema } from "../core/agent";
+import type { LlmToolSchema } from "../core/agent";
 import type {
   ToolCallId,
 } from "../core/ids";
@@ -11,7 +11,13 @@ import type {
   ToolMetadata,
 } from "../core/tools";
 import type { ToolApprovalPrompter } from "../ports/tools";
-import type { TaskStore } from "../workspace/tasks";
+import { ContextManager } from "../workspace/context-manager";
+import type {
+  PlanTask,
+  TaskStatus,
+  TaskStore,
+  TaskStoreSnapshot,
+} from "../workspace/tasks";
 import type { RuntimeHook, RuntimeModelCallHookContext } from "./hooks";
 
 export type AgentMode = "execute" | "plan" | "coordinator";
@@ -310,13 +316,27 @@ export function isToolAllowedInMode(
 export interface RuntimeModeHookOptions {
   readonly state: AgentRuntimeState;
   readonly describeTool?: (name: string) => ToolMetadata | undefined;
+  readonly contextManager?: ContextManager;
+  readonly worldState?: () => Promise<Readonly<Record<string, unknown>>>;
 }
 
 export class RuntimeModeHook implements RuntimeHook {
-  constructor(private readonly options: RuntimeModeHookOptions) {}
+  private readonly contextManager: ContextManager;
 
-  beforeModelCall(context: RuntimeModelCallHookContext) {
-    const request = withRuntimeMessages(context.request, context.stepContext);
+  constructor(private readonly options: RuntimeModeHookOptions) {
+    this.contextManager = options.contextManager ?? new ContextManager();
+  }
+
+  async beforeModelCall(context: RuntimeModelCallHookContext) {
+    const request = this.contextManager.projectSystemLane(context.request, {
+      id: "world-state",
+      placement: "dynamic_tail",
+      content: await renderWorldStateMessage(
+        this.options.state,
+        context.stepContext,
+        this.options.worldState,
+      ),
+    });
     if (context.stepContext.mode === "execute") {
       return request;
     }
@@ -485,31 +505,6 @@ const TASK_CONTROL_TOOL_NAMES = new Set([
   "task_update",
 ]);
 
-function withRuntimeMessages(
-  request: RuntimeModelCallHookContext["request"],
-  stepContext: RuntimeModelCallHookContext["stepContext"],
-): RuntimeModelCallHookContext["request"] {
-  const modeMessage: LlmMessage = {
-    role: "system",
-    content: renderRuntimeModeMessage(
-      stepContext.mode,
-      stepContext.coordinatorGoal,
-    ),
-  };
-  const [first, ...rest] = request.messages;
-  if (first?.role === "system") {
-    return {
-      ...request,
-      messages: [first, modeMessage, ...rest],
-    };
-  }
-
-  return {
-    ...request,
-    messages: [modeMessage, ...request.messages],
-  };
-}
-
 function renderRuntimeModeMessage(
   mode: AgentMode,
   coordinatorGoal: string | undefined,
@@ -538,6 +533,153 @@ function renderRuntimeModeMessage(
     "Runtime mode: execute.",
     "You may execute approved changes. For complex or ambiguous work, enter Plan Mode before editing.",
   ].join(" ");
+}
+
+async function renderWorldStateMessage(
+  state: AgentRuntimeState,
+  stepContext: RuntimeModelCallHookContext["stepContext"],
+  environmentProvider:
+    | (() => Promise<Readonly<Record<string, unknown>>> )
+    | undefined,
+): Promise<string> {
+  const taskState = await readTaskWorldState(state.workflow.taskStore);
+  const environmentState = await readEnvironmentWorldState(environmentProvider);
+  const worldState = {
+    schemaVersion: 1,
+    step: {
+      id: stepContext.stepId,
+      number: stepContext.step,
+      runtimeStateVersion: stepContext.stateVersion,
+      ...(stepContext.model === undefined ? {} : { model: stepContext.model }),
+    },
+    runtime: {
+      mode: stepContext.mode,
+      ...(stepContext.coordinatorGoal === undefined
+        ? {}
+        : { coordinatorGoal: stepContext.coordinatorGoal }),
+    },
+    plan: {
+      path: state.plan.planPath,
+      ...optionalRuntimeString("enteredAt", state.plan.enteredAt),
+      ...optionalRuntimeString("updatedAt", state.plan.updatedAt),
+      ...optionalRuntimeString("approvedAt", state.plan.approvedAt),
+      ...optionalRuntimeString(
+        "approvalSummary",
+        truncateRuntimeText(state.plan.approvalSummary, 500),
+      ),
+    },
+    ...(taskState === undefined ? {} : { tasks: taskState }),
+    ...environmentState,
+  };
+  return [
+    renderRuntimeModeMessage(stepContext.mode, stepContext.coordinatorGoal),
+    "The following JSON is current runtime truth for this step; prefer it over stale conversation history:",
+    JSON.stringify(worldState, null, 2),
+  ].join("\n");
+}
+
+async function readEnvironmentWorldState(
+  provider: (() => Promise<Readonly<Record<string, unknown>>>) | undefined,
+): Promise<Readonly<Record<string, unknown>>> {
+  if (provider === undefined) {
+    return {};
+  }
+  try {
+    return await provider();
+  } catch (error: unknown) {
+    return {
+      environment: {
+        available: false,
+        error: truncateRuntimeText(
+          error instanceof Error ? error.message : String(error),
+          500,
+        ),
+      },
+    };
+  }
+}
+
+async function readTaskWorldState(
+  taskStore: TaskStore | undefined,
+): Promise<Readonly<Record<string, unknown>> | undefined> {
+  if (taskStore === undefined) {
+    return undefined;
+  }
+  try {
+    return summarizeTaskSnapshot(await taskStore.read(), taskStore.filePath);
+  } catch (error: unknown) {
+    return {
+      path: taskStore.filePath,
+      available: false,
+      error: truncateRuntimeText(
+        error instanceof Error ? error.message : "Unknown task-store error",
+        500,
+      ),
+    };
+  }
+}
+
+function summarizeTaskSnapshot(
+  snapshot: TaskStoreSnapshot,
+  filePath: string,
+): Readonly<Record<string, unknown>> {
+  const counts: Record<TaskStatus, number> = {
+    pending: 0,
+    in_progress: 0,
+    completed: 0,
+    failed: 0,
+    blocked: 0,
+  };
+  for (const task of snapshot.tasks) {
+    counts[task.status] += 1;
+  }
+  return {
+    path: filePath,
+    available: true,
+    updatedAt: snapshot.updatedAt,
+    replanCount: snapshot.replanCount,
+    maxReplans: snapshot.maxReplans,
+    counts,
+    active: snapshot.tasks
+      .filter((task) => task.status !== "completed")
+      .slice(0, 20)
+      .map(summarizeActiveTask),
+    omittedActiveTasks: Math.max(
+      0,
+      snapshot.tasks.filter((task) => task.status !== "completed").length - 20,
+    ),
+  };
+}
+
+function summarizeActiveTask(task: PlanTask): Readonly<Record<string, unknown>> {
+  return {
+    id: truncateRuntimeText(task.id, 120),
+    title: truncateRuntimeText(task.title, 300),
+    status: task.status,
+    attempts: task.attempts,
+    dependencies: task.dependencies.slice(0, 20),
+    ...optionalRuntimeString("notes", truncateRuntimeText(task.notes, 500)),
+    ...optionalRuntimeString("error", truncateRuntimeText(task.error, 500)),
+  };
+}
+
+function truncateRuntimeText(
+  value: string | undefined,
+  maxChars: number,
+): string | undefined {
+  if (value === undefined || value.length <= maxChars) {
+    return value;
+  }
+  return `${value.slice(0, maxChars - 15)}...[truncated]`;
+}
+
+function optionalRuntimeString<Key extends string>(
+  key: Key,
+  value: string | undefined,
+): { readonly [Property in Key]: string } | object {
+  return value === undefined ? {} : { [key]: value } as {
+    readonly [Property in Key]: string;
+  };
 }
 
 function modeDeniedReason(mode: AgentMode, toolName: string): string {

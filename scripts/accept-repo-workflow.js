@@ -146,7 +146,11 @@ function createEditModel() {
       yield startEvent();
 
       if (requests === 1) {
-        assert.match(request.messages[0].content, /Repo workflow:/u);
+        assert.equal(
+          request.messages.some((message) =>
+            /Repo workflow:/u.test(message.content)),
+          true,
+        );
         yield toolCall("edit-call", "edit", {
           path: "fixture.txt",
           replacements: [
@@ -184,7 +188,11 @@ function createChannelWriteModel() {
       yield startEvent();
 
       if (requests === 1) {
-        assert.match(request.messages[0].content, /No repo is configured/u);
+        assert.equal(
+          request.messages.some((message) =>
+            /No repo is configured/u.test(message.content)),
+          true,
+        );
         yield toolCall("write-call", "write", {
           path: "helper.txt",
           content: "hello from channel\n",

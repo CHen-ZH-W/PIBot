@@ -2,6 +2,10 @@ import { appendFile, mkdir, stat } from "node:fs/promises";
 import * as path from "node:path";
 import type { ModelUsage } from "../agent/model";
 import type { ToolApprovalDecision, ToolApprovalRequest } from "../core/tools";
+import {
+  ContextManager,
+  type ModelRequestBudgetOptions,
+} from "../workspace/context-manager";
 import type { AgentRunContext } from "./context";
 import type {
   RuntimeAfterModelCallHookContext,
@@ -67,18 +71,36 @@ export class JsonlTraceRecorder implements TraceRecorder {
 
 export interface TraceRuntimeHookOptions {
   readonly recorder: TraceRecorder;
+  readonly contextBudget?: ModelRequestBudgetOptions;
+  readonly contextManager?: ContextManager;
   readonly calculateCost?: (
     usage: ModelUsage,
   ) => {
-    readonly cost: number;
-    readonly currency: string;
+      readonly cost: number;
+      readonly currency: string;
+      readonly cacheHitRatio?: number;
+      readonly cacheSavings?: number;
+      readonly uncachedInputCost?: number;
+      readonly cachedInputCost?: number;
+      readonly outputCost?: number;
   };
 }
 
 export class TraceRuntimeHook implements RuntimeHook {
-  constructor(private readonly options: TraceRuntimeHookOptions) {}
+  private readonly contextManager: ContextManager;
+
+  constructor(private readonly options: TraceRuntimeHookOptions) {
+    this.contextManager = options.contextManager ?? new ContextManager();
+  }
 
   async beforeModelCall(context: RuntimeModelCallHookContext): Promise<void> {
+    const estimate = this.contextManager.estimateModelRequest(context.request);
+    const budget = this.options.contextBudget === undefined
+      ? undefined
+      : this.contextManager.estimateModelRequestBudget(
+          context.request,
+          this.options.contextBudget,
+        );
     await this.record(withRun(context.run, {
       type: "model.started",
       step: context.step,
@@ -87,6 +109,20 @@ export class TraceRuntimeHook implements RuntimeHook {
       stateVersion: context.stepContext.stateVersion,
       messageCount: context.request.messages.length,
       toolCount: context.request.tools.length,
+      estimatedInputTokens: estimate.totalTokens,
+      estimatedMessageTokens: estimate.messageTokens,
+      estimatedToolTokens: estimate.toolTokens,
+      estimatedImageTokens: estimate.imageTokens,
+      imageCount: estimate.imageCount,
+      ...(budget === undefined
+        ? {}
+        : {
+            contextWindowTokens: budget.contextWindowTokens,
+            contextReserveTokens: budget.reserveTokens,
+            contextInputLimitTokens: budget.inputLimitTokens,
+            estimatedRemainingInputTokens: budget.remainingInputTokens,
+            estimatedContextOverBudget: budget.overBudget,
+          }),
       requestedModel: context.request.model,
     }));
   }

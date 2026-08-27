@@ -261,7 +261,10 @@ async function acceptsIndexedSkillRead() {
       requests.push(request);
       yield startEvent();
       if (requests.length === 1) {
-        const systemPrompt = request.messages.find((message) => message.role === "system").content;
+        const systemPrompt = request.messages.find((message) =>
+          message.role === "system" &&
+          message.content.includes("<available_skills>"))?.content;
+        assert.notEqual(systemPrompt, undefined);
         assert.match(systemPrompt, /<available_skills>/u);
         assert.match(systemPrompt, /<name>release-check<\/name>/u);
         assert.match(systemPrompt, /<description>Verify release readiness/u);

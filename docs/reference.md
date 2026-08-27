@@ -302,6 +302,11 @@ Common variables:
 | `SESSION_COMPACTION_RESERVE_TOKENS` | `32768` | Buffer reserved for prompt overhead, output and in-run context growth; LLM summary generation uses `floor(0.8 * reserve)` max output tokens |
 | `SESSION_COMPACTION_KEEP_RECENT_TOKENS` | `20000` | Approximate recent-history token budget retained after compaction |
 | `SESSION_COMPACTION_MAX_OVERFLOW_RETRIES` | `1` | Forced compaction retries after provider context overflow |
+| `SESSION_MICROCOMPACT_ENABLED` | `true` | Enable reversible model-surface pruning of stale successful Read/Grep and safe observational Bash results before semantic compaction |
+| `SESSION_MICROCOMPACT_PROTECT_RECENT_TOKENS` | `12000` | Recent history tail protected from Microcompact |
+| `SESSION_MICROCOMPACT_MIN_RECLAIM_TOKENS` | `512` | Minimum estimated saving for one Microcompact candidate |
+| `SESSION_MICROCOMPACT_MAX_ITEMS` | `12` | Maximum Tool Results replaced in one model projection |
+| `SESSION_MICROCOMPACT_WARM_CACHE_TTL_MS` | `300000` | Local TTL for treating an observed provider cache hit as warm |
 | `WORKSPACE_ROOT` | current directory | pibot workspace boundary |
 | `PIBOT_STORE_ROOT` | `.pibot` in workspace | Session and attachment storage |
 | `PIBOT_TRACE_MAX_FILE_BYTES` | `20000000` | Maximum structured trace JSONL size |
@@ -355,19 +360,169 @@ Common variables:
 | `CHILD_AGENT_TOOL_APPROVAL_TIMEOUT_MS` | `TOOL_APPROVAL_TIMEOUT_MS` | Child-agent tool approval timeout |
 | `CHILD_AGENT_ALLOW_BASH` | `false` | Allow bash for read-only child agents when no approval bridge is available |
 
-Session compaction runs before a new Slack task when estimated history usage exceeds
-`MODEL_CONTEXT_WINDOW_TOKENS - SESSION_COMPACTION_RESERVE_TOKENS`. Token counts
-use a lightweight estimate. The compactor preserves complete messages up to the
-recent-history budget and keeps tool calls paired with their tool results. It asks
+Session compaction runs before model steps when the estimated full request exceeds
+`MODEL_CONTEXT_WINDOW_TOKENS - SESSION_COMPACTION_RESERVE_TOKENS`. The lightweight
+estimate includes system/runtime messages, history, reasoning fields, tool calls,
+tool schemas and a conservative image allowance. Slack and Web runs persist
+completed in-run messages before this check, so a refreshed projection does not
+lose the current tool-call/result sequence. The compactor preserves the current
+user turn, keeps complete messages up to the recent-history budget, and keeps tool
+calls paired with their tool results. It asks
 the configured model for a structured summary and falls back to a heuristic
 summary if that call fails. Provider context overflow triggers one forced
 compaction and automatic retry by default.
+
+`ContextManager` is the model-surface boundary for durable channel history. It
+selects the latest checkpoint plus uncovered records, applies per-run user-message
+exclusion or replacement, and repairs tool-call ordering without rewriting
+`context.jsonl`. It also owns named model-only system lanes and final-request token
+estimation. Compaction records remain append-only and now include both the
+rendered checkpoint and machine-readable `summaryFacts`, so a later heuristic
+fallback can inherit facts from an earlier LLM checkpoint.
+
+Prompt assembly follows three ordered regions. The first System message contains
+only cache-stable agent instructions; ordered Tool schemas are the other stable
+request component. Memory indexes, Skill index, repo/run-start facts, date, cwd
+and channel-workspace reminders are no longer concatenated into that first
+message. A runtime hook projects them as a named `run-context` lane at the
+append-only dynamic tail on every Step. Durable projected history remains between
+the stable prefix and dynamic tail. Steering plus refreshable World State and
+Working Set lanes also live at that tail; history refreshes preserve these lanes
+and never insert them between an assistant tool call and its Tool Result.
+
+After a checkpoint covers older history, `ContextManager` inserts an
+`[pibot-context:exact-user-intent]` header immediately after the Summary and then
+replays every covered, non-compaction user message with its original `user` role
+and verbatim content. The uncovered recent tail remains after this protected lane,
+so an old request is not mistaken for the newest request. These messages are
+loaded from the append-only durable log rather than reconstructed from
+`summaryFacts`.
+
+Checkpoint coverage advances only through newly covered non-checkpoint records;
+the later physical JSONL line number of a Summary is never used to hide an older
+uncovered recent tail. Active projection includes only the newest checkpoint and
+filters earlier checkpoint records.
+
+Every context message carries an initial durable lifecycle state. Ordinary
+messages start as `Active`; safely repeatable archived Read, Skill-read and Grep
+results start as `Regenerable`. Microcompact appends a `context_lifecycle` record
+that moves selected Tool Results to `Pruned`, without changing their original
+message or blob. A later projection may append a transition back to
+`Regenerable`. Full Compact appends `Stale` transitions for covered source lines.
+Lifecycle changes are batched append-only records in `context.jsonl`, so current
+state is replayable without rewriting earlier records.
+
+Before semantic compaction, Microcompact can replace old, successful and safely
+recoverable Read, Grep, Skill-read, or observational Bash results on the model
+surface with a small locator/metadata result. It does not rewrite the result
+already stored in `context.jsonl`, does not compact failed results or mutating
+shell commands, protects the current user turn and recent tail, and retains the
+original `toolCallId` so Provider ordering remains valid. This is reversible
+projection, not a second durable summary.
+
+Prompt-cache state is a cost input to that decision rather than a compression
+mechanism. Provider usage (`cachedInputTokens / inputTokens`) and its observation
+age select one of these policies:
+
+- `warm_conservative`: while a recent cache hit is within TTL, preserve more of
+  the prefix and require a good reclaim-to-invalidated-suffix ratio.
+- `cold`: no observed hit, a zero hit, or TTL expiry; preferentially clean older
+  eligible Tool Results because there is no warm suffix to protect.
+
+If pressure remains after Microcompact, semantic Full Compact appends a Summary +
+Working Set checkpoint. Every successful Full Compact advances the local cache
+epoch and clears its warm observation, so the first request in the new epoch is
+treated as cold and then establishes a new reusable prefix. Slack traces record
+`session.microcompacted` with cache state, epoch, protected-prefix and invalidated-
+suffix estimates; `session.compacted` records protected-user-intent token estimates
+and marks `promptCacheEpochBoundary=true`.
+
+Full Compact summaries are recursive checkpoint nodes. Each version-2 Summary
+record stores `summaryHierarchy` with its level, parent Summary line numbers and
+source Summary/message counts. The first checkpoint is level 1; compacting a
+parent checkpoint plus newer source regions creates the next level. LLM
+compaction is instructed to merge parent checkpoint facts with the new delta,
+and heuristic fallback performs the same durable-fact merge. Old transcripts are
+not expanded again merely to build a newer Summary.
+
+Verbatim user intent is deliberately not a compaction target. If that protected
+lane itself dominates the model window and there are no newly coverable
+assistant/tool records, threshold compaction returns without writing another
+equivalent Summary. A forced provider-overflow recovery may still make its single
+configured retry, but pibot does not silently summarize or truncate the protected
+user wording. Extremely long-lived sessions can therefore require an explicit
+future archive policy or a larger model window.
+
+Compaction source selection operates on complete message/tool-call regions instead
+of deleting an arbitrary middle character range. Oversized individual message or
+tool-result fields retain bounded head and tail text with an explicit durable-line
+marker. Checkpoints separately retain exact user constraint segments, current
+work, pending tasks, failed approaches, errors and fixes, code state, and
+verification state. Existing version-1 context records without `summaryFacts`
+remain readable through the rendered-summary compatibility parser.
+
+`RuntimeModeHook` refreshes a `[pibot-context:world-state]` system lane for every
+model step. The lane contains the frozen step/mode identity, model name, current
+plan metadata, coordinator goal, a bounded live `tasks.json` projection, cwd,
+live git root/branch/dirty files, sandbox label, approval policy and pending
+count, MCP capability/configuration, and bounded child-agent status counts and
+active details. pibot currently has no MCP client registry, so World State says
+`supported=false` and reports an empty server list instead of implying hidden
+connectivity. A newer projection replaces the previous lane on the model surface;
+it is not appended to durable conversation history. Environment lookup failures
+become bounded `available=false` facts and do not abort the Step.
+Request-budget fields are recorded on `model.started` traces, while
+`session.compacted` traces distinguish history tokens from non-history request
+overhead.
+
+After a checkpoint becomes active, `WorkingSetHook` uses its modified/read file
+lists to rehydrate a bounded model-only working-set lane. Modified files are
+preferred over read-only files; current filesystem content is loaded with
+workspace and symlink boundary checks, cached by size/mtime, and represented as
+full text or bounded head/tail text with a reread locator. Missing, binary and
+out-of-workspace candidates are reported without aborting the model step;
+protected runtime and credential paths use the same denial policy as file tools. Exact
+constraints, current work, code state and verification state stay beside these
+current file snapshots.
+
+Every Slack, WebUI and built-in child-agent Tool Result is archived before it is
+serialized into a model-visible tool message. The exact executor result plus tool
+name/input is written with mode `0600` under the channel or child-run
+`tool-results/` directory. The admitted Tool Result carries a store-relative
+artifact locator, SHA-256, byte count and regenerability flag. Microcompact keeps
+that artifact reference in its small replacement, so pruning context does not
+remove the durable result blob. Existing tool-level safety/output limits still
+bound what the executor itself may produce; the archive is the complete result at
+the model-admission boundary, not an unbounded capture of discarded process I/O.
 
 Usage pricing can be overridden with `USAGE_COST_CURRENCY`,
 `USAGE_INPUT_COST_PER_1M_TOKENS`,
 `USAGE_CACHED_INPUT_COST_PER_1M_TOKENS` and
 `USAGE_OUTPUT_COST_PER_1M_TOKENS`. If no provider usage is returned, pibot
-records an estimated usage entry.
+records an estimated usage entry. Provider-reported records additionally persist
+`cacheHitRatio` and `cacheSavings`; per-Step trace events include uncached-input,
+cached-input and output cost components when pricing is configured. Slack, the
+embedded WebUI and the standalone WebUI all attach the same trace hook. The
+metrics report therefore exposes both per-run Slack usage and per-model-call
+Provider usage across traced agent surfaces.
+
+Run a controlled real Provider cache experiment with a frozen system prefix and
+append-only conversation tail:
+
+```bash
+OPENAI_API_KEY=... OPENAI_MODEL=... npm run measure:provider-cache
+```
+
+The command requires Provider usage metadata and writes
+`.pibot/measurements/provider-cache-latest.json`. `PIBOT_CACHE_BENCHMARK_TURNS`,
+`PIBOT_CACHE_BENCHMARK_STABLE_CHARS`, `PIBOT_CACHE_BENCHMARK_TAIL_CHARS` and
+`PIBOT_CACHE_BENCHMARK_OUTPUT` control the experiment. To aggregate real
+long-session usage, cache savings, Full Compact and Microcompact counts already
+recorded by a running deployment, use:
+
+```bash
+PIBOT_STORE_ROOT=.pibot npm run report:context-metrics
+```
 
 ## Persistent Memory
 

@@ -1,4 +1,5 @@
 import { appendFile, readFile, writeFile } from "node:fs/promises";
+import * as path from "node:path";
 import { MinimalAgentLoop } from "./agent/agent-loop";
 import {
   OpenAICompatibleProviderAdapter,
@@ -33,6 +34,8 @@ import {
   createSandboxExecutor,
   type SandboxExecutor,
 } from "./workspace/sandbox";
+import { ToolResultArchiveHook } from "./runtime/tool-result-archive";
+import { createRuntimeWorldStateProvider } from "./runtime/world-state";
 
 interface ChildAgentEnv {
   readonly childRunId: AgentRunId;
@@ -105,6 +108,11 @@ async function main(): Promise<void> {
         new RuntimeModeHook({
           state: runtime.state,
           describeTool: (name) => tools.describeTool(name),
+          worldState: createRuntimeWorldStateProvider({
+            workspaceRoot: env.workspaceRoot,
+            sandboxLabel: process.env.SANDBOX_EXECUTOR ?? "host(disabled)",
+            approvalMode: childToolApprovalMode(env),
+          }),
         }),
       ],
     });
@@ -114,6 +122,12 @@ async function main(): Promise<void> {
       systemPrompt: childSystemPrompt(env),
       history: [],
       tools: childToolSchemas(env),
+      postHooks: [
+        new ToolResultArchiveHook({
+          directory: path.join(env.runDir, "tool-results"),
+          locatorRoot: env.runDir,
+        }),
+      ],
       maxSteps: childMaxSteps(env),
       runContext: runtime,
       ...optionalString("model", readOptionalEnv("OPENAI_MODEL")),

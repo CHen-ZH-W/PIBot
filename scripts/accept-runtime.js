@@ -1,12 +1,17 @@
 const assert = require("node:assert/strict");
+const { execFileSync } = require("node:child_process");
 const {
   mkdtemp,
   readFile,
+  writeFile,
 } = require("node:fs/promises");
 const { tmpdir } = require("node:os");
 const { join } = require("node:path");
 const { MinimalAgentLoop } = require("../dist/agent/agent-loop");
-const { createAgentRunContext } = require("../dist/runtime/context");
+const {
+  captureAgentStepContext,
+  createAgentRunContext,
+} = require("../dist/runtime/context");
 const {
   AgentRunController,
   driveWithContextRecovery,
@@ -40,6 +45,10 @@ const {
   getCodingToolSchemas,
 } = require("../dist/tools");
 const { createSandboxExecutor } = require("../dist/workspace/sandbox");
+const { FileTaskStore } = require("../dist/workspace/tasks");
+const {
+  createRuntimeWorldStateProvider,
+} = require("../dist/runtime/world-state");
 
 async function runAcceptance() {
   await runCase("registry executes a newly registered tool", acceptsRegisteredTool);
@@ -48,6 +57,7 @@ async function runAcceptance() {
   await runCase("aborted queued tools keep complete tool-result pairing", acceptsAbortPairing);
   await runCase("abort wins when a model stream ignores the signal", acceptsAbortAfterModel);
   await runCase("step context freezes advertised capabilities", acceptsStepContextSnapshot);
+  await runCase("world state refreshes plan and task truth each step", acceptsWorldStateProjection);
   await runCase("in-flight steering advances to the next step", acceptsSteeringTransition);
   await runCase("step-end observer steering reaches the next step", acceptsTerminalSteeringRace);
   await runCase("control mailboxes enforce delivery and terminal boundaries", acceptsControlMailboxes);
@@ -61,6 +71,85 @@ async function runAcceptance() {
   await runCase("provider classifies context overflow", acceptsContextOverflow);
   await runCase("trace JSONL replays a complete run", acceptsTraceReplay);
   console.log("Runtime acceptance passed");
+}
+
+async function acceptsWorldStateProjection() {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pibot-world-state-"));
+  const taskStore = new FileTaskStore({ workspaceRoot });
+  await taskStore.writeTasks({
+    tasks: [{ id: "context-1", title: "Project current task state" }],
+  });
+  const state = createAgentRuntimeState({ taskStore });
+  enterPlanMode(state);
+  const run = createAgentRunContext({ state });
+  execFileSync("git", ["init", "--initial-branch=context-test"], {
+    cwd: workspaceRoot,
+    stdio: "ignore",
+  });
+  await writeFile(join(workspaceRoot, "dirty.txt"), "dirty\n", "utf8");
+  const hook = new RuntimeModeHook({
+    state,
+    worldState: createRuntimeWorldStateProvider({
+      workspaceRoot,
+      sandboxLabel: "linux-native(test)",
+      approvalMode: "approval-required",
+      pendingApprovalCount: () => 2,
+      childAgents: {
+        async listAgents() {
+          return [{
+            childRunId: "child-1",
+            agentId: "ExploreAgent",
+            role: "explore",
+            status: "running",
+            readOnly: true,
+            task: "inspect context",
+            updatedAt: "2026-08-27T00:00:00Z",
+          }];
+        },
+      },
+    }),
+  });
+  const baseRequest = {
+    messages: [{ role: "system", content: "base system" }],
+    tools: [],
+  };
+  const firstStep = captureAgentStepContext(run, "fake-model");
+  const first = await hook.beforeModelCall({
+    run,
+    step: firstStep.step,
+    stepContext: firstStep,
+    request: baseRequest,
+  });
+
+  assert.equal(first.messages.length, 2);
+  assert.match(first.messages[1].content, /\[pibot-context:world-state\]/u);
+  assert.match(first.messages[1].content, /"mode": "plan"/u);
+  assert.match(first.messages[1].content, /"status": "pending"/u);
+  assert.match(first.messages[1].content, /tasks\.json/u);
+  assert.match(first.messages[1].content, /"branch": "context-test"/u);
+  assert.match(first.messages[1].content, /"dirty": true/u);
+  assert.match(first.messages[1].content, /linux-native\(test\)/u);
+  assert.match(first.messages[1].content, /"pending": 2/u);
+  assert.match(first.messages[1].content, /"supported": false/u);
+  assert.match(first.messages[1].content, /"childRunId": "child-1"/u);
+
+  await taskStore.updateTask({ id: "context-1", status: "in_progress" });
+  const secondStep = captureAgentStepContext(run, "fake-model");
+  const second = await hook.beforeModelCall({
+    run,
+    step: secondStep.step,
+    stepContext: secondStep,
+    request: first,
+  });
+
+  assert.equal(second.messages.length, 2);
+  assert.match(second.messages[1].content, /"status": "in_progress"/u);
+  assert.equal(
+    second.messages.filter((message) =>
+      /\[pibot-context:world-state\]/u.test(message.content),
+    ).length,
+    1,
+  );
 }
 
 async function runCase(name, test) {

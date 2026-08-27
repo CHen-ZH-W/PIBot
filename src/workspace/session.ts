@@ -2,9 +2,9 @@ import type {
   LlmMessage,
   LlmMessageToolCall,
 } from "../core/agent";
+import type { ModelRequest, ModelUsage } from "../agent/model";
 import {
   hasUnresolvedToolCalls,
-  repairToolCallMessageOrder,
 } from "../core/llm-history";
 import type {
   SlackEventId,
@@ -15,6 +15,7 @@ import type {
 import type { ChannelSessionKey } from "../core/session";
 import type { SlackEvent } from "../core/slack";
 import type { AgentRuntimeState } from "../runtime/mode";
+import { ToolResultArchiveHook } from "../runtime/tool-result-archive";
 import {
   readChannelRuntimeState,
   writeChannelRuntimeState,
@@ -24,7 +25,18 @@ import type {
   SessionCompactionRequest,
   SessionCompactionResult,
   SessionCompactor,
+  SessionSummaryHierarchy,
+  SessionSummaryFacts,
 } from "./compaction";
+import {
+  parseSessionSummaryFacts,
+  parseSessionSummaryHierarchy,
+} from "./compaction";
+import {
+  ContextManager,
+  type DurableContextItem,
+} from "./context-manager";
+import type { MicrocompactResult } from "./microcompact";
 import {
   recordRunRolloutSummary,
   type RunRolloutSummaryRequest,
@@ -40,6 +52,11 @@ import type {
 type StoredContextRole = "user" | "assistant" | "tool";
 export type ChannelContextSource = "slack_log" | "webui" | "agent" | "compaction";
 type StoredContextSource = ChannelContextSource;
+export type ContextLifecycleState =
+  | "Active"
+  | "Stale"
+  | "Regenerable"
+  | "Pruned";
 
 interface SlackUserLogRecord {
   readonly eventId: SlackEventId;
@@ -51,7 +68,7 @@ interface SlackUserLogRecord {
   readonly receivedAt: string;
 }
 
-interface StoredContextEntry {
+interface StoredContextEntry extends DurableContextItem {
   readonly lineNumber: number;
   readonly message: LlmMessage;
   readonly source: StoredContextSource;
@@ -59,6 +76,14 @@ interface StoredContextEntry {
   readonly createdAt?: string;
   readonly isCompactionSummary: boolean;
   readonly coveredThroughLineNumber?: number;
+  readonly summaryFacts?: SessionSummaryFacts;
+  readonly summaryHierarchy?: SessionSummaryHierarchy;
+  readonly lifecycleState: ContextLifecycleState;
+}
+
+interface PromptCacheObservation {
+  readonly hitRatio: number;
+  readonly observedAtMs: number;
 }
 
 export interface ChannelContextMessage {
@@ -67,6 +92,7 @@ export interface ChannelContextMessage {
   readonly source: ChannelContextSource;
   readonly createdAt?: string;
   readonly eventId?: SlackEventId;
+  readonly lifecycleState: ContextLifecycleState;
 }
 
 export interface ChannelContextAppendRequest {
@@ -101,11 +127,22 @@ export interface PreparedChannelRunContext {
 export interface RefreshedChannelRunContext {
   readonly messages: readonly LlmMessage[];
   readonly compaction?: SessionCompactionResult;
+  readonly microcompaction?: MicrocompactResult;
+}
+
+export interface SessionRunCompactionRequest extends SessionCompactionRequest {
+  /** The assembled request lets compaction account for system/tool overhead. */
+  readonly modelRequest?: ModelRequest;
+  /** Replaces the latest durable user entry on the model surface only. */
+  readonly currentUserMessage?: LlmMessage;
+  /** Identifies that turn even if later steering user records are appended. */
+  readonly currentUserDurableContent?: string;
 }
 
 export interface WorkspaceSessionStoreOptions {
   readonly store: ChannelWorkspaceStore;
   readonly compactor?: SessionCompactor;
+  readonly contextManager?: ContextManager;
   readonly clock?: () => Date;
 }
 
@@ -116,11 +153,15 @@ export interface WorkspaceSessionStoreOptions {
 export class WorkspaceSessionStore {
   private readonly store: ChannelWorkspaceStore;
   private readonly compactor: SessionCompactor | undefined;
+  private readonly contextManager: ContextManager;
+  private readonly promptCacheByChannel = new Map<string, PromptCacheObservation>();
+  private readonly promptCacheEpochByChannel = new Map<string, number>();
   private readonly clock: () => Date;
 
   constructor(options: WorkspaceSessionStoreOptions) {
     this.store = options.store;
     this.compactor = options.compactor;
+    this.contextManager = options.contextManager ?? new ContextManager();
     this.clock = options.clock ?? (() => new Date());
   }
 
@@ -200,12 +241,9 @@ export class WorkspaceSessionStore {
     let contextEntries = await this.readContextEntries(key);
     const compaction = await this.compactIfNeeded(key, contextEntries, request);
     contextEntries = compaction.entries;
-    const effectiveEntries = effectiveContextEntries(contextEntries);
-    const history = repairToolCallMessageOrder(
-      effectiveEntries
-        .filter((entry) => entry.eventId !== event.eventId)
-        .map((entry) => entry.message),
-    );
+    const history = this.contextManager.projectHistory(contextEntries, {
+      excludeEventId: event.eventId,
+    });
     const memories = await this.store.readMemories(key);
 
     return {
@@ -225,9 +263,7 @@ export class WorkspaceSessionStore {
     let contextEntries = await this.readContextEntries(key);
     const compaction = await this.compactIfNeeded(key, contextEntries, request);
     contextEntries = compaction.entries;
-    const history = repairToolCallMessageOrder(
-      effectiveContextEntries(contextEntries).map((entry) => entry.message),
-    );
+    const history = this.contextManager.projectHistory(contextEntries);
     const memories = await this.store.readMemories(key);
 
     return {
@@ -277,11 +313,7 @@ export class WorkspaceSessionStore {
   async readContextMessages(
     key: ChannelSessionKey,
   ): Promise<readonly LlmMessage[]> {
-    return repairToolCallMessageOrder(
-      effectiveContextEntries(await this.readContextEntries(key)).map(
-        (entry) => entry.message,
-      ),
-    );
+    return this.contextManager.projectHistory(await this.readContextEntries(key));
   }
 
   async readRuntimeState(key: ChannelSessionKey): Promise<AgentRuntimeState> {
@@ -298,13 +330,16 @@ export class WorkspaceSessionStore {
   async readChannelContextMessages(
     key: ChannelSessionKey,
   ): Promise<readonly ChannelContextMessage[]> {
-    return effectiveContextEntries(await this.readContextEntries(key)).map(
+    return this.contextManager.selectActiveItems(
+      await this.readContextEntries(key),
+    ).map(
       (entry) => ({
         lineNumber: entry.lineNumber,
         message: entry.message,
         source: entry.source,
         ...(entry.createdAt === undefined ? {} : { createdAt: entry.createdAt }),
         ...(entry.eventId === undefined ? {} : { eventId: entry.eventId }),
+        lifecycleState: entry.lifecycleState,
       }),
     );
   }
@@ -354,27 +389,192 @@ export class WorkspaceSessionStore {
     prepared: PreparedChannelRunContext,
     currentEvent: SlackEvent,
     currentUserMessage: LlmMessage,
-    request: SessionCompactionRequest = {},
+    request: SessionRunCompactionRequest = {},
   ): Promise<RefreshedChannelRunContext> {
     const contextEntries = await this.readContextEntries(prepared.key);
+    const currentEntry = contextEntries.find(
+      (entry) => entry.eventId === currentEvent.eventId,
+    );
+    const projectionRequest = {
+      replaceEventMessage: {
+        eventId: currentEvent.eventId,
+        message: currentUserMessage,
+      },
+    };
+    const surface = this.contextManager.projectHistorySurface(contextEntries, {
+      projection: projectionRequest,
+      ...(request.modelRequest === undefined
+        ? {}
+        : { modelRequest: request.modelRequest }),
+      ...(currentEntry?.lineNumber === undefined
+        ? {}
+        : { preserveFromLineNumber: currentEntry.lineNumber }),
+      ...this.optionalPromptCacheHitRatio(prepared.key),
+    });
+    await this.persistProjectionLifecycle(
+      prepared.key,
+      contextEntries,
+      surface.microcompaction,
+    );
     const compaction = await this.compactIfNeeded(
       prepared.key,
       contextEntries,
-      request,
+      this.withModelRequestOverhead(
+        request,
+        surface.messages,
+        currentEntry?.lineNumber,
+        surface.microcompaction?.estimatedHistoryTokensAfter,
+        surface.protectedUserIntentTokens,
+      ),
     );
-    const messages = effectiveContextEntries(compaction.entries).map((entry) =>
-      entry.eventId === currentEvent.eventId
-        ? currentUserMessage
-        : entry.message);
-
+    const finalSurface = compaction.result?.triggered === true
+      ? this.contextManager.projectHistorySurface(compaction.entries, {
+          projection: projectionRequest,
+          ...(request.modelRequest === undefined
+            ? {}
+            : { modelRequest: request.modelRequest }),
+          ...(currentEntry?.lineNumber === undefined
+            ? {}
+            : { preserveFromLineNumber: currentEntry.lineNumber }),
+          ...this.optionalPromptCacheHitRatio(prepared.key),
+        })
+      : surface;
+    if (finalSurface !== surface) {
+      await this.persistProjectionLifecycle(
+        prepared.key,
+        compaction.entries,
+        finalSurface.microcompaction,
+      );
+    }
     return {
-      messages: repairToolCallMessageOrder(messages),
+      messages: finalSurface.messages,
       ...(compaction.result === undefined ? {} : { compaction: compaction.result }),
+      ...(finalSurface.microcompaction === undefined
+        ? {}
+        : { microcompaction: finalSurface.microcompaction }),
     };
+  }
+
+  async compactChannelRunMessagesIfNeeded(
+    prepared: PreparedChannelRunContext,
+    request: SessionRunCompactionRequest = {},
+  ): Promise<RefreshedChannelRunContext> {
+    const contextEntries = await this.readContextEntries(prepared.key);
+    const currentEntry = request.currentUserMessage === undefined
+      ? undefined
+      : [...contextEntries].reverse().find(
+          (entry) =>
+            entry.message.role === "user" &&
+            !entry.isCompactionSummary &&
+            (request.currentUserDurableContent === undefined ||
+              entry.message.content === request.currentUserDurableContent),
+        );
+    const projectionRequest =
+      request.currentUserMessage === undefined || currentEntry === undefined
+        ? {}
+        : {
+            replaceLineMessage: {
+              lineNumber: currentEntry.lineNumber,
+              message: request.currentUserMessage,
+            },
+          };
+    const surface = this.contextManager.projectHistorySurface(
+      contextEntries,
+      {
+        projection: projectionRequest,
+        ...(request.modelRequest === undefined
+          ? {}
+          : { modelRequest: request.modelRequest }),
+        ...(currentEntry?.lineNumber === undefined
+          ? {}
+          : { preserveFromLineNumber: currentEntry.lineNumber }),
+        ...this.optionalPromptCacheHitRatio(prepared.key),
+      },
+    );
+    await this.persistProjectionLifecycle(
+      prepared.key,
+      contextEntries,
+      surface.microcompaction,
+    );
+    const compaction = await this.compactIfNeeded(
+      prepared.key,
+      contextEntries,
+      this.withModelRequestOverhead(
+        request,
+        surface.messages,
+        currentEntry?.lineNumber,
+        surface.microcompaction?.estimatedHistoryTokensAfter,
+        surface.protectedUserIntentTokens,
+      ),
+    );
+    const finalSurface = compaction.result?.triggered === true
+      ? this.contextManager.projectHistorySurface(compaction.entries, {
+          projection: projectionRequest,
+          ...(request.modelRequest === undefined
+            ? {}
+            : { modelRequest: request.modelRequest }),
+          ...(currentEntry?.lineNumber === undefined
+            ? {}
+            : { preserveFromLineNumber: currentEntry.lineNumber }),
+          ...this.optionalPromptCacheHitRatio(prepared.key),
+        })
+      : surface;
+    if (finalSurface !== surface) {
+      await this.persistProjectionLifecycle(
+        prepared.key,
+        compaction.entries,
+        finalSurface.microcompaction,
+      );
+    }
+    return {
+      messages: finalSurface.messages,
+      ...(compaction.result === undefined ? {} : { compaction: compaction.result }),
+      ...(finalSurface.microcompaction === undefined
+        ? {}
+        : { microcompaction: finalSurface.microcompaction }),
+    };
+  }
+
+  observePromptCacheUsage(
+    key: ChannelSessionKey,
+    usage: ModelUsage | undefined,
+  ): void {
+    if (usage === undefined || usage.inputTokens <= 0) {
+      return;
+    }
+    const observed = Math.min(1, usage.cachedInputTokens / usage.inputTokens);
+    const cacheKey = channelCacheKey(key);
+    this.promptCacheByChannel.set(cacheKey, {
+      hitRatio: observed,
+      observedAtMs: this.clock().getTime(),
+    });
+  }
+
+  replaceModelHistoryMessages(
+    request: ModelRequest,
+    messages: readonly LlmMessage[],
+  ): ModelRequest {
+    return this.contextManager.replaceHistoryMessages(request, messages);
   }
 
   async readMemories(key: ChannelSessionKey): Promise<WorkspaceMemories> {
     return this.store.readMemories(key);
+  }
+
+  createToolResultArchiveHook(key: ChannelSessionKey): ToolResultArchiveHook {
+    const paths = this.store.getPaths(key);
+    return new ToolResultArchiveHook({
+      directory: `${paths.channelDir}/tool-results`,
+      locatorRoot: paths.rootDir,
+      clock: this.clock,
+      onError: (error) => {
+        this.store.recordWarning({
+          code: "tool_result_archive_failed",
+          filePath: `${paths.channelDir}/tool-results`,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      },
+    });
   }
 
   async recordRunRolloutSummary(
@@ -423,11 +623,22 @@ export class WorkspaceSessionStore {
     key: ChannelSessionKey,
   ): Promise<readonly StoredContextEntry[]> {
     const entries = await this.store.readContextEntries(key);
+    const lifecycleByLine = new Map<number, ContextLifecycleState>();
+    for (const entry of entries) {
+      for (const transition of parseLifecycleTransitions(entry.record)) {
+        lifecycleByLine.set(transition.lineNumber, transition.state);
+      }
+    }
     const parsed: StoredContextEntry[] = [];
     for (const entry of entries) {
       const contextEntry = this.parseContextEntry(entry);
       if (contextEntry !== null) {
-        parsed.push(contextEntry);
+        parsed.push({
+          ...contextEntry,
+          lifecycleState:
+            lifecycleByLine.get(contextEntry.lineNumber) ??
+            contextEntry.lifecycleState,
+        });
       }
     }
 
@@ -475,6 +686,9 @@ export class WorkspaceSessionStore {
 
   private parseContextEntry(entry: JsonlEntry): StoredContextEntry | null {
     const record = entry.record;
+    if (readString(record, "type") === "context_lifecycle") {
+      return null;
+    }
     if (readString(record, "type") !== "context_message") {
       this.warnInvalidContext(
         entry,
@@ -517,6 +731,12 @@ export class WorkspaceSessionStore {
     );
     const isCompactionSummary =
       source === "compaction" && compactionKind === "session_summary";
+    const summaryFacts = isCompactionSummary
+      ? parseSessionSummaryFacts(record.summaryFacts)
+      : undefined;
+    const summaryHierarchy = isCompactionSummary
+      ? parseSessionSummaryHierarchy(record.summaryHierarchy)
+      : undefined;
 
     return {
       lineNumber: entry.lineNumber,
@@ -533,6 +753,11 @@ export class WorkspaceSessionStore {
       ...optionalEventId(readString(record, "eventId")),
       ...(createdAt === undefined ? {} : { createdAt }),
       isCompactionSummary,
+      ...(summaryFacts === undefined ? {} : { summaryFacts }),
+      ...(summaryHierarchy === undefined ? {} : { summaryHierarchy }),
+      lifecycleState:
+        readLifecycleState(record.lifecycleState) ??
+        initialLifecycleState({ role, content }),
       ...optionalNumber(
         "coveredThroughLineNumber",
         coveredThroughLineNumber,
@@ -552,12 +777,22 @@ export class WorkspaceSessionStore {
       return { entries };
     }
 
-    const effectiveEntries = effectiveContextEntries(entries);
+    const effectiveEntries = this.contextManager.selectActiveItems(entries);
+    const durableSurface = this.contextManager.projectHistorySurface(entries);
+    const effectiveRequest: SessionCompactionRequest = {
+      ...request,
+      estimatedHistoryTokens:
+        request.estimatedHistoryTokens ??
+        this.contextManager.estimateMessages(durableSurface.messages),
+      protectedUserIntentTokens:
+        request.protectedUserIntentTokens ??
+        durableSurface.protectedUserIntentTokens,
+    };
     try {
       const result = await this.compactor.maybeCompact(
         effectiveEntries.map(toCompactableEntry),
         this.clock(),
-        request,
+        effectiveRequest,
       );
       if (!result.triggered) {
         return { entries, result };
@@ -568,6 +803,12 @@ export class WorkspaceSessionStore {
       }
 
       await this.store.appendContextRecord(key, result.summaryRecord);
+      await this.persistCompactionLifecycle(
+        key,
+        effectiveEntries,
+        result.coveredThroughLineNumber,
+      );
+      this.markPromptCacheEpochBoundary(key);
       return {
         entries: await this.readContextEntries(key),
         result,
@@ -576,6 +817,155 @@ export class WorkspaceSessionStore {
       this.warnCompactionFailed(key, error);
       return { entries };
     }
+  }
+
+  private withModelRequestOverhead(
+    request: SessionRunCompactionRequest,
+    projectedMessages: readonly LlmMessage[],
+    preserveFromLineNumber: number | undefined,
+    estimatedHistoryTokens: number | undefined,
+    protectedUserIntentTokens: number,
+  ): SessionCompactionRequest {
+    const {
+      modelRequest,
+      currentUserMessage: _currentUserMessage,
+      currentUserDurableContent: _currentUserDurableContent,
+      ...compactionRequest
+    } = request;
+    const protectedRequest = {
+      ...compactionRequest,
+      protectedUserIntentTokens,
+      ...(preserveFromLineNumber === undefined
+        ? {}
+        : { preserveFromLineNumber }),
+    };
+    const estimatedRequest = estimatedHistoryTokens === undefined
+      ? protectedRequest
+      : { ...protectedRequest, estimatedHistoryTokens };
+    if (modelRequest === undefined) {
+      return estimatedRequest;
+    }
+    const requestTokens = this.contextManager.estimateModelRequest(
+      this.contextManager.replaceHistoryMessages(
+        modelRequest,
+        projectedMessages,
+      ),
+    ).totalTokens;
+    const projectedMessageTokens = this.contextManager.estimateMessages(
+      projectedMessages,
+    );
+    return {
+      ...estimatedRequest,
+      additionalInputTokens: Math.max(
+        estimatedRequest.additionalInputTokens ?? 0,
+        requestTokens - projectedMessageTokens,
+        0,
+      ),
+    };
+  }
+
+  private optionalPromptCacheHitRatio(
+    key: ChannelSessionKey,
+  ): {
+    readonly recentCacheHitRatio?: number;
+    readonly cacheAgeMs?: number;
+    readonly cacheEpoch: number;
+  } {
+    const cacheKey = channelCacheKey(key);
+    const observation = this.promptCacheByChannel.get(cacheKey);
+    const cacheEpoch = this.promptCacheEpochByChannel.get(cacheKey) ?? 0;
+    if (observation === undefined) {
+      return { cacheEpoch };
+    }
+    return {
+      recentCacheHitRatio: observation.hitRatio,
+      cacheAgeMs: Math.max(0, this.clock().getTime() - observation.observedAtMs),
+      cacheEpoch,
+    };
+  }
+
+  private markPromptCacheEpochBoundary(key: ChannelSessionKey): void {
+    const cacheKey = channelCacheKey(key);
+    this.promptCacheByChannel.delete(cacheKey);
+    this.promptCacheEpochByChannel.set(
+      cacheKey,
+      (this.promptCacheEpochByChannel.get(cacheKey) ?? 0) + 1,
+    );
+  }
+
+  private async persistProjectionLifecycle(
+    key: ChannelSessionKey,
+    entries: readonly StoredContextEntry[],
+    microcompaction: MicrocompactResult | undefined,
+  ): Promise<void> {
+    if (microcompaction === undefined) {
+      return;
+    }
+    const prunedLines = new Set(
+      microcompaction.compactedItems.map((item) => item.lineNumber),
+    );
+    const activeLines = new Set(
+      this.contextManager.selectActiveItems(entries).map((entry) => entry.lineNumber),
+    );
+    const transitions = entries.flatMap((entry) => {
+      if (!activeLines.has(entry.lineNumber)) {
+        return [];
+      }
+      const desired = prunedLines.has(entry.lineNumber)
+        ? "Pruned" as const
+        : entry.lifecycleState === "Pruned"
+          ? initialLifecycleState(entry.message)
+          : entry.lifecycleState;
+      return desired === entry.lifecycleState
+        ? []
+        : [{ lineNumber: entry.lineNumber, state: desired }];
+    });
+    await this.appendLifecycleTransitions(key, transitions, "microcompact_projection");
+  }
+
+  private async persistCompactionLifecycle(
+    key: ChannelSessionKey,
+    entries: readonly StoredContextEntry[],
+    coveredThroughLineNumber: number | undefined,
+  ): Promise<void> {
+    if (coveredThroughLineNumber === undefined) {
+      return;
+    }
+    await this.appendLifecycleTransitions(
+      key,
+      entries
+        .filter((entry) =>
+          entry.lineNumber <= coveredThroughLineNumber &&
+          entry.lifecycleState !== "Stale")
+        .map((entry) => ({
+          lineNumber: entry.lineNumber,
+          state: "Stale" as const,
+        })),
+      "full_compact",
+    );
+  }
+
+  private async appendLifecycleTransitions(
+    key: ChannelSessionKey,
+    transitions: readonly {
+      readonly lineNumber: number;
+      readonly state: ContextLifecycleState;
+    }[],
+    reason: string,
+  ): Promise<void> {
+    if (transitions.length === 0) {
+      return;
+    }
+    await this.store.appendContextRecord(key, {
+      type: "context_lifecycle",
+      schemaVersion: 1,
+      reason,
+      transitions: transitions.map((transition) => ({
+        lineNumber: transition.lineNumber,
+        state: transition.state,
+      })),
+      createdAt: this.clock().toISOString(),
+    });
   }
 
   private warnInvalidLog(entry: JsonlEntry, message: string): void {
@@ -609,6 +999,10 @@ export class WorkspaceSessionStore {
           : "Session compaction failed with an unknown error",
     });
   }
+}
+
+function channelCacheKey(key: ChannelSessionKey): string {
+  return `${key.teamId}\u0000${key.channelId}`;
 }
 
 export function keyFromSlackEvent(event: SlackEvent): ChannelSessionKey {
@@ -661,7 +1055,7 @@ function userLogRecordToContextRecord(
 ): JsonObject {
   return {
     type: "context_message",
-    schemaVersion: 1,
+    schemaVersion: 2,
     role: "user",
     content: logRecord.text,
     source: "slack_log",
@@ -671,6 +1065,7 @@ function userLogRecordToContextRecord(
     userId: logRecord.userId,
     messageTs: logRecord.messageTs,
     createdAt: logRecord.receivedAt,
+    lifecycleState: "Active",
   };
 }
 
@@ -700,11 +1095,12 @@ function contextMessageToRecord(
 ): JsonObject {
   return {
     type: "context_message",
-    schemaVersion: 1,
+    schemaVersion: 2,
     role: message.role,
     content: message.content,
     source,
     createdAt: createdAt.toISOString(),
+    lifecycleState: initialLifecycleState(message),
     ...(message.toolCallId !== undefined
       ? { toolCallId: message.toolCallId }
       : {}),
@@ -742,6 +1138,64 @@ function readNumber(
 ): number | undefined {
   const value = record[key];
   return typeof value === "number" ? value : undefined;
+}
+
+function parseLifecycleTransitions(record: JsonObject): readonly {
+  readonly lineNumber: number;
+  readonly state: ContextLifecycleState;
+}[] {
+  if (readString(record, "type") !== "context_lifecycle") {
+    return [];
+  }
+  const value = record.transitions;
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((item) => {
+    if (!isJsonObject(item)) {
+      return [];
+    }
+    const lineNumber = readNumber(item, "lineNumber");
+    const state = readLifecycleState(item.state);
+    return lineNumber === undefined || state === undefined
+      ? []
+      : [{ lineNumber, state }];
+  });
+}
+
+function readLifecycleState(value: JsonValue | undefined):
+  | ContextLifecycleState
+  | undefined {
+  return value === "Active" ||
+      value === "Stale" ||
+      value === "Regenerable" ||
+      value === "Pruned"
+    ? value
+    : undefined;
+}
+
+function initialLifecycleState(
+  message: Pick<LlmMessage, "role" | "content">,
+): ContextLifecycleState {
+  if (message.role !== "tool") {
+    return "Active";
+  }
+  try {
+    const parsed: unknown = JSON.parse(message.content);
+    if (!isUnknownRecord(parsed)) {
+      return "Active";
+    }
+    const artifact = parsed.artifact;
+    return isUnknownRecord(artifact) && artifact.regenerable === true
+      ? "Regenerable"
+      : "Active";
+  } catch {
+    return "Active";
+  }
+}
+
+function isUnknownRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function readToolCalls(
@@ -843,35 +1297,6 @@ function optionalNumber<Key extends string>(
   return { [key]: value } as { readonly [Property in Key]: number };
 }
 
-function effectiveContextEntries(
-  entries: readonly StoredContextEntry[],
-): readonly StoredContextEntry[] {
-  const latestSummary = [...entries]
-    .reverse()
-    .find(
-      (entry) =>
-        entry.isCompactionSummary &&
-        entry.coveredThroughLineNumber !== undefined,
-    );
-
-  if (
-    latestSummary === undefined ||
-    latestSummary.coveredThroughLineNumber === undefined
-  ) {
-    return entries;
-  }
-  const coveredThroughLineNumber = latestSummary.coveredThroughLineNumber;
-
-  return [
-    latestSummary,
-    ...entries.filter(
-      (entry) =>
-        entry.lineNumber > coveredThroughLineNumber &&
-        entry.lineNumber !== latestSummary.lineNumber,
-    ),
-  ];
-}
-
 function toCompactableEntry(
   entry: StoredContextEntry,
 ): CompactableContextEntry {
@@ -885,6 +1310,10 @@ function toCompactableEntry(
       "coveredThroughLineNumber",
       entry.coveredThroughLineNumber,
     ),
+    ...(entry.summaryFacts === undefined ? {} : { summaryFacts: entry.summaryFacts }),
+    ...(entry.summaryHierarchy === undefined
+      ? {}
+      : { summaryHierarchy: entry.summaryHierarchy }),
   };
 }
 

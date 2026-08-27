@@ -395,16 +395,28 @@ export type ToolOutputByName = {
   readonly write: FileMutationOutput;
 };
 
+export interface ToolResultArtifactRef {
+  readonly kind: "tool_result_blob";
+  /** Store-root-relative locator, never an absolute host path. */
+  readonly path: string;
+  readonly sha256: string;
+  readonly bytes: number;
+  readonly toolName: string;
+  readonly regenerable: boolean;
+}
+
 export type ToolResult =
   | {
       readonly ok: true;
       readonly callId: ToolCallId;
       readonly output: unknown;
+      readonly artifact?: ToolResultArtifactRef;
     }
   | {
       readonly ok: false;
       readonly callId: ToolCallId;
       readonly error: ToolError;
+      readonly artifact?: ToolResultArtifactRef;
     };
 
 /**

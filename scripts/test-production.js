@@ -14,6 +14,7 @@ const vm = require("node:vm");
 const {
   calculateUsage,
   defaultUsagePricingForModel,
+  usagePricingFromEnv,
 } = require("../dist/app/usage");
 const { MinimalAgentLoop } = require("../dist/agent/agent-loop");
 const {
@@ -1774,10 +1775,17 @@ async function testWebUiSelfEvolutionModelClassification() {
         };
 
         if (modelRequests.length === 1) {
-          const userMessage = request.messages.at(-1);
+          const userMessage = [...request.messages]
+            .reverse()
+            .find((message) => message.role === "user");
+          assert.notEqual(userMessage, undefined);
           assert.equal(userMessage.role, "user");
           assert.match(userMessage.content, /请求 pibot 自进化/u);
           assert.match(userMessage.content, /原始请求：/u);
+          assert.match(
+            request.messages.at(-1).content,
+            /\[pibot-context:world-state\]/u,
+          );
           yield {
             type: "tool_call",
             call: {
@@ -3757,8 +3765,13 @@ function testKimiK26UsagePricing() {
 
   assert.equal(chinaPricing.strategy, "kimi-k2.6-cn");
   assert.equal(usage.uncachedInputTokens, 600_000);
+  assert.equal(usage.cacheHitRatio, 0.4);
+  assert.ok(Math.abs(usage.uncachedInputCost - 3.9) < 1e-12);
+  assert.ok(Math.abs(usage.cachedInputCost - 0.44) < 1e-12);
+  assert.ok(Math.abs(usage.outputCost - 5.4) < 1e-12);
+  assert.ok(Math.abs(usage.cacheSavings - 2.16) < 1e-12);
   assert.equal(usage.currency, "CNY");
-  assert.equal(usage.cost, 9.74);
+  assert.ok(Math.abs(usage.cost - 9.74) < 1e-12);
 
   const globalPricing = defaultUsagePricingForModel(
     "kimi-k2.6",
@@ -3766,6 +3779,18 @@ function testKimiK26UsagePricing() {
   );
   assert.equal(globalPricing.strategy, "kimi-k2.6-global");
   assert.equal(globalPricing.currency, "USD");
+
+  const overridden = usagePricingFromEnv(globalPricing, {
+    USAGE_COST_CURRENCY: "CNY",
+    USAGE_INPUT_COST_PER_1M_TOKENS: "2.5",
+    USAGE_CACHED_INPUT_COST_PER_1M_TOKENS: "0.5",
+    USAGE_OUTPUT_COST_PER_1M_TOKENS: "8",
+  });
+  assert.equal(overridden.strategy, "kimi-k2.6-global+env");
+  assert.equal(overridden.currency, "CNY");
+  assert.equal(overridden.inputCostPerMillionTokens, 2.5);
+  assert.equal(overridden.cachedInputCostPerMillionTokens, 0.5);
+  assert.equal(overridden.outputCostPerMillionTokens, 8);
 }
 
 async function testKimiStreamUsageParsing() {

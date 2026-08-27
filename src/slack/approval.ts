@@ -45,6 +45,24 @@ export class SlackToolApprovalBroker
 
   constructor(private readonly publisher: SlackEventPublisher) {}
 
+  pendingApprovalCount(conversation?: SlackConversationRef): number {
+    if (conversation === undefined) {
+      return this.pending.size;
+    }
+    let count = 0;
+    for (const pending of this.pending.values()) {
+      const current = pending.request.context.conversation;
+      if (
+        current.teamId === conversation.teamId &&
+        current.channelId === conversation.channelId &&
+        current.threadTs === conversation.threadTs
+      ) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
   async requestToolApproval(
     request: ToolApprovalPromptRequest,
     signal?: AbortSignal,

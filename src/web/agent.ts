@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { MinimalAgentLoop } from "../agent/agent-loop";
-import { RetryingModelClient } from "../agent/model";
 import {
-  buildCodingAgentSystemPrompt,
+  RetryingModelClient,
+  type ModelRequest,
+} from "../agent/model";
+import {
+  buildCodingAgentPromptParts,
   formatChannelWorkspacePrompt,
 } from "../agent/system-prompt";
 import type { AgentLoopEvent } from "../agent/events";
@@ -48,6 +51,8 @@ import {
   AgentRunController,
   type RuntimeTransition,
 } from "../runtime/run-controller";
+import { WorkingSetHook } from "../runtime/working-set";
+import { createRuntimeWorldStateProvider } from "../runtime/world-state";
 import { scanWorkspaceSkills } from "../workspace/skills";
 import type { ChannelWorkspaceStore } from "../workspace/store";
 import { FileTaskStore } from "../workspace/tasks";
@@ -65,8 +70,10 @@ import { createToolApprovalGate } from "../tools/approval";
 import type { SandboxExecutor } from "../workspace/sandbox";
 import type {
   ChannelContextMessage,
+  PreparedChannelRunContext,
   WorkspaceSessionStore,
 } from "../workspace/session";
+import type { SessionCompactionResult } from "../workspace/compaction";
 import type { ChildAgentRunStore } from "../workspace/child-agents";
 import type { EvolutionController } from "../evolution/controller";
 import {
@@ -119,6 +126,7 @@ export interface WebAgentRunnerOptions {
   readonly model: RetryingModelClient;
   readonly tools: readonly LlmToolSchema[];
   readonly sandboxExecutor: SandboxExecutor;
+  readonly sandboxLabel?: string;
   readonly toolApprovalMode: ToolApprovalMode;
   readonly toolLimits: Required<Pick<
     CodingToolExecutorOptions,
@@ -137,6 +145,7 @@ export interface WebAgentRunnerOptions {
   readonly maxOutputTokens?: number;
   readonly maxSteps: number;
   readonly maxParallelToolCalls?: number;
+  readonly runtimeHooks?: readonly RuntimeHook[];
   readonly disabledSkills?: readonly string[];
   readonly maxSkills?: number;
   readonly maxSkillFileBytes?: number;
@@ -430,6 +439,16 @@ export class WebAgentRunner {
       ok: true,
       approval,
     };
+  }
+
+  private pendingApprovalCount(runId: AgentRunId): number {
+    let count = 0;
+    for (const pending of this.pendingApprovals.values()) {
+      if (!pending.settled && pending.runId === runId) {
+        count += 1;
+      }
+    }
+    return count;
   }
 
   async generateConversationTitle(
@@ -757,11 +776,22 @@ export class WebAgentRunner {
           new RuntimeModeHook({
             state: runContext.state,
             describeTool: (name) => runTools.describeTool(name),
+            worldState: createRuntimeWorldStateProvider({
+              workspaceRoot: runWorkspaceRoot,
+              ...(this.options.sandboxLabel === undefined
+                ? {}
+                : { sandboxLabel: this.options.sandboxLabel }),
+              approvalMode: this.options.toolApprovalMode,
+              pendingApprovalCount: () =>
+                this.pendingApprovalCount(runContext.runId),
+              ...(childAgents === undefined ? {} : { childAgents }),
+            }),
           }),
+          ...(this.options.runtimeHooks ?? []),
           new CompletedToolReplayGuard(active.completedToolCallFingerprints),
         ],
       });
-      let systemPrompt = buildCodingAgentSystemPrompt({
+      let promptParts = buildCodingAgentPromptParts({
         tools: runToolSchemas,
         memories: prepared.memories,
         workspaceSkills: workspaceSkills.skills,
@@ -780,8 +810,58 @@ export class WebAgentRunner {
           ? {}
           : { thinkingLanguage: this.options.thinkingLanguage }),
       });
+      let systemPrompt = promptParts.stableSystemPrompt;
+      let dynamicContext = promptParts.dynamicContext;
+      const modelUserText = selfEvolutionRequest === undefined
+        ? text
+        : formatSelfEvolutionTicketPrompt(text);
 
       let runPrepared = prepared;
+      let completedGeneratedMessages = 0;
+      const workingSetHook = new WorkingSetHook({
+        workspaceRoot: runWorkspaceRoot,
+      });
+      const toolResultArchiveHook =
+        this.options.sessions.createToolResultArchiveHook(key);
+      const realtimeCompactionHook: RuntimeHook = {
+        beforeModelCall: async (context) => {
+          const refreshed =
+            await this.options.sessions.compactChannelRunMessagesIfNeeded(
+              runPrepared,
+              {
+                modelRequest: context.request,
+                currentUserMessage: {
+                  role: "user",
+                  content: modelUserText,
+                },
+                currentUserDurableContent: text,
+                signal: active.control.signal,
+              },
+            );
+          if (refreshed.compaction?.triggered !== true) {
+            return this.options.sessions.replaceModelHistoryMessages(
+              context.request,
+              refreshed.messages,
+            );
+          }
+          await emitWebEvent(active.onEvent, {
+            type: "status",
+            conversationId,
+            runId: runContext.runId,
+            message: formatWebCompactionStatus(refreshed.compaction),
+          });
+          return this.options.sessions.replaceModelHistoryMessages(
+            context.request,
+            refreshed.messages,
+          );
+        },
+        afterModelCall: (context) => {
+          this.options.sessions.observePromptCacheUsage(
+            runPrepared.key,
+            context.result.usage,
+          );
+        },
+      };
       const result = await active.control.run({
         execute: () => {
           const runHistory = historyWithoutCurrentUser(prepared.history, text);
@@ -790,15 +870,19 @@ export class WebAgentRunner {
             history: runHistory,
             generatedMessageStartIndex: runHistory.length + 2,
           };
+          completedGeneratedMessages = 0;
           return agentLoop.run(
             {
-              userText:
-                selfEvolutionRequest === undefined
-                  ? text
-                  : formatSelfEvolutionTicketPrompt(text),
+              userText: modelUserText,
               systemPrompt,
+              ...(dynamicContext === undefined ? {} : { dynamicContext }),
               history: runHistory,
               tools: runToolSchemas,
+              postHooks: [
+                realtimeCompactionHook,
+                workingSetHook,
+                toolResultArchiveHook,
+              ],
               maxSteps: this.options.maxSteps,
               ...(this.options.maxParallelToolCalls === undefined
                 ? {}
@@ -814,6 +898,13 @@ export class WebAgentRunner {
                 ? {}
                 : { maxOutputTokens: this.options.maxOutputTokens }),
               onEvent: async (event) => {
+                if (event.type === "message_completed") {
+                  completedGeneratedMessages += 1;
+                  await this.options.sessions.appendGeneratedMessage(
+                    runPrepared,
+                    event.message,
+                  );
+                }
                 await emitWebEvent(active.onEvent, {
                   type: "agent_event",
                   conversationId,
@@ -831,10 +922,13 @@ export class WebAgentRunner {
             shouldRecover: (attemptResult) =>
               attemptResult.error?.code === "context_overflow",
             recover: async (_attempt, attemptResult) => {
-              await this.options.sessions.appendRunMessages(
-                runPrepared,
-                attemptResult.messages,
-              );
+              completedGeneratedMessages =
+                await appendRemainingWebRunMessages(
+                  this.options.sessions,
+                  runPrepared,
+                  completedGeneratedMessages,
+                  attemptResult.messages,
+                );
               await emitWebEvent(active.onEvent, {
                 type: "status",
                 conversationId,
@@ -858,7 +952,7 @@ export class WebAgentRunner {
               prepared = await this.options.sessions.prepareChannelRun(key, {
                 signal: active.control.signal,
               });
-              systemPrompt = buildCodingAgentSystemPrompt({
+              promptParts = buildCodingAgentPromptParts({
                 tools: runToolSchemas,
                 memories: prepared.memories,
                 workspaceSkills: workspaceSkills.skills,
@@ -877,6 +971,8 @@ export class WebAgentRunner {
                   ? {}
                   : { thinkingLanguage: this.options.thinkingLanguage }),
               });
+              systemPrompt = promptParts.stableSystemPrompt;
+              dynamicContext = promptParts.dynamicContext;
               return true;
             },
           },
@@ -886,7 +982,12 @@ export class WebAgentRunner {
 
       reason = result.reason;
       errorCode = result.error?.code;
-      await this.options.sessions.appendRunMessages(prepared, result.messages);
+      await appendRemainingWebRunMessages(
+        this.options.sessions,
+        prepared,
+        completedGeneratedMessages,
+        result.messages,
+      );
       if (
         result.error === undefined ||
         active.failureMemoryPolicy !== "experience"
@@ -1449,13 +1550,26 @@ export class WebAgentRunner {
           new RuntimeModeHook({
             state: runContext.state,
             describeTool: (name) => runTools.describeTool(name),
+            worldState: createRuntimeWorldStateProvider({
+              workspaceRoot: implementationWorkspaceRoot,
+              ...(this.options.sandboxLabel === undefined
+                ? {}
+                : { sandboxLabel: this.options.sandboxLabel }),
+              approvalMode: evolutionImplementationApprovalMode(
+                this.options.toolApprovalMode,
+              ),
+              pendingApprovalCount: () =>
+                this.pendingApprovalCount(runContext.runId),
+            }),
           }),
+          ...(this.options.runtimeHooks ?? []),
+          new WorkingSetHook({ workspaceRoot: implementationWorkspaceRoot }),
           new CompletedToolReplayGuard(
             new Set(workflowAttempt?.completedToolCallFingerprints ?? []),
           ),
         ],
       });
-      const systemPrompt = buildCodingAgentSystemPrompt({
+      const promptParts = buildCodingAgentPromptParts({
         tools: runToolSchemas,
         memories: prepared.memories,
         workspaceSkills: workspaceSkills.skills,
@@ -1486,12 +1600,19 @@ export class WebAgentRunner {
           ? {}
           : { thinkingLanguage: this.options.thinkingLanguage }),
       });
+      const systemPrompt = promptParts.stableSystemPrompt;
       const result = await agentLoop.run(
         {
           userText: prompt,
           systemPrompt,
+          ...(promptParts.dynamicContext === undefined
+            ? {}
+            : { dynamicContext: promptParts.dynamicContext }),
           history: implementationHistory,
           tools: runToolSchemas,
+          postHooks: [
+            this.options.sessions.createToolResultArchiveHook(prepared.key),
+          ],
           maxSteps: this.options.maxSteps,
           ...(this.options.maxParallelToolCalls === undefined
             ? {}
@@ -2466,6 +2587,31 @@ function truncateSummary(value: string, maxLen: number): string {
     return value;
   }
   return value.slice(0, maxLen - 1) + "...";
+}
+
+async function appendRemainingWebRunMessages(
+  sessions: WorkspaceSessionStore,
+  prepared: PreparedChannelRunContext,
+  completedGeneratedMessages: number,
+  messages: readonly LlmMessage[],
+): Promise<number> {
+  let completed = completedGeneratedMessages;
+  const generatedMessages = messages.slice(prepared.generatedMessageStartIndex);
+  for (const message of generatedMessages.slice(completed)) {
+    completed += 1;
+    await sessions.appendGeneratedMessage(prepared, message);
+  }
+  return completed;
+}
+
+function formatWebCompactionStatus(result: SessionCompactionResult): string {
+  const after = result.estimatedTokensAfter === undefined
+    ? "unknown"
+    : `${result.estimatedTokensAfter} estimated tokens`;
+  return (
+    `Context compacted before the next model step: ` +
+    `${result.estimatedTokensBefore} -> ${after}.`
+  );
 }
 
 function historyWithoutCurrentUser(

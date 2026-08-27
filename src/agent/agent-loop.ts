@@ -41,6 +41,7 @@ import type {
   AgentLoopEventHandler,
 } from "./events";
 import { modelErrorToAgentLoopError } from "./events";
+import { DynamicContextHook } from "../workspace/context-manager";
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
 
@@ -56,9 +57,12 @@ export interface MinimalAgentLoopInput {
   readonly userText: string;
   readonly userContentParts?: readonly LlmMessageContentPart[];
   readonly systemPrompt: string;
+  readonly dynamicContext?: string;
   readonly history: readonly LlmMessage[];
   readonly tools: readonly LlmToolSchema[];
   readonly hooks?: readonly RuntimeHook[];
+  /** Runs after loop-level hooks, once runtime/world-state projection is final. */
+  readonly postHooks?: readonly RuntimeHook[];
   readonly maxSteps: number;
   readonly maxParallelToolCalls?: number;
   readonly runContext?: AgentRunContext;
@@ -110,8 +114,12 @@ export class MinimalAgentLoop {
     );
     const run = input.runContext ?? createAgentRunContext();
     const hooks = new RuntimeHookRunner([
+      ...(input.dynamicContext === undefined || input.dynamicContext.length === 0
+        ? []
+        : [new DynamicContextHook(input.dynamicContext)]),
       ...(input.hooks ?? []),
       ...this.baseHooks,
+      ...(input.postHooks ?? []),
     ]);
     const toolScheduler = this.dependencies.toolScheduler ?? new BoundedToolScheduler({
       tools: this.dependencies.tools,
