@@ -328,8 +328,10 @@ export class RuntimeModeHook implements RuntimeHook {
   }
 
   async beforeModelCall(context: RuntimeModelCallHookContext) {
-    const request = this.contextManager.projectSystemLane(context.request, {
+    const request = this.contextManager.projectContextLane(context.request, {
       id: "world-state",
+      authority: "developer",
+      kind: "state",
       placement: "dynamic_tail",
       content: await renderWorldStateMessage(
         this.options.state,

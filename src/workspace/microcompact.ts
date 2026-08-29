@@ -27,7 +27,7 @@ export interface MicrocompactPolicyOptions {
 
 export interface MicrocompactProjectionRequest {
   readonly modelRequest: ModelRequest;
-  /** Stable System + Tool-schema tokens before durable history. */
+  /** Stable System/Developer + Tool-schema tokens before durable history. */
   readonly stablePrefixTokens?: number;
   readonly preserveFromLineNumber?: number;
   readonly recentCacheHitRatio?: number;
@@ -629,16 +629,16 @@ function withProjectedMessages(
 ): ModelRequest {
   return {
     ...request,
-    messages: [...leadingSystemMessages(request.messages), ...messages],
+    messages: [...leadingAuthorityMessages(request.messages), ...messages],
   };
 }
 
-function leadingSystemMessages(
+function leadingAuthorityMessages(
   messages: readonly LlmMessage[],
 ): readonly LlmMessage[] {
   const leading: LlmMessage[] = [];
   for (const message of messages) {
-    if (message.role !== "system") {
+    if (message.role !== "system" && message.role !== "developer") {
       break;
     }
     leading.push(message);

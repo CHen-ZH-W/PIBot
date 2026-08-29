@@ -122,7 +122,11 @@ async function acceptsWorldStateProjection() {
   });
 
   assert.equal(first.messages.length, 2);
+  assert.equal(first.messages[1].role, "developer");
   assert.match(first.messages[1].content, /\[pibot-context:world-state\]/u);
+  assert.match(first.messages[1].content, /pibot-context-authority:developer/u);
+  assert.match(first.messages[1].content, /pibot-context-kind:state/u);
+  assert.match(first.messages[1].content, /pibot-context-placement:dynamic-tail/u);
   assert.match(first.messages[1].content, /"mode": "plan"/u);
   assert.match(first.messages[1].content, /"status": "pending"/u);
   assert.match(first.messages[1].content, /tasks\.json/u);
@@ -1314,7 +1318,11 @@ async function acceptsTraceReplay() {
   const model = {
     async *stream() {
       requests += 1;
-      yield startEvent("trace-model");
+      yield {
+        ...startEvent("trace-model"),
+        developerRoleMode: "native",
+        authorityDegraded: false,
+      };
       if (requests === 1) {
         yield toolCall("trace-write", "write", {
           path: "trace.txt",
@@ -1346,6 +1354,13 @@ async function acceptsTraceReplay() {
   }).run({
     userText: "create trace file",
     systemPrompt: "Use tools.",
+    contextLanes: [{
+      id: "trace-developer",
+      authority: "developer",
+      kind: "instruction",
+      placement: "stable_prefix",
+      content: "Trace developer authority.",
+    }],
     history: [],
     tools: getCodingToolSchemas(),
     maxSteps: 3,
@@ -1377,8 +1392,14 @@ async function acceptsTraceReplay() {
   assert.equal(records.every((record) => record.runId === run.runId), true);
   assert.equal(records.every((record) => record.parentRunId === run.parentRunId), true);
   assert.equal(records.every((record) => record.agentId === run.agentId), true);
+  const modelStarted = records.find((record) => record.type === "model.started");
+  assert.equal(modelStarted.messageRoleCounts.system, 1);
+  assert.equal(modelStarted.messageRoleCounts.developer, 1);
+  assert.equal(modelStarted.messageRoleCounts.user, 1);
   const modelCompleted = records.find((record) => record.type === "model.completed");
   assert.equal(modelCompleted.retryCount, 0);
+  assert.equal(modelCompleted.developerRoleMode, "native");
+  assert.equal(modelCompleted.authorityDegraded, false);
   assert.equal(modelCompleted.usage.totalTokens, 13);
   assert.equal(modelCompleted.cost, 0.01);
 }

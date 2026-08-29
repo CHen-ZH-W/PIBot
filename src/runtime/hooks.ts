@@ -1,4 +1,8 @@
-import type { ModelRequest, ModelUsage } from "../agent/model";
+import type {
+  DeveloperRoleMode,
+  ModelRequest,
+  ModelUsage,
+} from "../agent/model";
 import type { AgentLoopError, AgentEndReason } from "../agent/events";
 import type {
   ToolCall,
@@ -10,6 +14,8 @@ import type { AgentRunContext, AgentStepContext } from "./context";
 export interface RuntimeModelCallResult {
   readonly model?: string;
   readonly provider?: string;
+  readonly developerRoleMode?: DeveloperRoleMode;
+  readonly authorityDegraded?: boolean;
   readonly finishReason?: string;
   readonly usage?: ModelUsage;
   readonly retryCount: number;

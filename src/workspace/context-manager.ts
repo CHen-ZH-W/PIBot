@@ -2,6 +2,7 @@ import type { ModelRequest } from "../agent/model";
 import type {
   LlmMessage,
   LlmMessageContentPart,
+  LlmMessageContextLane,
   LlmToolSchema,
 } from "../core/agent";
 import type { SlackEventId } from "../core/ids";
@@ -14,6 +15,11 @@ import {
 } from "./microcompact";
 
 const CONTEXT_LANE_PREFIX = "[pibot-context:";
+const AUTHORITY_MARKER_PREFIX = "[pibot-context-authority:";
+const KIND_MARKER_PREFIX = "[pibot-context-kind:";
+const STABLE_PREFIX_MARKER = "[pibot-context-placement:stable-prefix]";
+const BEFORE_CURRENT_USER_MARKER =
+  "[pibot-context-placement:before-current-user]";
 const DYNAMIC_TAIL_MARKER = "[pibot-context-placement:dynamic-tail]";
 const STEERING_MESSAGE_PREFIX = "Steering message received during this run:\n";
 const DEFAULT_IMAGE_TOKENS = 1_700;
@@ -42,10 +48,22 @@ export interface ContextHistoryProjectionRequest {
   };
 }
 
-export interface ContextSystemLane {
+export type ContextLaneAuthority =
+  | "system"
+  | "developer"
+  | "user"
+  | "assistant";
+
+export type ContextLaneKind = LlmMessageContextLane["kind"];
+
+export type ContextLanePlacement = LlmMessageContextLane["placement"];
+
+export interface ContextLane {
   readonly id: string;
+  readonly authority: ContextLaneAuthority;
+  readonly kind: ContextLaneKind;
   readonly content: string;
-  readonly placement?: "stable_prefix" | "dynamic_tail";
+  readonly placement: ContextLanePlacement;
 }
 
 export interface ContextManagerOptions {
@@ -197,25 +215,30 @@ export class ContextManager {
     };
   }
 
-  /**
-   * Adds or replaces a named model-only system lane. Durable history remains
-   * untouched, while current runtime truth can be refreshed for every step.
-   */
-  projectSystemLane(
+  /** Adds or replaces a named, explicitly-authorized model-only context lane. */
+  projectContextLane(
     request: ModelRequest,
-    lane: ContextSystemLane,
+    lane: ContextLane,
   ): ModelRequest {
-    const marker = contextLaneMarker(lane.id);
+    const normalizedId = normalizeContextLaneId(lane.id);
+    const marker = contextLaneMarker(normalizedId);
     const laneMessage: LlmMessage = {
-      role: "system",
+      role: lane.authority,
+      contextLane: {
+        id: normalizedId,
+        kind: lane.kind,
+        placement: lane.placement,
+      },
       content: [
         marker,
-        ...(lane.placement === "dynamic_tail" ? [DYNAMIC_TAIL_MARKER] : []),
+        `${AUTHORITY_MARKER_PREFIX}${lane.authority}]`,
+        `${KIND_MARKER_PREFIX}${lane.kind}]`,
+        placementMarker(lane.placement),
         lane.content,
       ].join("\n"),
     };
     const messages = request.messages.filter(
-      (message) => !isContextLaneMessage(message, marker),
+      (message) => !isContextLaneMessage(message, normalizedId),
     );
     if (lane.placement === "dynamic_tail") {
       return {
@@ -223,17 +246,21 @@ export class ContextManager {
         messages: [...messages, laneMessage],
       };
     }
-    const [first, ...rest] = messages;
-    if (first?.role === "system") {
+    if (lane.placement === "before_current_user") {
       return {
         ...request,
-        messages: [first, laneMessage, ...rest],
+        messages: insertBeforeCurrentUser(messages, laneMessage),
       };
     }
 
+    const boundary = stablePrefixBoundary(messages);
     return {
       ...request,
-      messages: [laneMessage, ...messages],
+      messages: [
+        ...messages.slice(0, boundary),
+        laneMessage,
+        ...messages.slice(boundary),
+      ],
     };
   }
 
@@ -242,10 +269,17 @@ export class ContextManager {
     history: readonly LlmMessage[],
   ): ModelRequest {
     const stablePrefix = stablePrefixMessages(request.messages);
+    const beforeCurrentUserLanes = request.messages.filter(
+      isBeforeCurrentUserLaneMessage,
+    );
     const dynamicLanes = dynamicTailMessages(request.messages);
+    let messages = [...stablePrefix, ...history, ...dynamicLanes];
+    for (const lane of beforeCurrentUserLanes) {
+      messages = insertBeforeCurrentUser(messages, lane);
+    }
     return {
       ...request,
-      messages: [...stablePrefix, ...history, ...dynamicLanes],
+      messages,
     };
   }
 
@@ -296,23 +330,22 @@ export class ContextManager {
   }
 }
 
-/** Keeps refreshable prompt material at the append-only dynamic tail per step. */
-export class DynamicContextHook implements RuntimeHook {
+/** Projects authority-typed context lanes on every model step. */
+export class ContextLanesHook implements RuntimeHook {
   private readonly contextManager: ContextManager;
 
   constructor(
-    private readonly content: string,
+    private readonly lanes: readonly ContextLane[],
     contextManager?: ContextManager,
   ) {
     this.contextManager = contextManager ?? new ContextManager();
   }
 
   beforeModelCall(context: RuntimeModelCallHookContext): ModelRequest {
-    return this.contextManager.projectSystemLane(context.request, {
-      id: "run-context",
-      placement: "dynamic_tail",
-      content: this.content,
-    });
+    return this.lanes.reduce(
+      (request, lane) => this.contextManager.projectContextLane(request, lane),
+      context.request,
+    );
   }
 }
 
@@ -363,9 +396,11 @@ function projectSurfaceItems<Item extends DurableContextItem>(
   const header: MicrocompactSurfaceItem = {
     lineNumber: latestSummary.lineNumber,
     message: {
-      role: "system",
+      role: "developer",
       content: [
         "[pibot-context:exact-user-intent]",
+        "[pibot-context-authority:developer]",
+        "[pibot-context-kind:instruction]",
         "The following are historical user messages covered by the checkpoint. Their user-role content is reproduced verbatim and remains authoritative. Preserve their constraints, but do not mistake them for the newest request.",
       ].join("\n"),
     },
@@ -423,28 +458,69 @@ function projectItems<Item extends DurableContextItem>(
 }
 
 function contextLaneMarker(id: string): string {
+  return `${CONTEXT_LANE_PREFIX}${id}]`;
+}
+
+function normalizeContextLaneId(id: string): string {
   const normalized = id.trim().toLowerCase().replace(/[^a-z0-9_-]+/gu, "-");
   if (normalized.length === 0) {
-    throw new Error("Context system lane id must not be empty");
+    throw new Error("Context lane id must not be empty");
   }
-  return `${CONTEXT_LANE_PREFIX}${normalized}]`;
+  return normalized;
 }
 
-function isContextLaneMessage(message: LlmMessage, marker: string): boolean {
-  return message.role === "system" && message.content.startsWith(`${marker}\n`);
+function isContextLaneMessage(message: LlmMessage, id: string): boolean {
+  return message.contextLane?.id === id;
 }
 
-function isAnyContextLaneMessage(message: LlmMessage): boolean {
-  return message.role === "system" && message.content.startsWith(
-    CONTEXT_LANE_PREFIX,
-  );
+export function isModelContextLaneMessage(message: LlmMessage): boolean {
+  return message.contextLane !== undefined;
+}
+
+export function isProjectedContextLaneMessage(message: LlmMessage): boolean {
+  return message.contextLane !== undefined;
+}
+
+function placementMarker(placement: ContextLanePlacement): string {
+  switch (placement) {
+    case "stable_prefix":
+      return STABLE_PREFIX_MARKER;
+    case "before_current_user":
+      return BEFORE_CURRENT_USER_MARKER;
+    case "dynamic_tail":
+      return DYNAMIC_TAIL_MARKER;
+  }
+}
+
+function isBeforeCurrentUserLaneMessage(message: LlmMessage): boolean {
+  return message.contextLane?.placement === "before_current_user";
+}
+
+function insertBeforeCurrentUser(
+  messages: readonly LlmMessage[],
+  lane: LlmMessage,
+): LlmMessage[] {
+  let currentUserIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (message.role === "user" && !isModelContextLaneMessage(message)) {
+      currentUserIndex = index;
+      break;
+    }
+  }
+  const boundary = currentUserIndex >= 0
+    ? currentUserIndex
+    : dynamicTailStartIndex(messages);
+  return [
+    ...messages.slice(0, boundary),
+    lane,
+    ...messages.slice(boundary),
+  ];
 }
 
 function isDynamicTailMessage(message: LlmMessage): boolean {
   return (
-    (isAnyContextLaneMessage(message) &&
-      typeof message.content === "string" &&
-      message.content.includes(DYNAMIC_TAIL_MARKER)) ||
+    message.contextLane?.placement === "dynamic_tail" ||
     (message.role === "user" &&
       typeof message.content === "string" &&
       message.content.startsWith(STEERING_MESSAGE_PREFIX))
@@ -454,27 +530,37 @@ function isDynamicTailMessage(message: LlmMessage): boolean {
 function dynamicTailMessages(
   messages: readonly LlmMessage[],
 ): readonly LlmMessage[] {
+  return messages.slice(dynamicTailStartIndex(messages));
+}
+
+function dynamicTailStartIndex(messages: readonly LlmMessage[]): number {
   let startIndex = messages.length;
-  while (
-    startIndex > 0 &&
-    isDynamicTailMessage(messages[startIndex - 1] as LlmMessage)
-  ) {
+  while (startIndex > 0 && isDynamicTailMessage(messages[startIndex - 1]!)) {
     startIndex -= 1;
   }
-  return messages.slice(startIndex);
+  return startIndex;
+}
+
+function stablePrefixBoundary(messages: readonly LlmMessage[]): number {
+  let boundary = 0;
+  while (boundary < messages.length) {
+    const message = messages[boundary]!;
+    if (
+      (message.role !== "system" && message.role !== "developer") ||
+      isDynamicTailMessage(message) ||
+      isBeforeCurrentUserLaneMessage(message)
+    ) {
+      break;
+    }
+    boundary += 1;
+  }
+  return boundary;
 }
 
 function stablePrefixMessages(
   messages: readonly LlmMessage[],
 ): readonly LlmMessage[] {
-  const stablePrefix: LlmMessage[] = [];
-  for (const message of messages) {
-    if (message.role !== "system" || isDynamicTailMessage(message)) {
-      break;
-    }
-    stablePrefix.push(message);
-  }
-  return stablePrefix;
+  return messages.slice(0, stablePrefixBoundary(messages));
 }
 
 function estimateMessageTokens(messages: readonly LlmMessage[]): {

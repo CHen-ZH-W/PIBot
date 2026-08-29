@@ -1,6 +1,6 @@
 import { appendFile, mkdir, stat } from "node:fs/promises";
 import * as path from "node:path";
-import type { ModelUsage } from "../agent/model";
+import type { ModelRequest, ModelUsage } from "../agent/model";
 import type { ToolApprovalDecision, ToolApprovalRequest } from "../core/tools";
 import {
   ContextManager,
@@ -108,6 +108,7 @@ export class TraceRuntimeHook implements RuntimeHook {
       userTurnId: context.stepContext.userTurnId,
       stateVersion: context.stepContext.stateVersion,
       messageCount: context.request.messages.length,
+      messageRoleCounts: countMessageRoles(context.request),
       toolCount: context.request.tools.length,
       estimatedInputTokens: estimate.totalTokens,
       estimatedMessageTokens: estimate.messageTokens,
@@ -141,6 +142,8 @@ export class TraceRuntimeHook implements RuntimeHook {
       stepId: context.stepContext.stepId,
       provider: context.result.provider,
       model: context.result.model,
+      developerRoleMode: context.result.developerRoleMode,
+      authorityDegraded: context.result.authorityDegraded,
       finishReason: context.result.finishReason,
       usage: context.result.usage,
       retryCount: context.result.retryCount,
@@ -198,6 +201,14 @@ export class TraceRuntimeHook implements RuntimeHook {
   private async record(event: TraceEvent): Promise<void> {
     await this.options.recorder.record(event).catch(() => undefined);
   }
+}
+
+function countMessageRoles(request: ModelRequest): Readonly<Record<string, number>> {
+  const counts: Record<string, number> = {};
+  for (const message of request.messages) {
+    counts[message.role] = (counts[message.role] ?? 0) + 1;
+  }
+  return counts;
 }
 
 export function createTraceApprovalObserver(

@@ -64,6 +64,10 @@ import type {
 } from "../workspace/compaction";
 import type { MicrocompactResult } from "../workspace/microcompact";
 import {
+  isProjectedContextLaneMessage,
+  type ContextLane,
+} from "../workspace/context-manager";
+import {
   scanWorkspaceSkills,
   type WorkspaceSkill,
 } from "../workspace/skills";
@@ -449,6 +453,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     let usageInput:
       | {
           readonly systemPrompt: string;
+          readonly contextLanes: readonly ContextLane[];
           readonly history: readonly LlmMessage[];
           readonly userText: string;
         }
@@ -532,10 +537,10 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
           : { thinkingLanguage: this.options.thinkingLanguage }),
       });
       let systemPrompt = promptParts.stableSystemPrompt;
-      let dynamicContext = promptParts.dynamicContext;
+      let contextLanes = promptParts.contextLanes;
       usageInput = {
         systemPrompt,
-        ...(dynamicContext === undefined ? {} : { dynamicContext }),
+        contextLanes,
         history: preparedRun.history,
         userText: event.text,
       };
@@ -567,7 +572,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
             userText: event.text,
             userContentParts: input.userContentParts,
             systemPrompt,
-            ...(dynamicContext === undefined ? {} : { dynamicContext }),
+            contextLanes,
             history: preparedRun.history,
             tools: this.options.tools,
             postHooks: [
@@ -671,10 +676,10 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
                   : { thinkingLanguage: this.options.thinkingLanguage }),
               });
               systemPrompt = promptParts.stableSystemPrompt;
-              dynamicContext = promptParts.dynamicContext;
+              contextLanes = promptParts.contextLanes;
               usageInput = {
                 systemPrompt,
-                ...(dynamicContext === undefined ? {} : { dynamicContext }),
+                contextLanes,
                 history: preparedRun.history,
                 userText: event.text,
               };
@@ -689,7 +694,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
               persistence,
               initialResult,
               systemPrompt,
-              ...(dynamicContext === undefined ? {} : { dynamicContext }),
+              contextLanes,
               userText: event.text,
               signal: active.control.signal,
             }),
@@ -835,7 +840,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     readonly persistence: RunPersistenceState;
     readonly initialResult: AgentLoopResult;
     readonly systemPrompt: string;
-    readonly dynamicContext?: string;
+    readonly contextLanes: readonly ContextLane[];
     readonly userText: string;
     readonly signal: AbortSignal;
   }): Promise<AgentLoopResult> {
@@ -880,9 +885,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
             verifyCommands: options.verifyCommands ?? [],
           }),
           systemPrompt: input.systemPrompt,
-          ...(input.dynamicContext === undefined
-            ? {}
-            : { dynamicContext: input.dynamicContext }),
+          contextLanes: input.contextLanes,
           history,
           tools: this.options.tools,
           maxSteps,
@@ -1424,7 +1427,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     usageInput:
       | {
           readonly systemPrompt: string;
-          readonly dynamicContext?: string;
+          readonly contextLanes: readonly ContextLane[];
           readonly history: readonly LlmMessage[];
           readonly userText: string;
         }
@@ -1870,7 +1873,10 @@ function currentRunUserMessage(
   request: ModelRequest,
   prepared: PreparedChannelRunContext,
 ): LlmMessage | undefined {
-  const message = request.messages[prepared.history.length + 1];
+  const message = request.messages
+    .filter((candidate) => !isProjectedContextLaneMessage(candidate))[
+      prepared.history.length + 1
+    ];
   return message?.role === "user" ? message : undefined;
 }
 
@@ -1907,5 +1913,7 @@ function addModelUsage(
 function stripSystemMessages(
   messages: readonly LlmMessage[],
 ): readonly LlmMessage[] {
-  return messages.filter((message) => message.role !== "system");
+  return messages.filter(
+    (message) => message.role !== "system" && message.role !== "developer",
+  );
 }

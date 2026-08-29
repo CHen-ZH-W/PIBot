@@ -13,6 +13,7 @@ import type {
   ModelRequest,
   ModelToolCall,
   ModelUsage,
+  DeveloperRoleMode,
 } from "../agent/model";
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
@@ -21,24 +22,37 @@ export interface OpenAICompatibleModelClientConfig {
   readonly apiKeyEnvVar?: string;
   readonly baseUrlEnvVar?: string;
   readonly modelEnvVar?: string;
+  readonly developerRoleModeEnvVar?: string;
   readonly defaultBaseUrl?: string;
   readonly defaultModel?: string;
+  readonly defaultDeveloperRoleMode?: DeveloperRoleMode;
 }
 
 interface ResolvedConfig {
   readonly apiKeyEnvVar: string;
   readonly baseUrlEnvVar: string;
   readonly modelEnvVar: string;
+  readonly developerRoleModeEnvVar: string;
   readonly defaultBaseUrl: string;
   readonly defaultModel: string;
+  readonly defaultDeveloperRoleMode: DeveloperRoleMode;
 }
 
-type ProviderRole = "system" | "user" | "assistant" | "tool";
+type ProviderRole =
+  | "system"
+  | "developer"
+  | "user"
+  | "assistant"
+  | "tool";
 
 type ProviderMessage =
   | {
       readonly role: "system" | "user";
       readonly content: string | readonly ProviderContentPart[];
+    }
+  | {
+      readonly role: "developer";
+      readonly content: string;
     }
   | {
       readonly role: "assistant";
@@ -110,8 +124,12 @@ export class OpenAICompatibleProviderAdapter implements ModelProviderAdapter {
       apiKeyEnvVar: config.apiKeyEnvVar ?? "OPENAI_API_KEY",
       baseUrlEnvVar: config.baseUrlEnvVar ?? "OPENAI_BASE_URL",
       modelEnvVar: config.modelEnvVar ?? "OPENAI_MODEL",
+      developerRoleModeEnvVar:
+        config.developerRoleModeEnvVar ?? "OPENAI_DEVELOPER_ROLE_MODE",
       defaultBaseUrl: config.defaultBaseUrl ?? "https://api.openai.com/v1",
       defaultModel: config.defaultModel ?? "gpt-4o-mini",
+      defaultDeveloperRoleMode:
+        config.defaultDeveloperRoleMode ?? "native",
     };
   }
 
@@ -120,10 +138,19 @@ export class OpenAICompatibleProviderAdapter implements ModelProviderAdapter {
     signal?: AbortSignal,
   ): AsyncIterable<ModelEvent> {
     const model = this.resolveModel(request);
+    let developerRoleMode: DeveloperRoleMode;
+    try {
+      developerRoleMode = this.resolveDeveloperRoleMode();
+    } catch (error: unknown) {
+      yield { type: "error", error: toModelError(error) };
+      return;
+    }
     yield {
       type: "start",
       provider: "openai_compatible",
       model,
+      developerRoleMode,
+      authorityDegraded: developerRoleMode === "system-fallback",
     };
 
     try {
@@ -151,6 +178,7 @@ export class OpenAICompatibleProviderAdapter implements ModelProviderAdapter {
             request,
             model,
             shouldBackfillMissingReasoningContent(model, this.chatCompletionsUrl()),
+            developerRoleMode,
           ),
         ),
         ...optionalSignal(signal),
@@ -286,12 +314,24 @@ export class OpenAICompatibleProviderAdapter implements ModelProviderAdapter {
     );
     return `${baseUrl}/chat/completions`;
   }
+
+  private resolveDeveloperRoleMode(): DeveloperRoleMode {
+    const value = readEnv(this.config.developerRoleModeEnvVar) ??
+      this.config.defaultDeveloperRoleMode;
+    if (value === "native" || value === "system-fallback") {
+      return value;
+    }
+    throw new Error(
+      `${this.config.developerRoleModeEnvVar} must be one of: native, system-fallback`,
+    );
+  }
 }
 
 function toProviderRequestBody(
   request: ModelRequest,
   model: string,
   backfillMissingReasoningContent: boolean,
+  developerRoleMode: DeveloperRoleMode,
 ): ProviderRequestBody {
   return {
     model,
@@ -300,7 +340,11 @@ function toProviderRequestBody(
       include_usage: true,
     },
     messages: repairToolCallMessageOrder(request.messages).map((message) =>
-      toProviderMessage(message, backfillMissingReasoningContent),
+      toProviderMessage(
+        message,
+        backfillMissingReasoningContent,
+        developerRoleMode,
+      ),
     ),
     ...optionalTools(request.tools),
     ...optionalNumber("temperature", request.temperature),
@@ -311,6 +355,7 @@ function toProviderRequestBody(
 function toProviderMessage(
   message: LlmMessage,
   backfillMissingReasoningContent: boolean,
+  developerRoleMode: DeveloperRoleMode,
 ): ProviderMessage {
   if (message.role === "tool") {
     if (message.toolCallId === undefined) {
@@ -334,6 +379,13 @@ function toProviderMessage(
         backfillMissingReasoningContent,
       ),
       ...optionalProviderToolCalls(message.toolCalls),
+    };
+  }
+
+  if (message.role === "developer") {
+    return {
+      role: developerRoleMode === "native" ? "developer" : "system",
+      content: message.content,
     };
   }
 

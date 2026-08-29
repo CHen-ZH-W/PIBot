@@ -165,7 +165,10 @@ export class FileWebConversationStore {
     return this.appendMessages(
       conversationId,
       messages
-        .filter((message) => message.role !== "system")
+        .filter(
+          (message) =>
+            message.role !== "system" && message.role !== "developer",
+        )
         .map((message) => ({
           role: message.role,
           content: message.content,
@@ -182,7 +185,10 @@ export class FileWebConversationStore {
 
   toLlmHistory(conversation: WebConversation): readonly LlmMessage[] {
     return conversation.messages
-      .filter((message) => message.role !== "system")
+      .filter(
+        (message) =>
+          message.role !== "system" && message.role !== "developer",
+      )
       .map((message) => webMessageToLlmMessage(message));
   }
 

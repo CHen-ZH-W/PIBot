@@ -405,7 +405,7 @@ function buildCompactionResult(
   const estimatedTokensAfter =
     estimateMessagesTokens([
       {
-        role: "user",
+        role: "assistant",
         content: summaryContent,
       },
       ...plan.recentEntries.map((entry) => entry.message),
@@ -436,7 +436,7 @@ function buildCompactionResult(
     summaryRecord: {
       type: "context_message",
       schemaVersion: 2,
-      role: "user",
+      role: "assistant",
       content: summaryContent,
       source: "compaction",
       compactionKind: "session_summary",
@@ -518,7 +518,7 @@ async function generateLlmSummary(
       tools: [],
       messages: [
         {
-          role: "system",
+          role: "developer",
           content: [
             "Summarize an agent transcript as strict JSON only.",
             "Preserve durable facts and unresolved work. Do not invent facts.",

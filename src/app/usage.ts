@@ -1,6 +1,7 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import * as path from "node:path";
 import type { LlmMessage } from "../core/agent";
+import type { ContextLane } from "../workspace/context-manager";
 import type {
   AgentRunId,
   SlackChannelId,
@@ -87,7 +88,7 @@ export class NoopUsageRecorder implements UsageRecorder {
 
 export function estimateRunUsage(input: {
   readonly systemPrompt: string;
-  readonly dynamicContext?: string;
+  readonly contextLanes?: readonly ContextLane[];
   readonly history: readonly LlmMessage[];
   readonly userText: string;
   readonly generatedMessages: readonly LlmMessage[];
@@ -96,7 +97,7 @@ export function estimateRunUsage(input: {
   const inputTokens = estimateTokenCount(
     [
       input.systemPrompt,
-      input.dynamicContext ?? "",
+      ...(input.contextLanes ?? []).map((lane) => lane.content),
       input.userText,
       ...input.history.map((message) => message.content),
     ].join("\n"),

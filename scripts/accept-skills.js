@@ -262,7 +262,7 @@ async function acceptsIndexedSkillRead() {
       yield startEvent();
       if (requests.length === 1) {
         const systemPrompt = request.messages.find((message) =>
-          message.role === "system" &&
+          message.role === "developer" &&
           message.content.includes("<available_skills>"))?.content;
         assert.notEqual(systemPrompt, undefined);
         assert.match(systemPrompt, /<available_skills>/u);
@@ -344,7 +344,9 @@ async function acceptsPromptGuidedSkillCreation() {
       requests.push(request);
       yield startEvent();
       if (requests.length === 1) {
-        const systemPrompt = request.messages.find((message) => message.role === "system").content;
+        const systemPrompt = request.messages.find((message) =>
+          message.role === "developer" &&
+          message.content.includes("stable-developer-instructions")).content;
         assert.match(systemPrompt, /You may create or improve a reusable Skill/u);
         assert.match(systemPrompt, /\.pibot\/skills\/<skill-name>\/SKILL\.md/u);
         assert.match(systemPrompt, /Available tools:/u);

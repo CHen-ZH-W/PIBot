@@ -2,6 +2,7 @@ import type { LlmRequest } from "../core/agent";
 import type { ToolCallId } from "../core/ids";
 
 export type ModelProvider = "openai_compatible";
+export type DeveloperRoleMode = "native" | "system-fallback";
 
 export interface ModelRequest extends LlmRequest {
   readonly model?: string;
@@ -41,6 +42,8 @@ export type ModelEvent =
       readonly type: "start";
       readonly provider: ModelProvider;
       readonly model: string;
+      readonly developerRoleMode?: DeveloperRoleMode;
+      readonly authorityDegraded?: boolean;
     }
   | {
       readonly type: "retry";

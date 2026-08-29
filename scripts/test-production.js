@@ -174,6 +174,14 @@ async function runTests() {
   );
   await runCase("Kimi K2.6 usage pricing", testKimiK26UsagePricing);
   await runCase("Kimi stream usage parsing", testKimiStreamUsageParsing);
+  await runCase(
+    "OpenAI-compatible provider uses native developer authority by default",
+    testNativeDeveloperRole,
+  );
+  await runCase(
+    "OpenAI-compatible provider only degrades developer authority explicitly",
+    testExplicitDeveloperRoleFallback,
+  );
   await runCase("SSE tool call argument fragments", testSseToolCallArgumentFragments);
   await runCase("WebUI browser script parses", testWebUiBrowserScriptParses);
   await runCase("WebUI shell smoke renders", testWebUiShellSmokeRender);
@@ -3850,6 +3858,132 @@ async function testKimiStreamUsageParsing() {
     } else {
       process.env.PIBOT_TEST_API_KEY = previousApiKey;
     }
+  }
+}
+
+async function testNativeDeveloperRole() {
+  const previousApiKey = process.env.PIBOT_TEST_API_KEY;
+  const previousMode = process.env.PIBOT_TEST_DEVELOPER_ROLE_MODE;
+  const previousFetch = global.fetch;
+  let requestBody;
+  process.env.PIBOT_TEST_API_KEY = "test-key";
+  delete process.env.PIBOT_TEST_DEVELOPER_ROLE_MODE;
+  global.fetch = async (_url, init) => {
+    requestBody = JSON.parse(init.body);
+    return providerDoneResponse();
+  };
+
+  try {
+    const model = new OpenAICompatibleModelClient({
+      apiKeyEnvVar: "PIBOT_TEST_API_KEY",
+      developerRoleModeEnvVar: "PIBOT_TEST_DEVELOPER_ROLE_MODE",
+      defaultBaseUrl: "https://api.openai.test/v1",
+      defaultModel: "fake-model",
+    });
+    const events = [];
+    for await (const event of model.stream({
+      messages: [
+        { role: "system", content: "runtime boundary" },
+        {
+          role: "developer",
+          content: "application instruction",
+          contextLane: {
+            id: "provider-test",
+            kind: "instruction",
+            placement: "stable_prefix",
+          },
+        },
+        { role: "user", content: "current request" },
+      ],
+      tools: [],
+    })) {
+      events.push(event);
+    }
+
+    assert.deepEqual(
+      requestBody.messages.map((message) => message.role),
+      ["system", "developer", "user"],
+    );
+    assert.equal("contextLane" in requestBody.messages[1], false);
+    assert.deepEqual(events[0], {
+      type: "start",
+      provider: "openai_compatible",
+      model: "fake-model",
+      developerRoleMode: "native",
+      authorityDegraded: false,
+    });
+  } finally {
+    global.fetch = previousFetch;
+    restoreEnvironment("PIBOT_TEST_API_KEY", previousApiKey);
+    restoreEnvironment("PIBOT_TEST_DEVELOPER_ROLE_MODE", previousMode);
+  }
+}
+
+async function testExplicitDeveloperRoleFallback() {
+  const previousApiKey = process.env.PIBOT_TEST_API_KEY;
+  const previousMode = process.env.PIBOT_TEST_DEVELOPER_ROLE_MODE;
+  const previousFetch = global.fetch;
+  let requestBody;
+  process.env.PIBOT_TEST_API_KEY = "test-key";
+  process.env.PIBOT_TEST_DEVELOPER_ROLE_MODE = "system-fallback";
+  global.fetch = async (_url, init) => {
+    requestBody = JSON.parse(init.body);
+    return providerDoneResponse();
+  };
+
+  try {
+    const model = new OpenAICompatibleModelClient({
+      apiKeyEnvVar: "PIBOT_TEST_API_KEY",
+      developerRoleModeEnvVar: "PIBOT_TEST_DEVELOPER_ROLE_MODE",
+      defaultBaseUrl: "https://api.openai.test/v1",
+      defaultModel: "fake-model",
+    });
+    const events = [];
+    for await (const event of model.stream({
+      messages: [
+        { role: "system", content: "runtime boundary" },
+        { role: "developer", content: "application instruction" },
+        { role: "user", content: "current request" },
+      ],
+      tools: [],
+    })) {
+      events.push(event);
+    }
+
+    assert.deepEqual(
+      requestBody.messages.map((message) => message.role),
+      ["system", "system", "user"],
+    );
+    assert.deepEqual(events[0], {
+      type: "start",
+      provider: "openai_compatible",
+      model: "fake-model",
+      developerRoleMode: "system-fallback",
+      authorityDegraded: true,
+    });
+  } finally {
+    global.fetch = previousFetch;
+    restoreEnvironment("PIBOT_TEST_API_KEY", previousApiKey);
+    restoreEnvironment("PIBOT_TEST_DEVELOPER_ROLE_MODE", previousMode);
+  }
+}
+
+function providerDoneResponse() {
+  return new Response(
+    [
+      'data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}',
+      "data: [DONE]",
+      "",
+    ].join("\n\n"),
+    { status: 200 },
+  );
+}
+
+function restoreEnvironment(name, value) {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
   }
 }
 

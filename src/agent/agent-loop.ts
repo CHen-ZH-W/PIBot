@@ -30,6 +30,7 @@ import {
 import { decideAfterStep } from "../runtime/decisions";
 import type {
   ModelClient,
+  DeveloperRoleMode,
   ModelRequest,
   ModelToolCall,
   ModelUsage,
@@ -41,7 +42,10 @@ import type {
   AgentLoopEventHandler,
 } from "./events";
 import { modelErrorToAgentLoopError } from "./events";
-import { DynamicContextHook } from "../workspace/context-manager";
+import {
+  ContextLanesHook,
+  type ContextLane,
+} from "../workspace/context-manager";
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
 
@@ -57,7 +61,7 @@ export interface MinimalAgentLoopInput {
   readonly userText: string;
   readonly userContentParts?: readonly LlmMessageContentPart[];
   readonly systemPrompt: string;
-  readonly dynamicContext?: string;
+  readonly contextLanes?: readonly ContextLane[];
   readonly history: readonly LlmMessage[];
   readonly tools: readonly LlmToolSchema[];
   readonly hooks?: readonly RuntimeHook[];
@@ -114,9 +118,9 @@ export class MinimalAgentLoop {
     );
     const run = input.runContext ?? createAgentRunContext();
     const hooks = new RuntimeHookRunner([
-      ...(input.dynamicContext === undefined || input.dynamicContext.length === 0
+      ...(input.contextLanes === undefined || input.contextLanes.length === 0
         ? []
-        : [new DynamicContextHook(input.dynamicContext)]),
+        : [new ContextLanesHook(input.contextLanes)]),
       ...(input.hooks ?? []),
       ...this.baseHooks,
       ...(input.postHooks ?? []),
@@ -345,6 +349,8 @@ export class MinimalAgentLoop {
     let reasoningContent = "";
     let model: string | undefined;
     let provider: string | undefined;
+    let developerRoleMode: DeveloperRoleMode | undefined;
+    let authorityDegraded: boolean | undefined;
     let finishReason: string | undefined;
     let usage: ModelUsage | undefined;
     let retryCount = 0;
@@ -376,6 +382,8 @@ export class MinimalAgentLoop {
           case "start":
             provider = modelEvent.provider;
             model = modelEvent.model;
+            developerRoleMode = modelEvent.developerRoleMode;
+            authorityDegraded = modelEvent.authorityDegraded;
             break;
           case "retry":
             retryCount += 1;
@@ -417,6 +425,8 @@ export class MinimalAgentLoop {
               toolCalls,
               model,
               provider,
+              developerRoleMode,
+              authorityDegraded,
               finishReason,
               usage,
               retryCount,
@@ -437,6 +447,8 @@ export class MinimalAgentLoop {
         toolCalls,
         model,
         provider,
+        developerRoleMode,
+        authorityDegraded,
         finishReason,
         usage,
         retryCount,
@@ -454,6 +466,8 @@ export class MinimalAgentLoop {
       toolCalls,
       model,
       provider,
+      developerRoleMode,
+      authorityDegraded,
       finishReason,
       usage,
       retryCount,
@@ -548,6 +562,8 @@ function modelStepResult(input: {
   readonly toolCalls: readonly ModelToolCall[];
   readonly model?: string | undefined;
   readonly provider?: string | undefined;
+  readonly developerRoleMode?: DeveloperRoleMode | undefined;
+  readonly authorityDegraded?: boolean | undefined;
   readonly finishReason?: string | undefined;
   readonly usage?: ModelUsage | undefined;
   readonly retryCount: number;
@@ -561,6 +577,12 @@ function modelStepResult(input: {
     toolCalls: input.toolCalls,
     ...optionalString("model", input.model),
     ...optionalString("provider", input.provider),
+    ...(input.developerRoleMode === undefined
+      ? {}
+      : { developerRoleMode: input.developerRoleMode }),
+    ...(input.authorityDegraded === undefined
+      ? {}
+      : { authorityDegraded: input.authorityDegraded }),
     ...optionalString("finishReason", input.finishReason),
     ...optionalModelUsage(input.usage),
     retryCount: input.retryCount,

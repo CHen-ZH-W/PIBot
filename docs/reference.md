@@ -291,6 +291,7 @@ Common variables:
 |---|---:|---|
 | `OPENAI_BASE_URL` | OpenAI URL | OpenAI-compatible API base URL |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model name; `kimi-k2.6` enables Kimi pricing |
+| `OPENAI_DEVELOPER_ROLE_MODE` | `native` | `native` sends PIBot application instructions as `developer`; `system-fallback` explicitly maps them to `system` for endpoints that reject `developer` and records an authority downgrade |
 | `OPENAI_FALLBACK_MODELS` | empty | Comma-separated fallback models |
 | `MODEL_MAX_RETRIES` | `2` | Retries per model before fallback |
 | `MODEL_RETRY_BASE_DELAY_MS` | `500` | Initial model retry delay |
@@ -375,28 +376,48 @@ compaction and automatic retry by default.
 `ContextManager` is the model-surface boundary for durable channel history. It
 selects the latest checkpoint plus uncovered records, applies per-run user-message
 exclusion or replacement, and repairs tool-call ordering without rewriting
-`context.jsonl`. It also owns named model-only system lanes and final-request token
-estimation. Compaction records remain append-only and now include both the
-rendered checkpoint and machine-readable `summaryFacts`, so a later heuristic
-fallback can inherit facts from an earlier LLM checkpoint.
+`context.jsonl`. It also owns named model-only lanes with explicit `authority`,
+`kind`, and `placement`, plus final-request token estimation. Compaction records
+remain append-only and include both the rendered checkpoint and machine-readable
+`summaryFacts`, so a later heuristic fallback can inherit facts from an earlier
+LLM checkpoint.
 
-Prompt assembly follows three ordered regions. The first System message contains
-only cache-stable agent instructions; ordered Tool schemas are the other stable
-request component. Memory indexes, Skill index, repo/run-start facts, date, cwd
-and channel-workspace reminders are no longer concatenated into that first
-message. A runtime hook projects them as a named `run-context` lane at the
-append-only dynamic tail on every Step. Durable projected history remains between
-the stable prefix and dynamic tail. Steering plus refreshable World State and
-Working Set lanes also live at that tail; history refreshes preserve these lanes
-and never insert them between an assistant tool call and its Tool Result.
+Prompt assembly separates cache placement from model authority. Ordered Tool
+schemas plus the leading `system` and `developer` messages form the stable
+prefix. Durable history and model-only reference lanes remain in the middle;
+refreshable state and Steering form an append-only dynamic tail. History
+replacement preserves every declared lane placement and never inserts context
+between an assistant Tool Call and its Tool Result.
+
+| Context source | Model role | Kind | Placement |
+|---|---|---|---|
+| PIBot identity, sandbox and authority boundaries | `system` | instruction | stable prefix |
+| Tools, operating guidelines and runtime policy | `developer` | instruction | stable prefix |
+| Persistent Memory synthesized from prior runs | `assistant` | reference | before current user |
+| Workspace/legacy Skill metadata | `user` | reference | before current user |
+| Global and channel user instructions | `user` | instruction | before current user |
+| Compaction Summary | `assistant` | reference | durable history |
+| Covered historical user wording | `user` | instruction | durable history, verbatim |
+| Trusted PIBot Skill index, repo/run snapshot and World State | `developer` | instruction/state | dynamic tail |
+| Working Set and current file snapshots | `user` | reference | before current user |
+| In-run Steering | `user` | instruction | dynamic tail |
+
+The wire-level `AgentRole` includes `developer`. OpenAI-compatible requests send
+that role unchanged in `native` mode. Compatibility fallback is never inferred:
+an endpoint that rejects `developer` must be configured with
+`OPENAI_DEVELOPER_ROLE_MODE=system-fallback`. Model-start events and traces expose
+`developerRoleMode` and `authorityDegraded`; `model.started` additionally records
+per-role message counts. The repository's Kimi `.env.example` selects this
+fallback explicitly because that endpoint documents only `system`, `user`, and
+`assistant` input roles.
 
 After a checkpoint covers older history, `ContextManager` inserts an
-`[pibot-context:exact-user-intent]` header immediately after the Summary and then
-replays every covered, non-compaction user message with its original `user` role
-and verbatim content. The uncovered recent tail remains after this protected lane,
-so an old request is not mistaken for the newest request. These messages are
-loaded from the append-only durable log rather than reconstructed from
-`summaryFacts`.
+`[pibot-context:exact-user-intent]` developer header immediately after the
+assistant-authored Summary and then replays every covered, non-compaction user
+message with its original `user` role and verbatim content. The uncovered recent
+tail remains after this protected lane, so an old request is not mistaken for the
+newest request. These messages are loaded from the append-only durable log rather
+than reconstructed from `summaryFacts`.
 
 Checkpoint coverage advances only through newly covered non-checkpoint records;
 the later physical JSONL line number of a Summary is never used to hide an older
@@ -461,8 +482,9 @@ work, pending tasks, failed approaches, errors and fixes, code state, and
 verification state. Existing version-1 context records without `summaryFacts`
 remain readable through the rendered-summary compatibility parser.
 
-`RuntimeModeHook` refreshes a `[pibot-context:world-state]` system lane for every
-model step. The lane contains the frozen step/mode identity, model name, current
+`RuntimeModeHook` refreshes a `[pibot-context:world-state]` developer/state lane
+at the dynamic tail for every model step. The lane contains the frozen step/mode
+identity, model name, current
 plan metadata, coordinator goal, a bounded live `tasks.json` projection, cwd,
 live git root/branch/dirty files, sandbox label, approval policy and pending
 count, MCP capability/configuration, and bounded child-agent status counts and
@@ -476,7 +498,8 @@ Request-budget fields are recorded on `model.started` traces, while
 overhead.
 
 After a checkpoint becomes active, `WorkingSetHook` uses its modified/read file
-lists to rehydrate a bounded model-only working-set lane. Modified files are
+lists to rehydrate a bounded `user`/reference lane immediately before the current
+user message. It is explicitly marked as untrusted reference data. Modified files are
 preferred over read-only files; current filesystem content is loaded with
 workspace and symlink boundary checks, cached by size/mtime, and represented as
 full text or bounded head/tail text with a reread locator. Missing, binary and

@@ -475,7 +475,7 @@ export class WebAgentRunner {
       "</conversation_text>",
     ].join("\n");
     const messages: LlmMessage[] = [
-      { role: "system", content: systemPrompt },
+      { role: "developer", content: systemPrompt },
       { role: "user", content: userPrompt },
     ];
     const titleSettleMs = options.settleMs ?? 350;
@@ -811,7 +811,7 @@ export class WebAgentRunner {
           : { thinkingLanguage: this.options.thinkingLanguage }),
       });
       let systemPrompt = promptParts.stableSystemPrompt;
-      let dynamicContext = promptParts.dynamicContext;
+      let contextLanes = promptParts.contextLanes;
       const modelUserText = selfEvolutionRequest === undefined
         ? text
         : formatSelfEvolutionTicketPrompt(text);
@@ -875,7 +875,7 @@ export class WebAgentRunner {
             {
               userText: modelUserText,
               systemPrompt,
-              ...(dynamicContext === undefined ? {} : { dynamicContext }),
+              contextLanes,
               history: runHistory,
               tools: runToolSchemas,
               postHooks: [
@@ -972,7 +972,7 @@ export class WebAgentRunner {
                   : { thinkingLanguage: this.options.thinkingLanguage }),
               });
               systemPrompt = promptParts.stableSystemPrompt;
-              dynamicContext = promptParts.dynamicContext;
+              contextLanes = promptParts.contextLanes;
               return true;
             },
           },
@@ -1605,9 +1605,7 @@ export class WebAgentRunner {
         {
           userText: prompt,
           systemPrompt,
-          ...(promptParts.dynamicContext === undefined
-            ? {}
-            : { dynamicContext: promptParts.dynamicContext }),
+          contextLanes: promptParts.contextLanes,
           history: implementationHistory,
           tools: runToolSchemas,
           postHooks: [
@@ -1925,7 +1923,7 @@ export class WebAgentRunner {
     const contextMessages = await this.options.sessions.readChannelContextMessages(key);
     if (contextMessages.length === 0 && existing.messages.length > 0) {
       for (const message of existing.messages) {
-        if (message.role === "system") {
+        if (message.role === "system" || message.role === "developer") {
           continue;
         }
         await this.options.sessions.appendContextMessage(key, {

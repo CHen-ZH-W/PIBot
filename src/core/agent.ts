@@ -2,7 +2,12 @@ import type { AgentRunId, MessageId, ToolCallId } from "./ids";
 import type { SlackInboundMessage } from "./slack";
 import type { ToolCall, ToolResult } from "./tools";
 
-export type AgentRole = "system" | "user" | "assistant" | "tool";
+export type AgentRole =
+  | "system"
+  | "developer"
+  | "user"
+  | "assistant"
+  | "tool";
 
 /**
  * 职责：表达 agent transcript 中的一条规范化消息。
@@ -126,6 +131,16 @@ export type LlmMessageContentPart =
       };
     };
 
+/** Runtime-only provenance for a model-facing ContextManager lane. */
+export interface LlmMessageContextLane {
+  readonly id: string;
+  readonly kind: "instruction" | "state" | "reference";
+  readonly placement:
+    | "stable_prefix"
+    | "before_current_user"
+    | "dynamic_tail";
+}
+
 /**
  * 职责：表达传给 LLM provider 的最小消息结构。
  * 不应承担：构造 prompt、处理 token 流、执行工具调用。
@@ -133,6 +148,8 @@ export type LlmMessageContentPart =
 export interface LlmMessage {
   readonly role: AgentRole;
   readonly content: string;
+  /** Never serialized to Provider wire messages or durable conversation logs. */
+  readonly contextLane?: LlmMessageContextLane;
   readonly contentParts?: readonly LlmMessageContentPart[];
   readonly toolCallId?: ToolCallId;
   readonly toolCalls?: readonly LlmMessageToolCall[];
