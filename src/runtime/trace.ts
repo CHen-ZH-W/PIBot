@@ -75,6 +75,10 @@ export interface TraceRuntimeHookOptions {
   readonly contextManager?: ContextManager;
   readonly calculateCost?: (
     usage: ModelUsage,
+    model: {
+      readonly provider?: string;
+      readonly model?: string;
+    },
   ) => {
       readonly cost: number;
       readonly currency: string;
@@ -133,7 +137,10 @@ export class TraceRuntimeHook implements RuntimeHook {
       context.result.usage === undefined ||
       this.options.calculateCost === undefined
         ? {}
-        : this.options.calculateCost(context.result.usage);
+        : this.options.calculateCost(context.result.usage, {
+            ...optionalString("provider", context.result.provider),
+            ...optionalString("model", context.result.model),
+          });
     await this.record(withRun(context.run, {
       type: context.result.error === undefined
         ? "model.completed"
@@ -228,9 +235,13 @@ export function createTraceApprovalObserver(
       toolCallId: event.request.call.id,
       tool: event.request.call.name,
       riskLevel: event.request.risk,
+      capabilities: event.request.capabilities,
+      escalation: event.request.escalation,
+      runScopeAllowed: event.request.runScopeAllowed,
       mode: event.mode,
       policy: event.policy,
       approved: event.decision.approved,
+      scope: event.decision.scope,
       reason: event.decision.approved ? undefined : event.decision.reason,
     })).catch(() => undefined);
   };
@@ -305,4 +316,13 @@ function positiveInteger(
     throw new Error(`${label} must be a positive integer`);
   }
   return resolved;
+}
+
+function optionalString<Key extends string>(
+  key: Key,
+  value: string | undefined,
+): { readonly [Property in Key]: string } | object {
+  return value === undefined ? {} : { [key]: value } as {
+    readonly [Property in Key]: string;
+  };
 }

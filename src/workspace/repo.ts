@@ -1,6 +1,12 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
+import {
+  issueToolCapabilityGrant,
+  withActiveToolCapabilityGrant,
+} from "../core/capabilities";
+import type { ToolCallId } from "../core/ids";
 import type { ChannelSessionKey } from "../core/session";
 import { resolveWorkspacePath } from "./path-boundary";
 import {
@@ -255,21 +261,45 @@ export class ChannelRepoWorkflow {
     if (config.checkCommand === undefined) {
       throw new Error("run_check requires repo config checkCommand");
     }
+    const checkCommand = config.checkCommand;
 
-    const result = await this.sandboxExecutor.execute(
-      {
-        command: config.checkCommand,
+    const callId = `runtime-repo-check-${randomUUID()}` as ToolCallId;
+    const grant = issueToolCapabilityGrant({
+      callId,
+      toolName: "repo.run_check",
+      input: {
+        command: checkCommand,
         workspaceRoot: config.repoPath,
-        cwd: config.repoPath,
-        timeoutMs: config.checkTimeoutMs,
-        maxOutputChars: config.maxOutputChars,
       },
-      signal,
+      request: {
+        requirements: [
+          { capability: "process.exec", commands: [checkCommand] },
+          { capability: "filesystem.read", paths: ["."] },
+          { capability: "filesystem.write", paths: ["."] },
+        ],
+      },
+      policyVersion: this.sandboxExecutor.policy.version,
+      ttlMs: config.checkTimeoutMs + 60_000,
+      source: "runtime",
+    });
+    const result = await withActiveToolCapabilityGrant(
+      grant,
+      () => this.sandboxExecutor.execute(
+        {
+          command: checkCommand,
+          workspaceRoot: config.repoPath,
+          cwd: config.repoPath,
+          timeoutMs: config.checkTimeoutMs,
+          maxOutputChars: config.maxOutputChars,
+          authorization: grant,
+        },
+        signal,
+      ),
     );
 
     return {
       repoPath: config.repoPath,
-      command: config.checkCommand,
+      command: checkCommand,
       exitCode: result.exitCode,
       stdout: result.stdout,
       stderr: result.stderr,
@@ -318,6 +348,7 @@ export class ChannelRepoWorkflow {
     const repoPath = await resolveWorkspacePath(this.workspaceRoot, config.repoPath, {
       access: "cwd",
       allowWorkspaceRoot: true,
+      policy: this.sandboxExecutor.policy,
     });
     this.sandboxExecutor.assertWorkspaceAccess(repoPath);
     return {

@@ -1200,6 +1200,11 @@ textarea:disabled {
   opacity: 0.6;
 }
 
+.model-select {
+  max-width: 260px;
+  min-width: 150px;
+}
+
 @media (max-width: 1080px) {
   .shell {
     grid-template-columns: 220px minmax(0, 1fr);
@@ -1250,6 +1255,7 @@ const state = {
   view: "sessions",
   snapshot: null,
   runtime: null,
+  models: null,
   conversations: [],
   skills: { skills: [], disabledSkills: [], issues: [] },
   liveRuns: {},
@@ -1633,6 +1639,7 @@ async function refresh(options) {
     state.snapshot = data.evolution;
     state.evolutionContextLoaded = false;
     state.runtime = data.runtime || null;
+    state.models = data.models || null;
     state.conversations = data.conversations;
     state.skills = data.skills || { skills: [], disabledSkills: [], issues: [] };
     if (!state.selectedTicketId && data.evolution.tickets.length > 0) {
@@ -1977,9 +1984,27 @@ function renderTopbar(ticket) {
     : '';
   const refreshPending = pendingLabel("refresh");
   const actions = state.view === "sessions"
-    ? ''
+    ? renderModelControls()
     : (state.view === "skills" ? '' : renderEvolutionTopbarActions(ticket));
   return '<div class="topbar"><div class="topbar-left">' + leading + '<h1 title="' + escapeHtml(title) + '">' + escapeHtml(title) + '</h1></div><div class="toolbar">' + actions + '<button class="ghost btn-icon' + pendingClass(refreshPending) + '" data-action="refresh"' + disabledAttr(state.loading || !!refreshPending) + ' title="' + (refreshPending || "Refresh") + '"><span class="refresh-icon">↻</span></button></div></div>';
+}
+
+function renderModelControls() {
+  if (!state.models || !Array.isArray(state.models.models)) return '';
+  const active = String(state.models.active || '');
+  const selectPending = pendingLabel("model-select");
+  const checkPending = pendingLabel("model-check");
+  const syncPending = pendingLabel("model-sync");
+  const options = state.models.models.map(function(model) {
+    const ref = String(model.ref || '');
+    const name = model.name ? " · " + model.name : "";
+    const compatibility = model.status === "unknown" ? " · unverified" : "";
+    const label = ref + name + compatibility;
+    return '<option value="' + escapeHtml(ref) + '"' + (ref === active ? ' selected' : '') + '>' + escapeHtml(label) + '</option>';
+  }).join("");
+  return '<select id="model-selector" class="model-select" title="Active model"' + disabledAttr(!!selectPending) + '>' + options + '</select>' +
+    '<button class="ghost" data-action="check-models"' + disabledAttr(!!checkPending || !!syncPending) + ' title="Check provider model catalogs without writing">' + escapeHtml(checkPending || "Check models") + '</button>' +
+    '<button class="ghost" data-action="sync-models"' + disabledAttr(!!checkPending || !!syncPending) + ' title="Synchronize provider model catalogs">' + escapeHtml(syncPending || "Sync models") + '</button>';
 }
 
 function evolutionTopbarTitle(ticket) {
@@ -3367,8 +3392,11 @@ function renderLiveApproval(approval) {
   var status = pending
     ? '<span class="badge warn">' + escapeHtml(approval.risk || "approval") + '</span>'
     : '<span class="badge ' + (approval.status === "approved" ? "ok" : "danger") + '">' + escapeHtml(approval.status) + '</span>';
+  var runActions = approval.runScopeAllowed
+    ? '<button data-action="approve-web-approval" data-approval-scope="run" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Allow for run</button><button data-action="reject-web-approval" data-approval-scope="run" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Deny for run</button>'
+    : '';
   var actions = pending
-    ? '<div class="toolbar"><button class="primary" data-action="approve-web-approval" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>' + escapeHtml(label && label.indexOf("Approving") === 0 ? "Approving..." : "Approve") + '</button><button class="danger" data-action="reject-web-approval" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>' + escapeHtml(label && label.indexOf("Rejecting") === 0 ? "Rejecting..." : "Reject") + '</button></div>'
+    ? '<div class="toolbar"><button class="primary" data-action="approve-web-approval" data-approval-scope="once" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Allow once</button>' + runActions + '<button class="danger" data-action="reject-web-approval" data-approval-scope="once" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Reject once</button></div>'
     : '<div class="approval-summary">' + escapeHtml(approval.resolvedMessage || approval.status) + '</div>';
   return '<div class="approval-request' + (pending ? '' : ' resolved') + '">' +
     '<div class="approval-head"><span class="approval-title">' + escapeHtml(approval.title || "Approval required") + '</span>' + status + '</div>' +
@@ -3689,6 +3717,24 @@ document.addEventListener("change", function(event) {
   }
 });
 
+document.addEventListener("change", async function(event) {
+  const select = event.target.closest("#model-selector");
+  if (!select || !select.value || !state.models) return;
+  if (select.value === state.models.active) return;
+  state.actionError = null;
+  try {
+    await withPending("model-select", "Switching model...", async function() {
+      state.models = await api("/api/models/select", {
+        method: "POST",
+        body: JSON.stringify({ model: select.value })
+      });
+    });
+  } catch (error) {
+    state.actionError = errorMessage(error);
+    render();
+  }
+});
+
 document.addEventListener("click", async function(event) {
   const target = event.target.closest("[data-view],[data-ticket-id],[data-conversation-id],[data-action]");
   if (!target) return;
@@ -3915,12 +3961,12 @@ async function sendSessionControlMessage(conversationId, content) {
   scheduleRunRender(conversationId);
 }
 
-async function sendApprovalDecision(approvalId, approved) {
+async function sendApprovalDecision(approvalId, approved, scope) {
   var pendingKey = "approval:" + approvalId;
   await withPending(pendingKey, approved ? "Approving..." : "Rejecting...", async function() {
     const result = await api("/api/approvals/" + encodeURIComponent(approvalId), {
       method: "POST",
-      body: JSON.stringify({ approved: approved })
+      body: JSON.stringify({ approved: approved, scope: scope || "once" })
     });
     if (result.approval && result.approval.conversationId) {
       var live = ensureLiveRun(result.approval.conversationId);
@@ -4199,6 +4245,41 @@ async function handleAction(target) {
     });
     return false;
   }
+  if (action === "check-models") {
+    await withPending("model-check", "Checking models...", async function() {
+      const result = await api("/api/models/check", {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      state.models = result;
+      const failures = result.catalog && Array.isArray(result.catalog.results)
+        ? result.catalog.results.filter(function(item) { return item.status === "error"; })
+        : [];
+      const changed = result.catalog && result.catalog.synchronized === false;
+      state.actionError = failures.length > 0
+        ? "Model catalog check failed for: " + failures.map(function(item) { return item.provider; }).join(", ")
+        : changed
+        ? "Provider model catalogs differ from the local cache. Use Sync models to apply them."
+        : null;
+    });
+    return false;
+  }
+  if (action === "sync-models") {
+    await withPending("model-sync", "Syncing models...", async function() {
+      const result = await api("/api/models/sync", {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      state.models = result;
+      const failures = result.catalog && Array.isArray(result.catalog.results)
+        ? result.catalog.results.filter(function(item) { return item.status === "error"; })
+        : [];
+      state.actionError = failures.length > 0
+        ? "Model catalog sync failed for: " + failures.map(function(item) { return item.provider; }).join(", ") + ". Previous cached models were kept."
+        : null;
+    });
+    return false;
+  }
   if (action === "back-evolution") {
     state.evolutionPane = "tickets";
     state.autoScrollMain = true;
@@ -4440,7 +4521,8 @@ async function handleAction(target) {
   if (action === "approve-web-approval" || action === "reject-web-approval") {
     await sendApprovalDecision(
       target.dataset.approvalId,
-      action === "approve-web-approval"
+      action === "approve-web-approval",
+      target.dataset.approvalScope || "once"
     );
     return;
   }

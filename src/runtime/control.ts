@@ -275,6 +275,7 @@ export class NextTurnQueue<Payload> {
   enqueue(
     payload: Payload,
     input: Omit<RuntimeControlMessageInput<"follow_up">, "kind">,
+    options: { readonly reserveCapacity?: boolean } = {},
   ): RuntimeControlReceipt<"follow_up"> {
     const message = createRuntimeControlMessage({ ...input, kind: "follow_up" });
     const duplicate = this.records.find((record) => record.message.id === message.id);
@@ -286,7 +287,11 @@ export class NextTurnQueue<Payload> {
       };
     }
     const bytes = Buffer.byteLength(message.text, "utf8");
-    const rejection = this.enqueueRejection(bytes, message.text);
+    const rejection = this.enqueueRejection(
+      bytes,
+      message.text,
+      options.reserveCapacity === true,
+    );
     const record: RuntimeControlRecord<"follow_up"> = {
       message,
       status: rejection === undefined ? "queued" : "rejected",
@@ -331,6 +336,7 @@ export class NextTurnQueue<Payload> {
   private enqueueRejection(
     bytes: number,
     text: string,
+    reserveCapacity: boolean,
   ): RuntimeControlReceiptReason | undefined {
     if (this.closedReason !== undefined) {
       return this.closedReason;
@@ -338,7 +344,7 @@ export class NextTurnQueue<Payload> {
     if (text.trim().length === 0) {
       return "empty_control_message";
     }
-    if (this.entries.length >= this.limits.maxEntries) {
+    if (!reserveCapacity && this.entries.length >= this.limits.maxEntries) {
       return "next_turn_queue_full";
     }
     const queuedBytes = this.entries.reduce((total, entry) => total + entry.bytes, 0);

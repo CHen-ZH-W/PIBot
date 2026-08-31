@@ -1,6 +1,16 @@
 import { createHash } from "node:crypto";
 import * as path from "node:path";
-import { appendFile, mkdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import type { ChannelSessionKey } from "../core/session";
 
 export type JsonPrimitive = string | number | boolean | null;
@@ -28,7 +38,9 @@ export interface ChannelWorkspacePaths {
   readonly globalMemorySummaryFile: string;
   readonly globalMemoryRolloutSummariesDir: string;
   readonly globalMemoryExtensionNotesDir: string;
+  readonly globalMemoryCurationJobsDir: string;
   readonly globalMemoryAuditFile: string;
+  readonly globalMemoryUsageFile: string;
   readonly legacyGlobalMemoryFile: string;
   readonly legacyGlobalMemoryDir: string;
   readonly legacyGlobalMemoryAuditFile: string;
@@ -52,7 +64,8 @@ export type WorkspaceStoreWarningCode =
   | "invalid_context_record"
   | "compaction_failed"
   | "tool_result_archive_failed"
-  | "memory_curation_failed";
+  | "memory_curation_failed"
+  | "memory_usage_record_failed";
 
 /**
  * 职责：描述本地 workspace store 读写时可恢复的问题。
@@ -89,7 +102,8 @@ export type MemoryDocument =
   | "topic"
   | "rollout_summary"
   | "extension_note"
-  | "audit";
+  | "audit"
+  | "usage";
 export type WritableMemoryDocument =
   | "summary"
   | "index"
@@ -155,6 +169,69 @@ export interface MemoryMutationResult extends WritableMemoryDocumentRef {
   readonly afterBytes?: number;
 }
 
+export interface StoredMemoryDocument {
+  readonly topic: string;
+  readonly path: string;
+  readonly content: string;
+}
+
+export interface MemoryUsageEvent {
+  readonly document: "summary" | "index" | "topic" | "rollout_summary" | "extension_note";
+  readonly topic?: string;
+  readonly runId: string;
+  readonly userTurnId: string;
+  readonly stepId: string;
+  readonly toolCallId: string;
+  readonly createdAt: string;
+}
+
+export type MemoryFeedbackOutcome =
+  | "helpful"
+  | "validated"
+  | "not_applicable"
+  | "contradicted"
+  | "superseded";
+
+export interface MemoryFeedbackEvent {
+  readonly topic: string;
+  readonly outcome: MemoryFeedbackOutcome;
+  readonly reason: string;
+  readonly verifiedBy: readonly string[];
+  readonly notVerified: readonly string[];
+  readonly runId: string;
+  readonly disposition: "observed" | "accepted" | "needs_review";
+  readonly replacementTopic?: string;
+  readonly createdAt: string;
+}
+
+export interface MemoryCurationEvent {
+  readonly action:
+    | "candidate_noop"
+    | "candidate_staged"
+    | "candidate_accepted"
+    | "candidate_needs_review"
+    | "candidate_rejected"
+    | "feedback_recorded"
+    | "lifecycle_needs_review"
+    | "topic_stale"
+    | "topic_superseded"
+    | "topic_reactivated"
+    | "curation_failed"
+    | "routing_rebuilt"
+    | "run_completed";
+  readonly runId: string;
+  readonly reason: string;
+  readonly candidateTopic?: string;
+  readonly targetTopic?: string;
+  readonly createdAt: string;
+}
+
+export interface StoredMemoryCurationJob {
+  readonly id: string;
+  readonly path: string;
+  readonly content: string;
+}
+
 /**
  * 职责：提供 per-channel 目录、log/context JSONL 和 MEMORY.md 的文件边界。
  * 不应承担：解释 Slack 消息、构造 agent history、做 compaction、执行工具。
@@ -185,6 +262,29 @@ export interface ChannelWorkspaceStore {
     key: ChannelSessionKey,
     request: MemoryMutationRequest,
   ): Promise<MemoryMutationResult>;
+  listMemoryDocuments(
+    key: ChannelSessionKey,
+    document: "topic" | "extension_note" | "rollout_summary",
+  ): Promise<readonly StoredMemoryDocument[]>;
+  appendMemoryUsage(
+    key: ChannelSessionKey,
+    event: MemoryUsageEvent,
+  ): Promise<void>;
+  appendMemoryFeedback(
+    key: ChannelSessionKey,
+    event: MemoryFeedbackEvent,
+  ): Promise<void>;
+  recordMemoryCurationEvent(
+    key: ChannelSessionKey,
+    event: MemoryCurationEvent,
+  ): Promise<void>;
+  writeMemoryCurationJob(
+    key: ChannelSessionKey,
+    runId: string,
+    content: string,
+  ): Promise<void>;
+  listMemoryCurationJobs(): Promise<readonly StoredMemoryCurationJob[]>;
+  deleteMemoryCurationJob(runId: string): Promise<void>;
   deleteChannelDirectory(key: ChannelSessionKey): Promise<void>;
   recordWarning(warning: WorkspaceStoreWarning): void;
 }
@@ -197,6 +297,8 @@ export interface FileChannelWorkspaceStoreOptions {
   readonly maxMemoryFileBytes?: number;
   readonly maxMemoryIndexFileBytes?: number;
   readonly maxMemoryAuditFileBytes?: number;
+  readonly maxMemoryUsageFileBytes?: number;
+  readonly maxMemoryCurationJobFileBytes?: number;
 }
 
 export class FileChannelWorkspaceStore implements ChannelWorkspaceStore {
@@ -207,6 +309,8 @@ export class FileChannelWorkspaceStore implements ChannelWorkspaceStore {
   private readonly maxMemoryFileBytes: number;
   private readonly maxMemoryIndexFileBytes: number;
   private readonly maxMemoryAuditFileBytes: number;
+  private readonly maxMemoryUsageFileBytes: number;
+  private readonly maxMemoryCurationJobFileBytes: number;
 
   constructor(options: FileChannelWorkspaceStoreOptions) {
     this.rootDir = path.resolve(options.rootDir);
@@ -235,6 +339,16 @@ export class FileChannelWorkspaceStore implements ChannelWorkspaceStore {
       options.maxMemoryAuditFileBytes,
       2_000_000,
       "maxMemoryAuditFileBytes",
+    );
+    this.maxMemoryUsageFileBytes = positiveInteger(
+      options.maxMemoryUsageFileBytes,
+      2_000_000,
+      "maxMemoryUsageFileBytes",
+    );
+    this.maxMemoryCurationJobFileBytes = positiveInteger(
+      options.maxMemoryCurationJobFileBytes,
+      256_000,
+      "maxMemoryCurationJobFileBytes",
     );
   }
 
@@ -268,7 +382,9 @@ export class FileChannelWorkspaceStore implements ChannelWorkspaceStore {
         "ad_hoc",
         "notes",
       ),
+      globalMemoryCurationJobsDir: path.join(globalMemoriesDir, "curation_jobs"),
       globalMemoryAuditFile: path.join(globalMemoriesDir, "audit.jsonl"),
+      globalMemoryUsageFile: path.join(globalMemoriesDir, "usage.jsonl"),
       legacyGlobalMemoryFile: path.join(this.rootDir, "MEMORY.md"),
       legacyGlobalMemoryDir: path.join(this.rootDir, "memory"),
       legacyGlobalMemoryAuditFile: path.join(this.rootDir, "memory", "audit.jsonl"),
@@ -425,6 +541,179 @@ export class FileChannelWorkspaceStore implements ChannelWorkspaceStore {
     return result;
   }
 
+  async listMemoryDocuments(
+    key: ChannelSessionKey,
+    document: "topic" | "extension_note" | "rollout_summary",
+  ): Promise<readonly StoredMemoryDocument[]> {
+    const paths = await this.ensureChannelDirectory(key);
+    const directories = document === "topic"
+      ? [paths.globalMemoryDir, paths.legacyGlobalMemoryDir]
+      : document === "rollout_summary"
+        ? [paths.globalMemoryRolloutSummariesDir]
+      : [paths.globalMemoryExtensionNotesDir];
+    const documents: StoredMemoryDocument[] = [];
+    const seenTopics = new Set<string>();
+    for (const directory of directories) {
+      let names: readonly string[];
+      try {
+        names = (await readdir(directory, { withFileTypes: true }))
+          .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+          .map((entry) => entry.name)
+          .sort();
+      } catch (error: unknown) {
+        if (isNodeErrorWithCode(error, "ENOENT")) continue;
+        throw error;
+      }
+      for (const name of names) {
+        const topic = name.slice(0, -3);
+        if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(topic) || seenTopics.has(topic)) {
+          continue;
+        }
+        const filePath = path.join(directory, name);
+        const content = await readTextIfExists(filePath, this.maxMemoryFileBytes);
+        if (content !== undefined) {
+          seenTopics.add(topic);
+          documents.push({
+            topic,
+            path: relativeStorePath(this.rootDir, filePath),
+            content,
+          });
+        }
+      }
+    }
+    return documents.sort((left, right) => left.topic.localeCompare(right.topic));
+  }
+
+  async appendMemoryUsage(
+    key: ChannelSessionKey,
+    event: MemoryUsageEvent,
+  ): Promise<void> {
+    const paths = await this.ensureChannelDirectory(key);
+    await mkdir(path.dirname(paths.globalMemoryUsageFile), { recursive: true });
+    await appendJsonl(
+      paths.globalMemoryUsageFile,
+      {
+        type: "memory_usage",
+        schemaVersion: 1,
+        document: event.document,
+        ...(event.topic === undefined ? {} : { topic: event.topic }),
+        runId: event.runId,
+        userTurnId: event.userTurnId,
+        stepId: event.stepId,
+        toolCallId: event.toolCallId,
+        createdAt: event.createdAt,
+      },
+      this.maxMemoryUsageFileBytes,
+    );
+  }
+
+  async appendMemoryFeedback(
+    key: ChannelSessionKey,
+    event: MemoryFeedbackEvent,
+  ): Promise<void> {
+    const paths = await this.ensureChannelDirectory(key);
+    await mkdir(path.dirname(paths.globalMemoryUsageFile), { recursive: true });
+    await appendJsonl(
+      paths.globalMemoryUsageFile,
+      {
+        type: "memory_feedback",
+        schemaVersion: 1,
+        topic: event.topic,
+        outcome: event.outcome,
+        reason: event.reason,
+        verifiedBy: event.verifiedBy,
+        notVerified: event.notVerified,
+        runId: event.runId,
+        disposition: event.disposition,
+        ...(event.replacementTopic === undefined
+          ? {}
+          : { replacementTopic: event.replacementTopic }),
+        createdAt: event.createdAt,
+      },
+      this.maxMemoryUsageFileBytes,
+    );
+  }
+
+  async recordMemoryCurationEvent(
+    key: ChannelSessionKey,
+    event: MemoryCurationEvent,
+  ): Promise<void> {
+    const paths = await this.ensureChannelDirectory(key);
+    await mkdir(path.dirname(paths.globalMemoryAuditFile), { recursive: true });
+    await appendJsonl(
+      paths.globalMemoryAuditFile,
+      {
+        type: "memory_curation",
+        schemaVersion: 1,
+        action: event.action,
+        runId: event.runId,
+        reason: event.reason,
+        ...(event.candidateTopic === undefined
+          ? {}
+          : { candidateTopic: event.candidateTopic }),
+        ...(event.targetTopic === undefined
+          ? {}
+          : { targetTopic: event.targetTopic }),
+        createdAt: event.createdAt,
+      },
+      this.maxMemoryAuditFileBytes,
+    );
+  }
+
+  async writeMemoryCurationJob(
+    key: ChannelSessionKey,
+    runId: string,
+    content: string,
+  ): Promise<void> {
+    const paths = await this.ensureChannelDirectory(key);
+    assertTextSize(content, this.maxMemoryCurationJobFileBytes, "Memory curation job");
+    await mkdir(paths.globalMemoryCurationJobsDir, { recursive: true });
+    const filePath = memoryCurationJobPath(paths.globalMemoryCurationJobsDir, runId);
+    const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(temporaryPath, content, "utf8");
+    await rename(temporaryPath, filePath);
+  }
+
+  async listMemoryCurationJobs(): Promise<readonly StoredMemoryCurationJob[]> {
+    const directory = resolveInside(this.rootDir, "memories", "curation_jobs");
+    let names: readonly string[];
+    try {
+      names = (await readdir(directory, { withFileTypes: true }))
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .map((entry) => entry.name)
+        .sort();
+    } catch (error: unknown) {
+      if (isNodeErrorWithCode(error, "ENOENT")) return [];
+      throw error;
+    }
+    const jobs: StoredMemoryCurationJob[] = [];
+    for (const name of names) {
+      const filePath = path.join(directory, name);
+      const content = await readTextIfExists(
+        filePath,
+        this.maxMemoryCurationJobFileBytes,
+      );
+      if (content !== undefined) {
+        jobs.push({
+          id: name.slice(0, -5),
+          path: relativeStorePath(this.rootDir, filePath),
+          content,
+        });
+      }
+    }
+    return jobs;
+  }
+
+  async deleteMemoryCurationJob(runId: string): Promise<void> {
+    const directory = resolveInside(this.rootDir, "memories", "curation_jobs");
+    const filePath = memoryCurationJobPath(directory, runId);
+    try {
+      await unlink(filePath);
+    } catch (error: unknown) {
+      if (!isNodeErrorWithCode(error, "ENOENT")) throw error;
+    }
+  }
+
   async deleteChannelDirectory(key: ChannelSessionKey): Promise<void> {
     const paths = this.getPaths(key);
     await rm(paths.channelDir, { recursive: true, force: true });
@@ -440,6 +729,9 @@ export class FileChannelWorkspaceStore implements ChannelWorkspaceStore {
     }
     if (ref.document === "audit") {
       return this.maxMemoryAuditFileBytes;
+    }
+    if (ref.document === "usage") {
+      return this.maxMemoryUsageFileBytes;
     }
     return this.maxMemoryFileBytes;
   }
@@ -500,6 +792,7 @@ export class FileChannelWorkspaceStore implements ChannelWorkspaceStore {
     }
     try {
       if (request.document === "rollout_summary") {
+        const requestSummary = extractRolloutUserRequest(request.content);
         await this.upsertMemoryIndexBullet(key, paths, {
           scope: request.scope,
           topic: request.topic,
@@ -507,14 +800,19 @@ export class FileChannelWorkspaceStore implements ChannelWorkspaceStore {
           marker: "recent-rollout-summaries",
           bullet: memoryReferenceBullet({
             topic: request.topic,
-            title: extractMemoryTitle(request.content, "Run summary"),
+            title: requestSummary.length === 0
+              ? extractMemoryTitle(request.content, "Run summary")
+              : requestSummary,
             href: `rollout_summaries/${request.topic}.md`,
-            detail: extractMemoryExcerpt(request.content),
+            detail: "Episode recap; inspect and revalidate before reuse.",
           }),
           reason: "Automatically index rollout_summary memory document",
           source: request.source,
         });
-      } else {
+      } else if (
+        memoryCandidateStatus(request.content) === "pending" ||
+        memoryCandidateStatus(request.content) === "needs_review"
+      ) {
         await this.upsertMemoryIndexBullet(key, paths, {
           scope: request.scope,
           topic: request.topic,
@@ -522,9 +820,9 @@ export class FileChannelWorkspaceStore implements ChannelWorkspaceStore {
           marker: "pending-extension-notes",
           bullet: memoryReferenceBullet({
             topic: request.topic,
-            title: extractMemoryTitle(request.content, "Extension note"),
+            title: "Pending memory candidate",
             href: `extensions/ad_hoc/notes/${request.topic}.md`,
-            detail: extractMemoryExcerpt(request.content),
+            detail: "Requires curation or user review before becoming accepted knowledge.",
           }),
           reason: "Automatically index extension_note memory candidate",
           source: request.source,
@@ -536,9 +834,26 @@ export class FileChannelWorkspaceStore implements ChannelWorkspaceStore {
           marker: "pending-extension-notes",
           bullet: memorySummaryBullet({
             topic: request.topic,
-            title: extractMemoryTitle(request.content, "Extension note"),
+            title: "Pending memory candidate; not accepted knowledge",
           }),
           reason: "Automatically surface extension_note memory candidate",
+          source: request.source,
+        });
+      } else {
+        await this.removeMemoryIndexBullet(key, paths, {
+          scope: request.scope,
+          topic: request.topic,
+          section: "Pending Extension Notes",
+          marker: "pending-extension-notes",
+          reason: "Remove resolved extension_note from pending memory index",
+          source: request.source,
+        });
+        await this.removeMemorySummaryBullet(key, paths, {
+          scope: request.scope,
+          topic: request.topic,
+          section: "Pending Extension Notes",
+          marker: "pending-extension-notes",
+          reason: "Remove resolved extension_note from pending memory summary",
           source: request.source,
         });
       }
@@ -759,6 +1074,8 @@ function memoryDocumentPath(
       return paths.globalMemoryFile;
     case "audit":
       return paths.globalMemoryAuditFile;
+    case "usage":
+      return paths.globalMemoryUsageFile;
     case "topic": {
       const topic = assertMemoryTopic(ref.topic);
       return path.join(paths.globalMemoryDir, `${topic}.md`);
@@ -783,6 +1100,7 @@ function legacyMemoryDocumentPath(
     case "summary":
     case "rollout_summary":
     case "extension_note":
+    case "usage":
       return undefined;
     case "index":
       return paths.legacyGlobalMemoryFile;
@@ -844,7 +1162,7 @@ function upsertManagedBullet(
     .filter((line) => !isManagedBulletForTopic(line, topic));
   const lines = [...existing, input.bullet]
     .filter((line) => line.trim().length > 0)
-    .slice(-40);
+    .slice(-managedBulletLimit(input.marker));
   return replaceManagedSection(base, input.section, start, end, lines);
 }
 
@@ -970,6 +1288,36 @@ function extractMemoryExcerpt(content: string): string {
   return truncateInline(lines.slice(1).join(" "), 180);
 }
 
+function extractRolloutUserRequest(content: string): string {
+  const match = /## User Request\s+```text\s*([\s\S]*?)```/u.exec(content);
+  const firstLine = match?.[1]
+    ?.split(/\r?\n/u)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  return firstLine === undefined ? "" : truncateInline(firstLine, 120);
+}
+
+function memoryCandidateStatus(
+  content: string,
+): "pending" | "needs_review" | "accepted" | "rejected" {
+  const match = /^status:\s*(pending|needs_review|accepted|rejected)\s*$/imu.exec(content);
+  return match?.[1] === "needs_review" ||
+      match?.[1] === "accepted" ||
+      match?.[1] === "rejected"
+    ? match[1]
+    : "pending";
+}
+
+function managedBulletLimit(marker: string): number {
+  if (marker === "recent-rollout-summaries") {
+    return 5;
+  }
+  if (marker === "pending-extension-notes") {
+    return 20;
+  }
+  return 40;
+}
+
 function truncateInline(text: string, maxChars: number): string {
   const oneLine = text.replace(/\s+/gu, " ").trim();
   if (oneLine.length <= maxChars) {
@@ -1009,6 +1357,14 @@ function assertTextSize(content: string, maxBytes: number, label: string): void 
       `${label} exceeds maximum size of ${maxBytes} bytes`,
     );
   }
+}
+
+function memoryCurationJobPath(directory: string, runId: string): string {
+  const slug = runId.toLowerCase()
+    .replace(/[^a-z0-9_-]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 32) || "run";
+  return path.join(directory, `${slug}-${sha256(runId).slice(0, 16)}.json`);
 }
 
 function relativeStorePath(rootDir: string, filePath: string): string {

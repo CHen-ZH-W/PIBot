@@ -37,6 +37,12 @@ export const readSkillTool: CodingToolDefinition<
   name: "read_skill",
   riskLevel: "read-only",
   executionMode: "parallel",
+  resolveCapabilities: (input) => ({
+    requirements: [{
+      capability: "runtime.read",
+      resources: [`skill:${input.location}:${input.path ?? "SKILL.md"}`],
+    }],
+  }),
   parse: parseReadSkillInput,
   description:
     "Read a SKILL.md file or relative resource from a pibot-indexed Skill. Use the location shown in the available skills list.",
@@ -111,6 +117,18 @@ export const writeSkillTool: CodingToolDefinition<
   name: "write_skill",
   riskLevel: "external",
   executionMode: "sequential",
+  resolveCapabilities: (input) => ({
+    requirements: [
+      {
+        capability: "runtime.control",
+        resources: [`skill:${input.name}:${input.path ?? "SKILL.md"}`],
+      },
+      {
+        capability: "external.side_effect",
+        resources: ["pibot-wide-skill-store"],
+      },
+    ],
+  }),
   parse: parseWriteSkillInput,
   description:
     "Create or update a pibot-wide Skill package under .pibot/skills. Requires an explicit Skill name and writes only inside that Skill directory.",

@@ -5,6 +5,7 @@ import type {
   AgentStepId,
   AgentUserTurnId,
 } from "../core/ids";
+import type { ToolExecutionSnapshot } from "../core/tools";
 import type { AgentMode } from "./mode";
 import {
   NextStepInbox,
@@ -73,6 +74,19 @@ export interface AgentStepContext {
   readonly advertisedTools: readonly string[];
   readonly coordinatorGoal?: string;
   readonly model?: string;
+  readonly snapshot: AgentStepSnapshot;
+}
+
+export interface AgentStepSnapshot {
+  readonly schemaVersion: 1;
+  readonly capturedAt: string;
+  readonly runtime: {
+    readonly version: number;
+    readonly mode: AgentMode;
+    readonly coordinatorGoal?: string;
+  };
+  readonly execution: ToolExecutionSnapshot;
+  readonly worldState: Readonly<Record<string, unknown>>;
 }
 
 const legacyStepSequences = new WeakMap<object, { nextStep: number }>();
@@ -81,6 +95,7 @@ const legacyStepInboxes = new WeakMap<object, NextStepInbox>();
 export function captureAgentStepContext(
   run: AgentRunContext,
   model: string | undefined,
+  executionSnapshot?: ToolExecutionSnapshot,
 ): AgentStepContext {
   const stepSequence = run.stepSequence ?? legacyStepSequence(run);
   const step = stepSequence.nextStep;
@@ -96,6 +111,20 @@ export function captureAgentStepContext(
     ...controlMessages.map((message) => message.text),
     ...legacySteeringMessages,
   ];
+  const execution = executionSnapshot ?? Object.freeze({
+    schemaVersion: 1 as const,
+    authorityVersion: "unversioned",
+    availableTools: Object.freeze([] as string[]),
+    runtimeStateVersion: run.state.version,
+    mode: run.state.mode,
+  });
+  const runtimeSnapshot = Object.freeze({
+    version: run.state.version,
+    mode: run.state.mode,
+    ...(run.state.coordinator.goal === undefined
+      ? {}
+      : { coordinatorGoal: run.state.coordinator.goal }),
+  });
   return Object.freeze({
     runId: run.runId,
     userTurnId: run.userTurnId,
@@ -110,6 +139,13 @@ export function captureAgentStepContext(
       ? {}
       : { coordinatorGoal: run.state.coordinator.goal }),
     ...(model === undefined ? {} : { model }),
+    snapshot: Object.freeze({
+      schemaVersion: 1 as const,
+      capturedAt: new Date().toISOString(),
+      runtime: runtimeSnapshot,
+      execution,
+      worldState: Object.freeze({}),
+    }),
   });
 }
 
@@ -142,8 +178,47 @@ export function withAdvertisedStepTools(
   context: AgentStepContext,
   tools: readonly string[],
 ): AgentStepContext {
+  const advertisedTools = Object.freeze([...tools]);
   return Object.freeze({
     ...context,
-    advertisedTools: Object.freeze([...tools]),
+    advertisedTools,
+    snapshot: Object.freeze({
+      ...context.snapshot,
+      execution: Object.freeze({
+        ...context.snapshot.execution,
+        availableTools: advertisedTools,
+      }),
+    }),
   });
+}
+
+export function withStepWorldState(
+  context: AgentStepContext,
+  worldState: Readonly<Record<string, unknown>>,
+): AgentStepContext {
+  return Object.freeze({
+    ...context,
+    snapshot: Object.freeze({
+      ...context.snapshot,
+      worldState: deepFreezeRecord(worldState),
+    }),
+  });
+}
+
+function deepFreezeRecord(
+  value: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  return deepFreezeValue({ ...value }) as Readonly<Record<string, unknown>>;
+}
+
+function deepFreezeValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map(deepFreezeValue));
+  }
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => [key, deepFreezeValue(item)] as const);
+    return Object.freeze(Object.fromEntries(entries));
+  }
+  return value;
 }

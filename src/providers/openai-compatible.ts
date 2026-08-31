@@ -15,27 +15,44 @@ import type {
   ModelUsage,
   DeveloperRoleMode,
 } from "../agent/model";
+import type { ModelRequestCompatibility } from "../models/types";
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
 
 export interface OpenAICompatibleModelClientConfig {
+  readonly providerId?: string;
+  readonly auth?: "bearer" | "none";
+  readonly apiKey?: string;
   readonly apiKeyEnvVar?: string;
+  readonly baseUrl?: string;
   readonly baseUrlEnvVar?: string;
+  readonly model?: string;
   readonly modelEnvVar?: string;
+  readonly developerRoleMode?: DeveloperRoleMode;
   readonly developerRoleModeEnvVar?: string;
   readonly defaultBaseUrl?: string;
   readonly defaultModel?: string;
   readonly defaultDeveloperRoleMode?: DeveloperRoleMode;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly request?: ModelRequestCompatibility;
 }
 
 interface ResolvedConfig {
+  readonly providerId: string;
+  readonly auth: "bearer" | "none";
+  readonly apiKey?: string;
   readonly apiKeyEnvVar: string;
+  readonly baseUrl?: string;
   readonly baseUrlEnvVar: string;
+  readonly model?: string;
   readonly modelEnvVar: string;
+  readonly developerRoleMode?: DeveloperRoleMode;
   readonly developerRoleModeEnvVar: string;
   readonly defaultBaseUrl: string;
   readonly defaultModel: string;
   readonly defaultDeveloperRoleMode: DeveloperRoleMode;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly request: ModelRequestCompatibility;
 }
 
 type ProviderRole =
@@ -98,15 +115,17 @@ interface ProviderTool {
 }
 
 interface ProviderRequestBody {
+  readonly [key: string]: unknown;
   readonly model: string;
   readonly stream: true;
-  readonly stream_options: {
+  readonly stream_options?: {
     readonly include_usage: true;
   };
   readonly messages: readonly ProviderMessage[];
   readonly tools?: readonly ProviderTool[];
   readonly temperature?: number;
   readonly max_tokens?: number;
+  readonly max_completion_tokens?: number;
 }
 
 interface ToolCallAccumulator {
@@ -121,15 +140,25 @@ export class OpenAICompatibleProviderAdapter implements ModelProviderAdapter {
 
   constructor(config: OpenAICompatibleModelClientConfig = {}) {
     this.config = {
+      providerId: config.providerId ?? "openai_compatible",
+      auth: config.auth ?? "bearer",
+      ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }),
       apiKeyEnvVar: config.apiKeyEnvVar ?? "OPENAI_API_KEY",
+      ...(config.baseUrl === undefined ? {} : { baseUrl: config.baseUrl }),
       baseUrlEnvVar: config.baseUrlEnvVar ?? "OPENAI_BASE_URL",
+      ...(config.model === undefined ? {} : { model: config.model }),
       modelEnvVar: config.modelEnvVar ?? "OPENAI_MODEL",
+      ...(config.developerRoleMode === undefined
+        ? {}
+        : { developerRoleMode: config.developerRoleMode }),
       developerRoleModeEnvVar:
         config.developerRoleModeEnvVar ?? "OPENAI_DEVELOPER_ROLE_MODE",
       defaultBaseUrl: config.defaultBaseUrl ?? "https://api.openai.com/v1",
       defaultModel: config.defaultModel ?? "gpt-4o-mini",
       defaultDeveloperRoleMode:
         config.defaultDeveloperRoleMode ?? "native",
+      headers: config.headers ?? {},
+      request: config.request ?? {},
     };
   }
 
@@ -147,15 +176,15 @@ export class OpenAICompatibleProviderAdapter implements ModelProviderAdapter {
     }
     yield {
       type: "start",
-      provider: "openai_compatible",
+      provider: this.config.providerId,
       model,
       developerRoleMode,
       authorityDegraded: developerRoleMode === "system-fallback",
     };
 
     try {
-      const apiKey = readEnv(this.config.apiKeyEnvVar);
-      if (apiKey === undefined) {
+      const apiKey = this.config.apiKey ?? readEnv(this.config.apiKeyEnvVar);
+      if (this.config.auth === "bearer" && apiKey === undefined) {
         yield {
           type: "error",
           error: {
@@ -170,8 +199,11 @@ export class OpenAICompatibleProviderAdapter implements ModelProviderAdapter {
       const response = await fetch(this.chatCompletionsUrl(), {
         method: "POST",
         headers: {
-          authorization: `Bearer ${apiKey}`,
+          ...(this.config.auth === "bearer" && apiKey !== undefined
+            ? { authorization: `Bearer ${apiKey}` }
+            : {}),
           "content-type": "application/json",
+          ...this.config.headers,
         },
         body: JSON.stringify(
           toProviderRequestBody(
@@ -179,6 +211,7 @@ export class OpenAICompatibleProviderAdapter implements ModelProviderAdapter {
             model,
             shouldBackfillMissingReasoningContent(model, this.chatCompletionsUrl()),
             developerRoleMode,
+            this.config.request,
           ),
         ),
         ...optionalSignal(signal),
@@ -303,6 +336,7 @@ export class OpenAICompatibleProviderAdapter implements ModelProviderAdapter {
   private resolveModel(request: ModelRequest): string {
     return (
       request.model ??
+      this.config.model ??
       readEnv(this.config.modelEnvVar) ??
       this.config.defaultModel
     );
@@ -310,13 +344,16 @@ export class OpenAICompatibleProviderAdapter implements ModelProviderAdapter {
 
   private chatCompletionsUrl(): string {
     const baseUrl = removeTrailingSlash(
-      readEnv(this.config.baseUrlEnvVar) ?? this.config.defaultBaseUrl,
+      this.config.baseUrl ??
+        readEnv(this.config.baseUrlEnvVar) ??
+        this.config.defaultBaseUrl,
     );
     return `${baseUrl}/chat/completions`;
   }
 
   private resolveDeveloperRoleMode(): DeveloperRoleMode {
-    const value = readEnv(this.config.developerRoleModeEnvVar) ??
+    const value = this.config.developerRoleMode ??
+      readEnv(this.config.developerRoleModeEnvVar) ??
       this.config.defaultDeveloperRoleMode;
     if (value === "native" || value === "system-fallback") {
       return value;
@@ -332,13 +369,15 @@ function toProviderRequestBody(
   model: string,
   backfillMissingReasoningContent: boolean,
   developerRoleMode: DeveloperRoleMode,
+  compatibility: ModelRequestCompatibility,
 ): ProviderRequestBody {
   return {
+    ...(compatibility.extraBody ?? {}),
     model,
     stream: true,
-    stream_options: {
-      include_usage: true,
-    },
+    ...(compatibility.streamUsage === false
+      ? {}
+      : { stream_options: { include_usage: true as const } }),
     messages: repairToolCallMessageOrder(request.messages).map((message) =>
       toProviderMessage(
         message,
@@ -347,8 +386,12 @@ function toProviderRequestBody(
       ),
     ),
     ...optionalTools(request.tools),
-    ...optionalNumber("temperature", request.temperature),
-    ...optionalNumber("max_tokens", request.maxOutputTokens),
+    ...(compatibility.supportsTemperature === false
+      ? {}
+      : optionalNumber("temperature", request.temperature)),
+    ...(compatibility.maxTokensField === "max_completion_tokens"
+      ? optionalNumber("max_completion_tokens", request.maxOutputTokens)
+      : optionalNumber("max_tokens", request.maxOutputTokens)),
   };
 }
 

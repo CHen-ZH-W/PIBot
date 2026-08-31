@@ -40,6 +40,10 @@ async function runAcceptance() {
     acceptsSpawnAndCollect,
   );
   await runCase(
+    "child terminal status is delivered as an event and external keys are idempotent",
+    acceptsTerminalEventAndIdempotency,
+  );
+  await runCase(
     "child tmux pane inherits model environment from the parent process",
     acceptsInheritedModelEnvironment,
   );
@@ -127,6 +131,37 @@ async function acceptsSpawnAndCollect() {
   assert.match(
     await readFile(join(status.paths.runDir, "task.md"), "utf8"),
     /ReviewAgent/u,
+  );
+}
+
+async function acceptsTerminalEventAndIdempotency() {
+  const fixture = await createFixture();
+  const first = await fixture.childAgents.spawnAgent({
+    role: "explore",
+    task: "sleep-short event-driven",
+    readOnly: true,
+    timeoutMs: 5000,
+    externalKey: "task-attempt-1",
+  });
+  const duplicate = await fixture.childAgents.spawnAgent({
+    role: "explore",
+    task: "this duplicate must not start",
+    readOnly: true,
+    timeoutMs: 5000,
+    externalKey: "task-attempt-1",
+  });
+  assert.equal(duplicate.childRunId, first.childRunId);
+  const matching = (await fixture.store.listRuns(fixture.key, {
+    parentRunId: first.parentRunId,
+    includeCompleted: true,
+  })).filter((run) => run.externalKey === "task-attempt-1");
+  assert.equal(matching.length, 1);
+
+  const terminal = await fixture.childAgents.waitForTerminal(first.childRunId);
+  assert.equal(terminal.status, "completed");
+  assert.match(
+    await readFile(terminal.paths.resultFile, "utf8"),
+    /fake child result after short sleep/u,
   );
 }
 
@@ -554,6 +589,7 @@ async function createFixture(options = {}) {
     key,
     store: childStore,
     supervisor,
+    childAgents,
     tools,
   };
 }

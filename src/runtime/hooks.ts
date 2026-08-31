@@ -30,6 +30,12 @@ export interface RuntimeModelCallHookContext {
   readonly request: ModelRequest;
 }
 
+export interface RuntimeStepHookContext {
+  readonly run: AgentRunContext;
+  readonly step: number;
+  readonly stepContext: AgentStepContext;
+}
+
 export interface RuntimeAfterModelCallHookContext
   extends RuntimeModelCallHookContext {
   readonly result: RuntimeModelCallResult;
@@ -68,6 +74,9 @@ export type BeforeToolCallDecision =
     };
 
 export interface RuntimeHook {
+  captureStepContext?(
+    context: RuntimeStepHookContext,
+  ): Promise<AgentStepContext | void> | AgentStepContext | void;
   beforeModelCall?(
     context: RuntimeModelCallHookContext,
   ): Promise<ModelRequest | void> | ModelRequest | void;
@@ -88,6 +97,19 @@ export interface RuntimeHook {
 
 export class RuntimeHookRunner {
   constructor(private readonly hooks: readonly RuntimeHook[] = []) {}
+
+  async captureStepContext(
+    context: RuntimeStepHookContext,
+  ): Promise<AgentStepContext> {
+    let stepContext = context.stepContext;
+    for (const hook of this.hooks) {
+      stepContext = (await hook.captureStepContext?.({
+        ...context,
+        stepContext,
+      })) ?? stepContext;
+    }
+    return stepContext;
+  }
 
   async beforeModelCall(
     context: RuntimeModelCallHookContext,

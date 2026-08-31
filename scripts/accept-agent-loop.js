@@ -25,6 +25,10 @@ async function runAcceptance() {
     "reasoning and completed messages are emitted",
     acceptsReasoningAndCompletedMessageEvents,
   );
+  await runCase(
+    "completed streamed tool calls execute before the model stream ends",
+    acceptsStreamingToolExecution,
+  );
   console.log("AgentLoop acceptance passed");
 }
 
@@ -262,6 +266,70 @@ async function acceptsReasoningAndCompletedMessageEvents() {
   assert.equal(completed.message.reasoningContent, "Inspecting the request.");
 }
 
+async function acceptsStreamingToolExecution() {
+  let streamEnded = false;
+  let startedBeforeStreamEnd = false;
+  let markToolStarted;
+  const toolStarted = new Promise((resolve) => {
+    markToolStarted = resolve;
+  });
+  let modelCalls = 0;
+  const model = {
+    async *stream() {
+      modelCalls += 1;
+      yield {
+        type: "start",
+        provider: "anthropic",
+        model: "claude-streaming-test",
+      };
+      if (modelCalls === 1) {
+        yield {
+          type: "tool_call",
+          call: {
+            id: "streaming-read",
+            name: "read",
+            argumentsJson: JSON.stringify({ path: "README.md" }),
+          },
+        };
+        await Promise.race([
+          toolStarted,
+          wait(1000).then(() => {
+            throw new Error("tool did not start while the model stream remained open");
+          }),
+        ]);
+        streamEnded = true;
+      } else {
+        yield { type: "text_delta", text: "streamed tool result observed" };
+      }
+      yield { type: "done" };
+    },
+  };
+  const tools = createReadToolExecutor();
+  const originalExecute = tools.executeTool;
+  tools.executeTool = async (call, signal, snapshot) => {
+    startedBeforeStreamEnd = !streamEnded;
+    markToolStarted();
+    return originalExecute(call, signal, snapshot);
+  };
+  const result = await new MinimalAgentLoop({ model, tools }).run({
+    userText: "read while streaming",
+    systemPrompt: "Use tools.",
+    history: [],
+    tools: [readToolSchema],
+    maxSteps: 2,
+  });
+
+  assert.equal(result.reason, "completed");
+  assert.equal(startedBeforeStreamEnd, true);
+  assert.equal(
+    result.messages.some(
+      (message) =>
+        message.role === "tool" && message.toolCallId === "streaming-read",
+    ),
+    true,
+  );
+}
+
 async function acceptsInvalidToolArguments() {
   const requests = [];
   const model = createScriptedModel([
@@ -330,6 +398,10 @@ function createScriptedModel(steps, requests, usages = []) {
       };
     },
   };
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function createReadToolExecutor() {

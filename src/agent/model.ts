@@ -1,11 +1,13 @@
 import type { LlmRequest } from "../core/agent";
 import type { ToolCallId } from "../core/ids";
+import type { ModelRef } from "../models/types";
 
-export type ModelProvider = "openai_compatible";
+export type ModelProvider = string;
 export type DeveloperRoleMode = "native" | "system-fallback";
 
 export interface ModelRequest extends LlmRequest {
   readonly model?: string;
+  readonly modelRef?: ModelRef;
 }
 
 export interface ModelToolCall {
@@ -83,7 +85,7 @@ export interface ModelProviderAdapter extends ModelClient {}
 
 export interface RetryingModelClientOptions {
   readonly maxRetries?: number;
-  readonly fallbackModels?: readonly string[];
+  readonly fallbackModels?: readonly (string | ModelRef)[];
   readonly baseRetryDelayMs?: number;
   readonly maxRetryDelayMs?: number;
   readonly random?: () => number;
@@ -91,7 +93,7 @@ export interface RetryingModelClientOptions {
 
 export class RetryingModelClient implements ModelClient {
   private readonly maxRetries: number;
-  private readonly fallbackModels: readonly string[];
+  private readonly fallbackModels: readonly (string | ModelRef)[];
   private readonly baseRetryDelayMs: number;
   private readonly maxRetryDelayMs: number;
   private readonly random: () => number;
@@ -119,14 +121,17 @@ export class RetryingModelClient implements ModelClient {
     request: ModelRequest,
     signal?: AbortSignal,
   ): AsyncIterable<ModelEvent> {
-    const models = distinctModels(request.model, this.fallbackModels);
+    const models = distinctModels(
+      request.modelRef ?? request.model,
+      this.fallbackModels,
+    );
     let retryCount = 0;
 
     for (let modelIndex = 0; modelIndex < models.length; modelIndex += 1) {
       const requestedModel = models[modelIndex];
       for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
         let emittedContent = false;
-        let activeModel = requestedModel;
+        let activeModel = modelSelectionLabel(requestedModel);
         let failure: ModelError | undefined;
 
         for await (const event of this.adapter.stream(
@@ -184,7 +189,9 @@ export class RetryingModelClient implements ModelClient {
           retryCount,
           delayMs,
           ...optionalString("fromModel", activeModel),
-          ...(canRetry ? {} : optionalString("toModel", nextModel)),
+          ...(canRetry
+            ? {}
+            : optionalString("toModel", modelSelectionLabel(nextModel))),
         };
         await sleep(delayMs, signal);
         if (!canRetry) {
@@ -196,12 +203,17 @@ export class RetryingModelClient implements ModelClient {
 }
 
 function distinctModels(
-  primary: string | undefined,
-  fallbackModels: readonly string[],
-): readonly (string | undefined)[] {
-  const result: (string | undefined)[] = [primary];
+  primary: string | ModelRef | undefined,
+  fallbackModels: readonly (string | ModelRef)[],
+): readonly (string | ModelRef | undefined)[] {
+  const result: (string | ModelRef | undefined)[] = [primary];
   for (const fallback of fallbackModels) {
-    if (fallback.length > 0 && !result.includes(fallback)) {
+    const fallbackLabel = modelSelectionLabel(fallback);
+    if (
+      fallbackLabel !== undefined &&
+      fallbackLabel.length > 0 &&
+      !result.some((item) => modelSelectionLabel(item) === fallbackLabel)
+    ) {
       result.push(fallback);
     }
   }
@@ -210,9 +222,28 @@ function distinctModels(
 
 function withRequestedModel(
   request: ModelRequest,
-  model: string | undefined,
+  model: string | ModelRef | undefined,
 ): ModelRequest {
-  return model === undefined ? request : { ...request, model };
+  if (model === undefined) {
+    return request;
+  }
+  if (typeof model === "string") {
+    const { modelRef: _modelRef, ...withoutModelRef } = request;
+    return { ...withoutModelRef, model };
+  }
+  const { model: _model, ...withoutModel } = request;
+  return { ...withoutModel, modelRef: model };
+}
+
+function modelSelectionLabel(
+  model: string | ModelRef | undefined,
+): string | undefined {
+  if (model === undefined) {
+    return undefined;
+  }
+  return typeof model === "string"
+    ? model
+    : `${model.provider}/${model.model}`;
 }
 
 function backoffDelay(

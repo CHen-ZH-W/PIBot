@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { MinimalAgentLoop } from "../agent/agent-loop";
 import {
-  RetryingModelClient,
+  type ModelClient,
   type ModelRequest,
 } from "../agent/model";
 import {
@@ -12,6 +12,7 @@ import {
 import type { AgentLoopEvent } from "../agent/events";
 import type { LlmMessage, LlmToolSchema } from "../core/agent";
 import type { ChannelSessionKey } from "../core/session";
+import type { ModelRef } from "../models/types";
 import type {
   ToolApprovalDecision,
   ToolApprovalPromptRequest,
@@ -51,8 +52,10 @@ import {
   AgentRunController,
   type RuntimeTransition,
 } from "../runtime/run-controller";
+import { AgentRuntime } from "../runtime/agent-runtime";
 import { WorkingSetHook } from "../runtime/working-set";
 import { createRuntimeWorldStateProvider } from "../runtime/world-state";
+import type { ContextManager } from "../workspace/context-manager";
 import { scanWorkspaceSkills } from "../workspace/skills";
 import type { ChannelWorkspaceStore } from "../workspace/store";
 import { FileTaskStore } from "../workspace/tasks";
@@ -66,7 +69,10 @@ import {
   type CodingToolExecutorOptions,
   type ToolApprovalMode,
 } from "../tools";
-import { createToolApprovalGate } from "../tools/approval";
+import {
+  createToolApprovalGate,
+  toolApprovalRulesForRun,
+} from "../tools/approval";
 import type { SandboxExecutor } from "../workspace/sandbox";
 import type {
   ChannelContextMessage,
@@ -111,6 +117,16 @@ import {
 } from "../workflow/fingerprints";
 import type { FailureExperienceRecord } from "../workflow/types";
 import type { WorkflowOrchestrator } from "../workflow/orchestrator";
+import {
+  ChildWorkflowScheduler,
+  childWorkflowExternalKeyPrefix,
+  formatChildWorkflowParentResume,
+} from "../workflow/child-scheduler";
+import {
+  formatTaskGraphParentResume,
+  TaskGraphScheduler,
+  taskGraphExternalKeyPrefix,
+} from "../workflow/task-scheduler";
 import type {
   FileWebConversationStore,
   WebConversation,
@@ -123,7 +139,9 @@ export interface WebAgentRunnerOptions {
   readonly store: ChannelWorkspaceStore;
   readonly sessions: WorkspaceSessionStore;
   readonly repoWorkflow?: ChannelRepoWorkflow;
-  readonly model: RetryingModelClient;
+  readonly model: ModelClient;
+  readonly contextManager?: ContextManager;
+  readonly resolveModelRef?: () => ModelRef;
   readonly tools: readonly LlmToolSchema[];
   readonly sandboxExecutor: SandboxExecutor;
   readonly sandboxLabel?: string;
@@ -159,6 +177,7 @@ export interface WebAgentRunnerOptions {
   };
   readonly childAgents?: WebChildAgentOptions;
   readonly workflows?: WorkflowOrchestrator;
+  readonly runtime?: AgentRuntime;
 }
 
 export interface WebChildAgentOptions {
@@ -308,6 +327,7 @@ export interface WebAgentRunOptions {
 
 interface QueuedWebFollowUp {
   readonly text: string;
+  readonly source: "webui" | "runtime";
 }
 
 export interface WebApprovalView {
@@ -322,6 +342,7 @@ export interface WebApprovalView {
   readonly status: "pending" | "approved" | "rejected" | "cancelled" | "expired";
   readonly expiresAt: string;
   readonly resolvedMessage?: string;
+  readonly runScopeAllowed: boolean;
 }
 
 type ActiveWebRun = ActiveWebConversationRun | ActiveWebEvolutionRun;
@@ -340,6 +361,7 @@ interface ActiveWebConversationRun {
 interface ActiveWebEvolutionRun {
   readonly kind: "evolution";
   readonly runId: AgentRunId;
+  readonly control: AgentRunController<void>;
 }
 
 interface PendingWebApproval {
@@ -371,10 +393,12 @@ export class WebAgentRunner {
   private readonly maxFollowUpQueueSize: number;
   private readonly approvalTimeoutMs: number;
   private readonly childApprovalResponder: FileChildAgentApprovalResponder | undefined;
+  private readonly runtime: AgentRuntime;
 
   constructor(private readonly options: WebAgentRunnerOptions) {
     this.maxFollowUpQueueSize = options.maxFollowUpQueueSize ?? 5;
     this.approvalTimeoutMs = options.approvalTimeoutMs ?? 300000;
+    this.runtime = options.runtime ?? new AgentRuntime();
     const childApprovalRootDir = options.childAgents?.approvalRootDir;
     if (childApprovalRootDir !== undefined) {
       this.childApprovalResponder = new FileChildAgentApprovalResponder({
@@ -412,6 +436,7 @@ export class WebAgentRunner {
   async decideApproval(
     approvalId: string,
     approved: boolean,
+    scope: "once" | "run" = "once",
   ): Promise<{ readonly ok: true; readonly approval: WebApprovalView } | {
     readonly ok: false;
     readonly error: string;
@@ -423,12 +448,25 @@ export class WebAgentRunner {
         error: "Unknown or completed approval request",
       };
     }
+    if (scope === "run" && pending.request.runScopeAllowed !== true) {
+      return {
+        ok: false,
+        error: "Run-scoped approval is not available for this request",
+      };
+    }
 
     const decision = approved
-      ? { approved: true as const }
-      : deniedApproval("Tool call was rejected in WebUI");
+      ? (scope === "run"
+          ? { approved: true as const, scope: "run" as const }
+          : { approved: true as const })
+      : (scope === "run"
+          ? {
+              ...deniedApproval("Tool call was rejected in WebUI"),
+              scope: "run" as const,
+            }
+          : deniedApproval("Tool call was rejected in WebUI"));
     const status = approved ? "approved" : "rejected";
-    const resolvedMessage = approvalDecisionStatus(pending.request, approved);
+    const resolvedMessage = approvalDecisionStatus(pending.request, approved, scope);
     const approval = await this.finishApproval(
       approvalId,
       decision,
@@ -576,7 +614,8 @@ export class WebAgentRunner {
     const controlRef: {
       current?: AgentRunController<QueuedWebFollowUp>;
     } = {};
-    const control = new AgentRunController<QueuedWebFollowUp>({
+    const control = this.runtime.createRun<QueuedWebFollowUp>({
+      scope: `web:${conversationId}`,
       runContext,
       maxFollowUps: this.maxFollowUpQueueSize,
       onTransition: (transition) => emitWebEvent(runOptions.onEvent, {
@@ -605,7 +644,7 @@ export class WebAgentRunner {
     this.activeByConversation.set(conversationId, active);
 
     const abortExternal = () => {
-      active.control.cancel({
+      this.runtime.cancel(active.control.runId, {
         reason: "client_disconnect",
         source: "web",
       });
@@ -613,21 +652,33 @@ export class WebAgentRunner {
     runOptions.signal?.addEventListener("abort", abortExternal, { once: true });
 
     try {
-      return await active.control.runUserTurns({
-        initial: { text },
-        execute: async (turn) => {
-          resetActiveControlMessageBoundary(active);
-          return this.runConversationTurn(conversationId, turn.text, active);
+      return await this.runtime.runUserTurns<QueuedWebFollowUp, WebAgentTurnResult>(
+        active.control,
+        {
+          initial: { text, source: "webui" },
+          execute: async (turn) => {
+            resetActiveControlMessageBoundary(active);
+            return this.runConversationTurn(conversationId, turn, active);
+          },
+          onFollowUpStart: async (turn) => {
+            const modeSwitch = parseModeSwitchMessage(turn.text);
+            if (modeSwitch !== undefined) {
+              this.runtime.changeMode(
+                active.control.runId,
+                modeSwitch,
+                renderModeSwitchSteering(modeSwitch),
+                "web",
+              );
+            }
+            await emitWebEvent(active.onEvent, {
+              type: "status",
+              conversationId,
+              runId: active.control.runContext.runId,
+              message: "Starting queued follow-up...",
+            });
+          },
         },
-        onFollowUpStart: async () => {
-          await emitWebEvent(active.onEvent, {
-            type: "status",
-            conversationId,
-            runId: active.control.runContext.runId,
-            message: "Starting queued follow-up...",
-          });
-        },
-      });
+      );
     } finally {
       resolveActiveControlMessageBoundary(active);
       runOptions.signal?.removeEventListener("abort", abortExternal);
@@ -637,9 +688,10 @@ export class WebAgentRunner {
 
   private async runConversationTurn(
     conversationId: string,
-    text: string,
+    input: QueuedWebFollowUp,
     active: ActiveWebConversationRun,
   ): Promise<WebAgentTurnResult> {
+    const text = input.text;
     const runContext = active.control.runContext;
     const key = this.memoryKeyFor(conversationId);
     let reason = "unknown";
@@ -671,7 +723,7 @@ export class WebAgentRunner {
         role: "user",
         content: text,
       },
-      source: "webui",
+      source: input.source,
     });
     await emitWebEvent(active.onEvent, {
       type: "conversation",
@@ -730,6 +782,78 @@ export class WebAgentRunner {
         workspaceRoot: runWorkspaceRoot,
         approvalContext,
       });
+      const childScheduler = childAgents === undefined || this.options.workflows === undefined
+        ? undefined
+        : new ChildWorkflowScheduler({
+            workflows: this.options.workflows,
+            childAgents,
+            parentAgentRunId: runContext.runId,
+            externalKeyPrefix: childWorkflowExternalKeyPrefix({
+              workspaceRoot: runWorkspaceRoot,
+              conversationKey: `webui:${conversationId}`,
+            }),
+            metadata: {
+              transport: "webui",
+              conversationId,
+            },
+            parentResume: {
+              acquireHold: ({ workflowRunId }) =>
+                this.runtime.deferRunCompletion(
+                  active.control.runId,
+                  `coordinator_child:${workflowRunId}`,
+                ),
+              enqueue: (event) => {
+                const text = formatChildWorkflowParentResume(event);
+                return this.runtime.enqueueFollowUp(
+                  active.control.runId,
+                  { text, source: "runtime" },
+                  { text, source: "runtime", reserveCapacity: true },
+                ).accepted;
+              },
+            },
+          });
+      const taskScheduler = childAgents === undefined || this.options.workflows === undefined
+        ? undefined
+        : new TaskGraphScheduler({
+            taskStore,
+            workflows: this.options.workflows,
+            externalKeyPrefix: taskGraphExternalKeyPrefix({
+              workspaceRoot: runWorkspaceRoot,
+              conversationKey: `webui:${conversationId}`,
+            }),
+            metadata: {
+              transport: "webui",
+              conversationId,
+            },
+            parentResume: {
+              acquireHold: ({ graphVersion, tasksDigest }) =>
+                this.runtime.deferRunCompletion(
+                  active.control.runId,
+                  `task_graph:v${graphVersion}:${tasksDigest}`,
+                ),
+              enqueue: (event) => {
+                const text = formatTaskGraphParentResume(event);
+                return this.runtime.enqueueFollowUp(
+                  active.control.runId,
+                  { text, source: "runtime" },
+                  { text, source: "runtime", reserveCapacity: true },
+                ).accepted;
+              },
+            },
+            createChildRuntime: (workflowRunId) => {
+              const runtime = this.createChildAgentRuntime({
+                key,
+                runContext: { ...runContext, runId: workflowRunId },
+                workspaceRoot: runWorkspaceRoot,
+                approvalContext,
+              });
+              if (runtime === undefined) {
+                throw new Error("ChildAgentRuntime is not available for TaskGraphScheduler");
+              }
+              return runtime;
+            },
+          });
+      await taskScheduler?.resumeFrozenGraph();
       const runTools = createCodingToolExecutor({
         workspaceRoot: runWorkspaceRoot,
         ...(this.options.pibotSkillsRoot === undefined
@@ -740,11 +864,14 @@ export class WebAgentRunner {
         approvalGate: createToolApprovalGate(this.options.toolApprovalMode, {
           prompter: approvalPrompter,
           context: approvalContext,
+          rules: toolApprovalRulesForRun(runContext.state),
           timeoutMs: this.approvalTimeoutMs,
         }),
         runtime: runContext.state,
         tasks: taskStore,
         ...(childAgents === undefined ? {} : { childAgents }),
+        ...(childScheduler === undefined ? {} : { childScheduler }),
+        ...(taskScheduler === undefined ? {} : { taskScheduler }),
         memory: {
           store: this.options.store,
           key,
@@ -765,6 +892,9 @@ export class WebAgentRunner {
       const agentLoop = new MinimalAgentLoop({
         model: this.options.model,
         tools: runTools,
+        ...(this.options.contextManager === undefined
+          ? {}
+          : { contextManager: this.options.contextManager }),
         hooks: [
           ...(repoStart === undefined
             ? [
@@ -781,6 +911,8 @@ export class WebAgentRunner {
               ...(this.options.sandboxLabel === undefined
                 ? {}
                 : { sandboxLabel: this.options.sandboxLabel }),
+              sandboxPolicy: this.options.sandboxExecutor.policy,
+              sandboxEnforcement: this.options.sandboxExecutor.enforcement,
               approvalMode: this.options.toolApprovalMode,
               pendingApprovalCount: () =>
                 this.pendingApprovalCount(runContext.runId),
@@ -823,6 +955,8 @@ export class WebAgentRunner {
       });
       const toolResultArchiveHook =
         this.options.sessions.createToolResultArchiveHook(key);
+      const memoryUsageHook = this.options.sessions.createMemoryUsageHook(key);
+      const runModelRef = this.options.resolveModelRef?.();
       const realtimeCompactionHook: RuntimeHook = {
         beforeModelCall: async (context) => {
           const refreshed =
@@ -881,6 +1015,7 @@ export class WebAgentRunner {
               postHooks: [
                 realtimeCompactionHook,
                 workingSetHook,
+                memoryUsageHook,
                 toolResultArchiveHook,
               ],
               maxSteps: this.options.maxSteps,
@@ -888,6 +1023,7 @@ export class WebAgentRunner {
                 ? {}
                 : { maxParallelToolCalls: this.options.maxParallelToolCalls }),
               runContext,
+              ...(runModelRef === undefined ? {} : { modelRef: runModelRef }),
               ...(this.options.modelName === undefined
                 ? {}
                 : { model: this.options.modelName }),
@@ -998,7 +1134,7 @@ export class WebAgentRunner {
           userText: text,
           reason,
           steps: result.steps,
-          messages: result.messages,
+          messages: result.messages.slice(runPrepared.generatedMessageStartIndex),
           ...(result.error === undefined
             ? {}
             : {
@@ -1050,7 +1186,7 @@ export class WebAgentRunner {
     const trimmed = text.trim();
     if (isAgentStopCommand(trimmed)) {
       await this.appendActiveControlMessage(active, trimmed);
-      const receipt = active.control.cancel({
+      const receipt = this.runtime.cancel(active.control.runId, {
         reason: "user_stop",
         source: "web",
       });
@@ -1070,9 +1206,31 @@ export class WebAgentRunner {
       };
     }
 
+    if (active.control.awaitingFollowUp) {
+      const receipt = this.runtime.enqueueFollowUp(
+        active.control.runId,
+        { text: trimmed, source: "webui" },
+        { text: trimmed, source: "web" },
+      );
+      await emitWebEvent(active.onEvent, {
+        type: "status",
+        conversationId: active.conversationId,
+        runId: active.control.runContext.runId,
+        message: !receipt.accepted || receipt.position === undefined
+          ? "The follow-up queue is full."
+          : `Follow-up queued at position ${receipt.position}.`,
+      });
+      return {
+        conversationId: active.conversationId,
+        runId: active.control.runContext.runId,
+        reason: receipt.accepted ? "queued" : "busy",
+      };
+    }
+
     const modeSwitch = parseModeSwitchMessage(trimmed);
     if (modeSwitch !== undefined) {
-      const receipt = active.control.changeMode(
+      const receipt = this.runtime.changeMode(
+        active.control.runId,
         modeSwitch,
         renderModeSwitchSteering(modeSwitch),
         "web",
@@ -1095,7 +1253,11 @@ export class WebAgentRunner {
 
     const steering = parseSteeringMessage(trimmed);
     if (steering !== undefined) {
-      const receipt = active.control.steer(steering, "web");
+      const receipt = this.runtime.steer(
+        active.control.runId,
+        steering,
+        "web",
+      );
       await this.appendActiveControlMessage(active, trimmed);
       await emitWebEvent(active.onEvent, {
         type: "status",
@@ -1114,8 +1276,9 @@ export class WebAgentRunner {
 
     const followUp = parseFollowUpMessage(trimmed);
     if (followUp !== undefined) {
-      const receipt = active.control.enqueueFollowUp(
-        { text: followUp },
+      const receipt = this.runtime.enqueueFollowUp(
+        active.control.runId,
+        { text: followUp, source: "webui" },
         { text: followUp, source: "web" },
       );
       if (!receipt.accepted || receipt.position === undefined) {
@@ -1144,7 +1307,11 @@ export class WebAgentRunner {
       };
     }
 
-    const receipt = active.control.steer(renderInlineSteering(trimmed), "web");
+    const receipt = this.runtime.steer(
+      active.control.runId,
+      renderInlineSteering(trimmed),
+      "web",
+    );
     await this.appendActiveControlMessage(active, trimmed);
     await emitWebEvent(active.onEvent, {
       type: "status",
@@ -1370,10 +1537,23 @@ export class WebAgentRunner {
     const runContext = createAgentRunContext({
       agentId: "evolution" as AgentId,
     });
+    const control = this.runtime.createRun<void>({
+      scope: `web:${EVOLUTION_CHANNEL_NAME}`,
+      runContext,
+      maxFollowUps: 0,
+    });
     this.activeByConversation.set(EVOLUTION_CHANNEL_NAME, {
       kind: "evolution",
       runId: runContext.runId,
+      control,
     });
+    const abortExternal = () => {
+      this.runtime.cancel(control.runId, {
+        reason: "client_disconnect",
+        source: "web",
+      });
+    };
+    runOptions.signal?.addEventListener("abort", abortExternal, { once: true });
     const startedAtMs = Date.now();
     let reason = "unknown";
     let errorCode: string | undefined;
@@ -1381,492 +1561,508 @@ export class WebAgentRunner {
     let workflowAttempt: EvolutionWorkflowAttemptContext | undefined;
     let workflowAttemptFinished = false;
 
-    try {
-      const evolutionSnapshot = await this.options.evolution.readSnapshot();
-      const ticket = this.requireEvolutionTicketForImplementation(
-        evolutionSnapshot.tickets,
-        ticketId,
-      );
-      const workflowAdmission = await this.beginEvolutionWorkflowAttempt(
-        ticket,
-        evolutionSnapshot.activeRuntimeVersion?.versionId,
-      );
-      if (workflowAdmission?.blockedReason !== undefined) {
-        await emitWebEvent(runOptions.onEvent, {
-          type: "status",
-          conversationId: EVOLUTION_CHANNEL_NAME,
-          runId: runContext.runId,
-          message:
-            `编排器已阻止重复实现：${workflowAdmission.blockedReason}。` +
-            "请先更新工单中的修复策略或等待熔断冷却。",
-        });
-        return {
-          conversationId: EVOLUTION_CHANNEL_NAME,
-          runId: runContext.runId,
-          reason: "blocked",
-          errorCode: workflowAdmission.blockedReason,
-        };
-      }
-      workflowAttempt = workflowAdmission;
-      const key = evolutionTicketChannelKey(ticket.id);
-      const selfInstructionsTicket = ticket.target === "self_instructions";
-      await emitWebEvent(runOptions.onEvent, {
-        type: "status",
-        conversationId: EVOLUTION_CHANNEL_NAME,
-        runId: runContext.runId,
-        message: selfInstructionsTicket
-          ? "正在创建隔离的自定义指令工作区..."
-          : "正在创建隔离实现工作区...",
-      });
-      const selfInstructionsStaging: SelfInstructionsStagingWorkspace | undefined =
-        selfInstructionsTicket
-          ? await createSelfInstructionsStagingWorkspace({
-              sourceRoot: this.options.workspaceRoot,
-              ticketId: ticket.id,
-              runId: runContext.runId,
-              ...(evolutionSnapshot.selfInstructions === undefined
-                ? {}
-                : { currentInstructions: evolutionSnapshot.selfInstructions }),
-              ...(ticket.proposal.proposedSelfInstructions === undefined
-                ? {}
-                : { proposalDraft: ticket.proposal.proposedSelfInstructions }),
-            })
-          : undefined;
-      const runtimeStaging = selfInstructionsTicket
-        ? undefined
-        : await createRuntimeCodeStagingWorkspace({
-            sourceRoot: this.options.workspaceRoot,
-            ticketId: ticket.id,
-            runId: runContext.runId,
-          });
-      const implementationWorkspaceRoot =
-        selfInstructionsStaging?.root ?? runtimeStaging?.root;
-      if (implementationWorkspaceRoot === undefined) {
-        throw new Error("创建实现工作区失败");
-      }
-      this.options.sandboxExecutor.assertWorkspaceAccess(implementationWorkspaceRoot);
-      const prompt = formatEvolutionImplementationPrompt(
-        ticket,
-        implementationWorkspaceRoot,
-        this.options.workspaceRoot,
-        workflowAttempt?.failureDigest,
-      );
-      const prepared = await this.options.sessions.prepareChannelRun(key);
-      const implementationHistory = (workflowAttempt?.failureDigest.length ?? 0) > 0
-        ? []
-        : prepared.history;
-      const runPrepared = {
-        ...prepared,
-        history: implementationHistory,
-        generatedMessageStartIndex: implementationHistory.length + 2,
-      };
-      await this.options.evolution.beginImplementation(ticket.id, {
-        actor: "webui",
-      });
-      implementationStarted = true;
-      await emitWebEvent(runOptions.onEvent, {
-        type: "run_start",
-        conversationId: EVOLUTION_CHANNEL_NAME,
-        runId: runContext.runId,
-        userTurnId: runContext.userTurnId,
-      });
-      await this.options.sessions.appendContextMessage(key, {
-        message: {
-          role: "user",
-          content: prompt,
-        },
-        source: "webui",
-      });
-
-      await emitWebEvent(runOptions.onEvent, {
-        type: "status",
-        conversationId: EVOLUTION_CHANNEL_NAME,
-        runId: runContext.runId,
-        message: `实现工作区：${implementationWorkspaceRoot}`,
-      });
-
-      const workspaceSkills = await scanWorkspaceSkills(implementationWorkspaceRoot, {
-        ...(this.options.pibotSkillsRoot === undefined
-          ? {}
-          : { pibotSkillsRoot: this.options.pibotSkillsRoot }),
-        ...(this.options.disabledSkills === undefined
-          ? {}
-          : { disabledSkills: this.options.disabledSkills }),
-        ...(this.options.maxSkills === undefined
-          ? {}
-          : { maxSkills: this.options.maxSkills }),
-        ...(this.options.maxSkillFileBytes === undefined
-          ? {}
-          : { maxSkillFileBytes: this.options.maxSkillFileBytes }),
-      });
-      const selfInstructions =
-        await this.options.evolution.readCurrentSelfInstructions();
-      const taskStore = new FileTaskStore({
-        workspaceRoot: implementationWorkspaceRoot,
-      });
-      const childAgents = this.createChildAgentRuntime({
-        key,
-        runContext,
-        workspaceRoot: implementationWorkspaceRoot,
-      });
-      const runToolSchemas = evolutionImplementationToolSchemas(
-        this.options.tools,
-      );
-      const runTools = createCodingToolExecutor({
-        workspaceRoot: implementationWorkspaceRoot,
-        ...(this.options.pibotSkillsRoot === undefined
-          ? {}
-          : { pibotSkillsRoot: this.options.pibotSkillsRoot }),
-        skills: workspaceSkills.skills,
-        sandboxExecutor: this.options.sandboxExecutor,
-        approvalGate: createToolApprovalGate(
-          evolutionImplementationApprovalMode(this.options.toolApprovalMode),
-        ),
-        disabledTools: EVOLUTION_IMPLEMENTATION_DISABLED_TOOLS,
-        runtime: runContext.state,
-        tasks: taskStore,
-        ...(childAgents === undefined ? {} : { childAgents }),
-        memory: {
-          store: this.options.store,
-          key,
-          source: {
-            type: "user",
-            runId: runContext.runId,
-            userId: "webui" as SlackUserId,
-          },
-        },
-        evolution: {
-          submitManualSignal: (input) =>
-            this.options.evolution.submitManualSignal(input),
-          source: "webui_user",
-          actor: "webui",
-        },
-        ...this.options.toolLimits,
-      });
-      const agentLoop = new MinimalAgentLoop({
-        model: this.options.model,
-        tools: runTools,
-        hooks: [
-          new RuntimeModeHook({
-            state: runContext.state,
-            describeTool: (name) => runTools.describeTool(name),
-            worldState: createRuntimeWorldStateProvider({
-              workspaceRoot: implementationWorkspaceRoot,
-              ...(this.options.sandboxLabel === undefined
-                ? {}
-                : { sandboxLabel: this.options.sandboxLabel }),
-              approvalMode: evolutionImplementationApprovalMode(
-                this.options.toolApprovalMode,
-              ),
-              pendingApprovalCount: () =>
-                this.pendingApprovalCount(runContext.runId),
-            }),
-          }),
-          ...(this.options.runtimeHooks ?? []),
-          new WorkingSetHook({ workspaceRoot: implementationWorkspaceRoot }),
-          new CompletedToolReplayGuard(
-            new Set(workflowAttempt?.completedToolCallFingerprints ?? []),
-          ),
-        ],
-      });
-      const promptParts = buildCodingAgentPromptParts({
-        tools: runToolSchemas,
-        memories: prepared.memories,
-        workspaceSkills: workspaceSkills.skills,
-        repoPrompt: undefined,
-        channelWorkspacePrompt: selfInstructionsTicket
-          ? formatSelfInstructionsWorkspacePrompt(
-              implementationWorkspaceRoot,
-              this.options.workspaceRoot,
-              evolutionSnapshot.tickets,
-              ticket.id,
-            )
-          : formatEvolutionWorkspacePrompt(
-              implementationWorkspaceRoot,
-              this.options.workspaceRoot,
-              evolutionSnapshot.tickets,
-              ticket.id,
-              evolutionSnapshot.runtimeVersions.find((version) =>
-                version.id === evolutionSnapshot.activeRuntimeVersion?.versionId
-              ),
-            ),
-        workspaceRoot: implementationWorkspaceRoot,
-        mode: runContext.state.mode,
-        reflectionEnabled: false,
-        ...(selfInstructions === undefined
-          ? {}
-          : { agentSelfInstructions: selfInstructions }),
-        ...(this.options.thinkingLanguage === undefined
-          ? {}
-          : { thinkingLanguage: this.options.thinkingLanguage }),
-      });
-      const systemPrompt = promptParts.stableSystemPrompt;
-      const result = await agentLoop.run(
-        {
-          userText: prompt,
-          systemPrompt,
-          contextLanes: promptParts.contextLanes,
-          history: implementationHistory,
-          tools: runToolSchemas,
-          postHooks: [
-            this.options.sessions.createToolResultArchiveHook(prepared.key),
-          ],
-          maxSteps: this.options.maxSteps,
-          ...(this.options.maxParallelToolCalls === undefined
-            ? {}
-            : { maxParallelToolCalls: this.options.maxParallelToolCalls }),
-          runContext,
-          ...(this.options.modelName === undefined
-            ? {}
-            : { model: this.options.modelName }),
-          ...(this.options.temperature === undefined
-            ? {}
-            : { temperature: this.options.temperature }),
-          ...(this.options.maxOutputTokens === undefined
-            ? {}
-            : { maxOutputTokens: this.options.maxOutputTokens }),
-          onEvent: async (event) => {
-            await emitWebEvent(runOptions.onEvent, {
-              type: "agent_event",
-              conversationId: EVOLUTION_CHANNEL_NAME,
-              runId: runContext.runId,
-              event: toWebAgentStreamLoopEvent(event),
-            });
-          },
-        },
-        runOptions.signal,
-      );
-
-      reason = result.reason;
-      errorCode = result.error?.code;
-      await this.options.sessions.appendRunMessages(runPrepared, result.messages);
-      if (runOptions.failureMemoryPolicy !== "experience") {
-        await this.recordRunRolloutSummaryBestEffort({
-          key,
-          runId: runContext.runId,
-          userText: ticket.title,
-          reason,
-          steps: result.steps,
-          messages: result.messages,
-          ...(result.error === undefined
-            ? {}
-            : {
-                errorCode: result.error.code,
-                errorMessage: result.error.message,
-              }),
-          durationMs: Date.now() - startedAtMs,
-        });
-      }
-      if (result.error !== undefined) {
-        await this.options.sessions.appendContextMessage(key, {
-          message: {
-            role: "assistant",
-            content: `Evolution implementation error (${result.error.code}). ${result.error.message}`,
-          },
-          source: "agent",
-        });
-      }
-
-      let validation:
-        | RuntimeCodeValidationReport
-        | SelfInstructionsValidationReport
-        | undefined;
-      let publish: RuntimeCodePublishReport | undefined;
-      let selfInstructionsDraft: string | undefined;
-      let postRunError: string | undefined;
-      const agentCompleted = result.error === undefined && result.reason === "completed";
-      if (agentCompleted) {
-        if (selfInstructionsTicket) {
-          await emitWebEvent(runOptions.onEvent, {
-            type: "status",
-            conversationId: EVOLUTION_CHANNEL_NAME,
-            runId: runContext.runId,
-            message: "正在验证自定义指令草稿...",
-          });
-          if (selfInstructionsStaging === undefined) {
-            throw new Error("缺少自定义指令暂存工作区");
-          }
-          selfInstructionsDraft = await readStagedSelfInstructions(
-            selfInstructionsStaging,
+    return await this.runtime.runUserTurns<void, WebAgentTurnResult>(control, {
+      initial: undefined,
+      execute: async () => {
+        try {
+          const evolutionSnapshot = await this.options.evolution.readSnapshot();
+          const ticket = this.requireEvolutionTicketForImplementation(
+            evolutionSnapshot.tickets,
+            ticketId,
           );
-          validation = validateStagedSelfInstructions({
-            instructions: selfInstructionsDraft,
-            baselineInstructions: selfInstructionsStaging.baselineInstructions,
-          });
-          if (validation.status !== "passed") {
-            postRunError = "自定义指令验证未通过。";
-          }
-        } else {
-          await emitWebEvent(runOptions.onEvent, {
-            type: "status",
-            conversationId: EVOLUTION_CHANNEL_NAME,
-            runId: runContext.runId,
-            message: "正在验证隔离工作区...",
-          });
-          if (runtimeStaging === undefined) {
-            throw new Error("缺少运行时代码暂存工作区");
-          }
-          validation = await validateRuntimeCodeWorkspace({
-            workspaceRoot: runtimeStaging.root,
-            dependencyRoot: this.options.workspaceRoot,
-          });
-          if (validation.status === "passed") {
+          const workflowAdmission = await this.beginEvolutionWorkflowAttempt(
+            ticket,
+            evolutionSnapshot.activeRuntimeVersion?.versionId,
+          );
+          if (workflowAdmission?.blockedReason !== undefined) {
             await emitWebEvent(runOptions.onEvent, {
               type: "status",
               conversationId: EVOLUTION_CHANNEL_NAME,
               runId: runContext.runId,
-              message: "验证已通过，正在发布检查后的变更...",
+              message:
+                `编排器已阻止重复实现：${workflowAdmission.blockedReason}。` +
+                "请先更新工单中的修复策略或等待熔断冷却。",
             });
-            publish = await publishRuntimeCodeWorkspace({
-              stagingRoot: runtimeStaging.root,
-              destinationRoot: this.options.workspaceRoot,
-              baseline: runtimeStaging.baseline,
-            });
-            if (publish.conflicts.length > 0) {
-              postRunError = `发布冲突：${publish.conflicts.join(", ")}`;
-            } else if (!runtimeCodePublishHasChanges(publish)) {
-              postRunError = "本次实现没有产生可发布的源码变更。";
-            }
-          } else {
-            postRunError = "验证未通过。";
+            return {
+              conversationId: EVOLUTION_CHANNEL_NAME,
+              runId: runContext.runId,
+              reason: "blocked",
+              errorCode: workflowAdmission.blockedReason,
+            };
           }
-        }
-      }
+          workflowAttempt = workflowAdmission;
+          const key = evolutionTicketChannelKey(ticket.id);
+          const selfInstructionsTicket = ticket.target === "self_instructions";
+          await emitWebEvent(runOptions.onEvent, {
+            type: "status",
+            conversationId: EVOLUTION_CHANNEL_NAME,
+            runId: runContext.runId,
+            message: selfInstructionsTicket
+              ? "正在创建隔离的自定义指令工作区..."
+              : "正在创建隔离实现工作区...",
+          });
+          const selfInstructionsStaging: SelfInstructionsStagingWorkspace | undefined =
+            selfInstructionsTicket
+              ? await createSelfInstructionsStagingWorkspace({
+                  sourceRoot: this.options.workspaceRoot,
+                  ticketId: ticket.id,
+                  runId: runContext.runId,
+                  ...(evolutionSnapshot.selfInstructions === undefined
+                    ? {}
+                    : { currentInstructions: evolutionSnapshot.selfInstructions }),
+                  ...(ticket.proposal.proposedSelfInstructions === undefined
+                    ? {}
+                    : { proposalDraft: ticket.proposal.proposedSelfInstructions }),
+                })
+              : undefined;
+          const runtimeStaging = selfInstructionsTicket
+            ? undefined
+            : await createRuntimeCodeStagingWorkspace({
+                sourceRoot: this.options.workspaceRoot,
+                ticketId: ticket.id,
+                runId: runContext.runId,
+              });
+          const implementationWorkspaceRoot =
+            selfInstructionsStaging?.root ?? runtimeStaging?.root;
+          if (implementationWorkspaceRoot === undefined) {
+            throw new Error("创建实现工作区失败");
+          }
+          this.options.sandboxExecutor.assertWorkspaceAccess(implementationWorkspaceRoot);
+          const prompt = formatEvolutionImplementationPrompt(
+            ticket,
+            implementationWorkspaceRoot,
+            this.options.workspaceRoot,
+            workflowAttempt?.failureDigest,
+          );
+          const prepared = await this.options.sessions.prepareChannelRun(key);
+          const implementationHistory = (workflowAttempt?.failureDigest.length ?? 0) > 0
+            ? []
+            : prepared.history;
+          const runPrepared = {
+            ...prepared,
+            history: implementationHistory,
+            generatedMessageStartIndex: implementationHistory.length + 2,
+          };
+          await this.options.evolution.beginImplementation(ticket.id, {
+            actor: "webui",
+          });
+          implementationStarted = true;
+          await emitWebEvent(runOptions.onEvent, {
+            type: "run_start",
+            conversationId: EVOLUTION_CHANNEL_NAME,
+            runId: runContext.runId,
+            userTurnId: runContext.userTurnId,
+          });
+          await this.options.sessions.appendContextMessage(key, {
+            message: {
+              role: "user",
+              content: prompt,
+            },
+            source: "webui",
+          });
 
-      const success = selfInstructionsTicket
-        ? agentCompleted &&
-          validation?.status === "passed" &&
-          selfInstructionsDraft !== undefined
-        : agentCompleted &&
-          validation?.status === "passed" &&
-          publish !== undefined &&
-          publish.conflicts.length === 0 &&
-          runtimeCodePublishHasChanges(publish);
-      const implementationSummary = formatEvolutionImplementationSummary({
-        reason: result.reason,
-        stagingRoot: implementationWorkspaceRoot,
-        ...optionalSummaryField("agentSummary", finalAssistantSummary(result.messages)),
-        ...optionalSummaryField("errorCode", result.error?.code),
-        ...optionalSummaryField("validation", validation),
-        ...optionalSummaryField("publish", publish),
-        ...optionalSummaryField("postRunError", postRunError),
-      });
-      await this.options.evolution.finishImplementation(ticket.id, {
-        actor: "webui",
-        success,
-        summary: implementationSummary,
-      });
-      if (success && selfInstructionsTicket && selfInstructionsDraft !== undefined) {
-        await emitWebEvent(runOptions.onEvent, {
-          type: "status",
-          conversationId: EVOLUTION_CHANNEL_NAME,
-          runId: runContext.runId,
-          message: "Creating selectable self-instructions version...",
-        });
-        await this.options.evolution.createSelfInstructionsVersionForTicket(ticket.id, {
-          actor: "webui",
-          instructions: selfInstructionsDraft,
-        });
-      } else if (success && publish !== undefined) {
-        await emitWebEvent(runOptions.onEvent, {
-          type: "status",
-          conversationId: EVOLUTION_CHANNEL_NAME,
-          runId: runContext.runId,
-          message: "Capturing selectable runtime version...",
-        });
-        await this.options.evolution.createRuntimeCodeVersionForTicket(ticket.id, {
-          actor: "webui",
-          workspaceRoot: this.options.workspaceRoot,
-          changedFiles: publish.changedFiles,
-          deletedFiles: publish.deletedFiles,
-        });
-      }
-      if (!success) {
-        await this.reportEvolutionFailureIfNeeded({
-          runId: runContext.runId,
-          key,
-          reason,
-          errorCode: errorCode ?? result.reason,
-          durationMs: Date.now() - startedAtMs,
-        });
-      }
-      if (workflowAttempt !== undefined && this.options.workflows !== undefined) {
-        const workflowErrorFingerprint = success
-          ? undefined
-          : fingerprintEvolutionImplementationFailure({
-              ...optionalSummaryField("resultErrorCode", result.error?.code),
-              ...optionalSummaryField("resultErrorMessage", result.error?.message),
-              ...optionalSummaryField("validation", validation),
-              ...optionalSummaryField("publish", publish),
-              ...optionalSummaryField("postRunError", postRunError),
+          await emitWebEvent(runOptions.onEvent, {
+            type: "status",
+            conversationId: EVOLUTION_CHANNEL_NAME,
+            runId: runContext.runId,
+            message: `实现工作区：${implementationWorkspaceRoot}`,
+          });
+
+          const workspaceSkills = await scanWorkspaceSkills(implementationWorkspaceRoot, {
+            ...(this.options.pibotSkillsRoot === undefined
+              ? {}
+              : { pibotSkillsRoot: this.options.pibotSkillsRoot }),
+            ...(this.options.disabledSkills === undefined
+              ? {}
+              : { disabledSkills: this.options.disabledSkills }),
+            ...(this.options.maxSkills === undefined
+              ? {}
+              : { maxSkills: this.options.maxSkills }),
+            ...(this.options.maxSkillFileBytes === undefined
+              ? {}
+              : { maxSkillFileBytes: this.options.maxSkillFileBytes }),
+          });
+          const selfInstructions =
+            await this.options.evolution.readCurrentSelfInstructions();
+          const taskStore = new FileTaskStore({
+            workspaceRoot: implementationWorkspaceRoot,
+          });
+          const childAgents = this.createChildAgentRuntime({
+            key,
+            runContext,
+            workspaceRoot: implementationWorkspaceRoot,
+          });
+          const runToolSchemas = evolutionImplementationToolSchemas(
+            this.options.tools,
+          );
+          const runTools = createCodingToolExecutor({
+            workspaceRoot: implementationWorkspaceRoot,
+            ...(this.options.pibotSkillsRoot === undefined
+              ? {}
+              : { pibotSkillsRoot: this.options.pibotSkillsRoot }),
+            skills: workspaceSkills.skills,
+            sandboxExecutor: this.options.sandboxExecutor,
+            approvalGate: createToolApprovalGate(
+              evolutionImplementationApprovalMode(this.options.toolApprovalMode),
+            ),
+            disabledTools: EVOLUTION_IMPLEMENTATION_DISABLED_TOOLS,
+            runtime: runContext.state,
+            tasks: taskStore,
+            ...(childAgents === undefined ? {} : { childAgents }),
+            memory: {
+              store: this.options.store,
+              key,
+              source: {
+                type: "user",
+                runId: runContext.runId,
+                userId: "webui" as SlackUserId,
+              },
+            },
+            evolution: {
+              submitManualSignal: (input) =>
+                this.options.evolution.submitManualSignal(input),
+              source: "webui_user",
+              actor: "webui",
+            },
+            ...this.options.toolLimits,
+          });
+          const agentLoop = new MinimalAgentLoop({
+            model: this.options.model,
+            tools: runTools,
+            ...(this.options.contextManager === undefined
+              ? {}
+              : { contextManager: this.options.contextManager }),
+            hooks: [
+              new RuntimeModeHook({
+                state: runContext.state,
+                describeTool: (name) => runTools.describeTool(name),
+                worldState: createRuntimeWorldStateProvider({
+                  workspaceRoot: implementationWorkspaceRoot,
+                  ...(this.options.sandboxLabel === undefined
+                    ? {}
+                    : { sandboxLabel: this.options.sandboxLabel }),
+                  sandboxPolicy: this.options.sandboxExecutor.policy,
+                  sandboxEnforcement: this.options.sandboxExecutor.enforcement,
+                  approvalMode: evolutionImplementationApprovalMode(
+                    this.options.toolApprovalMode,
+                  ),
+                  pendingApprovalCount: () =>
+                    this.pendingApprovalCount(runContext.runId),
+                }),
+              }),
+              ...(this.options.runtimeHooks ?? []),
+              new WorkingSetHook({ workspaceRoot: implementationWorkspaceRoot }),
+              new CompletedToolReplayGuard(
+                new Set(workflowAttempt?.completedToolCallFingerprints ?? []),
+              ),
+            ],
+          });
+          const promptParts = buildCodingAgentPromptParts({
+            tools: runToolSchemas,
+            memories: prepared.memories,
+            workspaceSkills: workspaceSkills.skills,
+            repoPrompt: undefined,
+            channelWorkspacePrompt: selfInstructionsTicket
+              ? formatSelfInstructionsWorkspacePrompt(
+                  implementationWorkspaceRoot,
+                  this.options.workspaceRoot,
+                  evolutionSnapshot.tickets,
+                  ticket.id,
+                )
+              : formatEvolutionWorkspacePrompt(
+                  implementationWorkspaceRoot,
+                  this.options.workspaceRoot,
+                  evolutionSnapshot.tickets,
+                  ticket.id,
+                  evolutionSnapshot.runtimeVersions.find((version) =>
+                    version.id === evolutionSnapshot.activeRuntimeVersion?.versionId
+                  ),
+                ),
+            workspaceRoot: implementationWorkspaceRoot,
+            mode: runContext.state.mode,
+            reflectionEnabled: false,
+            ...(selfInstructions === undefined
+              ? {}
+              : { agentSelfInstructions: selfInstructions }),
+            ...(this.options.thinkingLanguage === undefined
+              ? {}
+              : { thinkingLanguage: this.options.thinkingLanguage }),
+          });
+          const systemPrompt = promptParts.stableSystemPrompt;
+          const runModelRef = this.options.resolveModelRef?.();
+          const result = await control.run({
+            execute: () => agentLoop.run(
+              {
+                userText: prompt,
+                systemPrompt,
+                contextLanes: promptParts.contextLanes,
+                history: implementationHistory,
+                tools: runToolSchemas,
+                postHooks: [
+                  this.options.sessions.createMemoryUsageHook(prepared.key),
+                  this.options.sessions.createToolResultArchiveHook(prepared.key),
+                ],
+                maxSteps: this.options.maxSteps,
+                ...(this.options.maxParallelToolCalls === undefined
+                  ? {}
+                  : { maxParallelToolCalls: this.options.maxParallelToolCalls }),
+                runContext,
+                ...(runModelRef === undefined ? {} : { modelRef: runModelRef }),
+                ...(this.options.modelName === undefined
+                  ? {}
+                  : { model: this.options.modelName }),
+                ...(this.options.temperature === undefined
+                  ? {}
+                  : { temperature: this.options.temperature }),
+                ...(this.options.maxOutputTokens === undefined
+                  ? {}
+                  : { maxOutputTokens: this.options.maxOutputTokens }),
+                onEvent: async (event) => {
+                  await emitWebEvent(runOptions.onEvent, {
+                    type: "agent_event",
+                    conversationId: EVOLUTION_CHANNEL_NAME,
+                    runId: runContext.runId,
+                    event: toWebAgentStreamLoopEvent(event),
+                  });
+                },
+              },
+              control.signal,
+            ),
+          });
+
+          reason = result.reason;
+          errorCode = result.error?.code;
+          await this.options.sessions.appendRunMessages(runPrepared, result.messages);
+          if (runOptions.failureMemoryPolicy !== "experience") {
+            await this.recordRunRolloutSummaryBestEffort({
+              key,
+              runId: runContext.runId,
+              userText: ticket.title,
+              reason,
+              steps: result.steps,
+              messages: result.messages.slice(runPrepared.generatedMessageStartIndex),
+              ...(result.error === undefined
+                ? {}
+                : {
+                    errorCode: result.error.code,
+                    errorMessage: result.error.message,
+                  }),
+              durationMs: Date.now() - startedAtMs,
+            });
+          }
+          if (result.error !== undefined) {
+            await this.options.sessions.appendContextMessage(key, {
+              message: {
+                role: "assistant",
+                content: `Evolution implementation error (${result.error.code}). ${result.error.message}`,
+              },
+              source: "agent",
+            });
+          }
+
+          let validation:
+            | RuntimeCodeValidationReport
+            | SelfInstructionsValidationReport
+            | undefined;
+          let publish: RuntimeCodePublishReport | undefined;
+          let selfInstructionsDraft: string | undefined;
+          let postRunError: string | undefined;
+          const agentCompleted = result.error === undefined && result.reason === "completed";
+          if (agentCompleted) {
+            if (selfInstructionsTicket) {
+              await emitWebEvent(runOptions.onEvent, {
+                type: "status",
+                conversationId: EVOLUTION_CHANNEL_NAME,
+                runId: runContext.runId,
+                message: "正在验证自定义指令草稿...",
+              });
+              if (selfInstructionsStaging === undefined) {
+                throw new Error("缺少自定义指令暂存工作区");
+              }
+              selfInstructionsDraft = await readStagedSelfInstructions(
+                selfInstructionsStaging,
+              );
+              validation = validateStagedSelfInstructions({
+                instructions: selfInstructionsDraft,
+                baselineInstructions: selfInstructionsStaging.baselineInstructions,
+              });
+              if (validation.status !== "passed") {
+                postRunError = "自定义指令验证未通过。";
+              }
+            } else {
+              await emitWebEvent(runOptions.onEvent, {
+                type: "status",
+                conversationId: EVOLUTION_CHANNEL_NAME,
+                runId: runContext.runId,
+                message: "正在验证隔离工作区...",
+              });
+              if (runtimeStaging === undefined) {
+                throw new Error("缺少运行时代码暂存工作区");
+              }
+              validation = await validateRuntimeCodeWorkspace({
+                workspaceRoot: runtimeStaging.root,
+                dependencyRoot: this.options.workspaceRoot,
+              });
+              if (validation.status === "passed") {
+                await emitWebEvent(runOptions.onEvent, {
+                  type: "status",
+                  conversationId: EVOLUTION_CHANNEL_NAME,
+                  runId: runContext.runId,
+                  message: "验证已通过，正在发布检查后的变更...",
+                });
+                publish = await publishRuntimeCodeWorkspace({
+                  stagingRoot: runtimeStaging.root,
+                  destinationRoot: this.options.workspaceRoot,
+                  baseline: runtimeStaging.baseline,
+                });
+                if (publish.conflicts.length > 0) {
+                  postRunError = `发布冲突：${publish.conflicts.join(", ")}`;
+                } else if (!runtimeCodePublishHasChanges(publish)) {
+                  postRunError = "本次实现没有产生可发布的源码变更。";
+                }
+              } else {
+                postRunError = "验证未通过。";
+              }
+            }
+          }
+
+          const success = selfInstructionsTicket
+            ? agentCompleted &&
+              validation?.status === "passed" &&
+              selfInstructionsDraft !== undefined
+            : agentCompleted &&
+              validation?.status === "passed" &&
+              publish !== undefined &&
+              publish.conflicts.length === 0 &&
+              runtimeCodePublishHasChanges(publish);
+          const implementationSummary = formatEvolutionImplementationSummary({
+            reason: result.reason,
+            stagingRoot: implementationWorkspaceRoot,
+            ...optionalSummaryField("agentSummary", finalAssistantSummary(result.messages)),
+            ...optionalSummaryField("errorCode", result.error?.code),
+            ...optionalSummaryField("validation", validation),
+            ...optionalSummaryField("publish", publish),
+            ...optionalSummaryField("postRunError", postRunError),
+          });
+          await this.options.evolution.finishImplementation(ticket.id, {
+            actor: "webui",
+            success,
+            summary: implementationSummary,
+          });
+          if (success && selfInstructionsTicket && selfInstructionsDraft !== undefined) {
+            await emitWebEvent(runOptions.onEvent, {
+              type: "status",
+              conversationId: EVOLUTION_CHANNEL_NAME,
+              runId: runContext.runId,
+              message: "Creating selectable self-instructions version...",
+            });
+            await this.options.evolution.createSelfInstructionsVersionForTicket(ticket.id, {
+              actor: "webui",
+              instructions: selfInstructionsDraft,
+            });
+          } else if (success && publish !== undefined) {
+            await emitWebEvent(runOptions.onEvent, {
+              type: "status",
+              conversationId: EVOLUTION_CHANNEL_NAME,
+              runId: runContext.runId,
+              message: "Capturing selectable runtime version...",
+            });
+            await this.options.evolution.createRuntimeCodeVersionForTicket(ticket.id, {
+              actor: "webui",
+              workspaceRoot: this.options.workspaceRoot,
+              changedFiles: publish.changedFiles,
+              deletedFiles: publish.deletedFiles,
+            });
+          }
+          if (!success) {
+            await this.reportEvolutionFailureIfNeeded({
+              runId: runContext.runId,
+              key,
+              reason,
+              errorCode: errorCode ?? result.reason,
+              durationMs: Date.now() - startedAtMs,
+            });
+          }
+          if (workflowAttempt !== undefined && this.options.workflows !== undefined) {
+            const workflowErrorFingerprint = success
+              ? undefined
+              : fingerprintEvolutionImplementationFailure({
+                  ...optionalSummaryField("resultErrorCode", result.error?.code),
+                  ...optionalSummaryField("resultErrorMessage", result.error?.message),
+                  ...optionalSummaryField("validation", validation),
+                  ...optionalSummaryField("publish", publish),
+                  ...optionalSummaryField("postRunError", postRunError),
+                  summary: implementationSummary,
+                });
+            const diffFingerprint = selfInstructionsTicket
+              ? fingerprintCanonical({
+                  before: selfInstructionsStaging?.baselineInstructions ?? "",
+                  after: selfInstructionsDraft ?? "",
+                })
+              : runtimeStaging === undefined
+              ? undefined
+              : await fingerprintRuntimeCodeWorkspaceDiff({
+                  stagingRoot: runtimeStaging.root,
+                  baseline: runtimeStaging.baseline,
+                });
+            await this.options.workflows.finishAttempt({
+              runId: workflowAttempt.workflowRunId,
+              attemptId: workflowAttempt.attemptId,
+              success,
+              ...(workflowErrorFingerprint === undefined
+                ? {}
+                : { resultErrorFingerprint: workflowErrorFingerprint }),
+              ...(diffFingerprint === undefined ? {} : { diffFingerprint }),
+              contextFingerprint: workflowAttempt.contextFingerprint,
               summary: implementationSummary,
             });
-        const diffFingerprint = selfInstructionsTicket
-          ? fingerprintCanonical({
-              before: selfInstructionsStaging?.baselineInstructions ?? "",
-              after: selfInstructionsDraft ?? "",
-            })
-          : runtimeStaging === undefined
-          ? undefined
-          : await fingerprintRuntimeCodeWorkspaceDiff({
-              stagingRoot: runtimeStaging.root,
-              baseline: runtimeStaging.baseline,
-            });
-        await this.options.workflows.finishAttempt({
-          runId: workflowAttempt.workflowRunId,
-          attemptId: workflowAttempt.attemptId,
-          success,
-          ...(workflowErrorFingerprint === undefined
-            ? {}
-            : { resultErrorFingerprint: workflowErrorFingerprint }),
-          ...(diffFingerprint === undefined ? {} : { diffFingerprint }),
-          contextFingerprint: workflowAttempt.contextFingerprint,
-          summary: implementationSummary,
-        });
-        workflowAttemptFinished = true;
-      }
+            workflowAttemptFinished = true;
+          }
 
-      return {
-        conversationId: EVOLUTION_CHANNEL_NAME,
-        runId: runContext.runId,
-        reason,
-        ...(errorCode === undefined ? {} : { errorCode }),
-      };
-    } catch (error: unknown) {
-      if (implementationStarted) {
-        await this.options.evolution.finishImplementation(ticketId, {
-          actor: "webui",
-          success: false,
-          summary: error instanceof Error ? error.message : String(error),
-        });
-      }
-      if (
-        workflowAttempt !== undefined &&
-        !workflowAttemptFinished &&
-        this.options.workflows !== undefined
-      ) {
-        const summary = error instanceof Error ? error.message : String(error);
-        await this.options.workflows.finishAttempt({
-          runId: workflowAttempt.workflowRunId,
-          attemptId: workflowAttempt.attemptId,
-          success: false,
-          resultErrorFingerprint: fingerprintError({
-            stepKind: "evolution_implementation",
-            errorCode: error instanceof Error ? error.name : "exception",
-            message: summary,
-          }),
-          diffFingerprint: fingerprintCanonical({
-            state: "diff_unavailable",
-            reason: "implementation_exception",
-          }),
-          contextFingerprint: workflowAttempt.contextFingerprint,
-          summary,
-        }).catch(() => undefined);
-      }
-      throw error;
-    } finally {
-      this.activeByConversation.delete(EVOLUTION_CHANNEL_NAME);
-    }
+          return {
+            conversationId: EVOLUTION_CHANNEL_NAME,
+            runId: runContext.runId,
+            reason,
+            ...(errorCode === undefined ? {} : { errorCode }),
+          };
+        } catch (error: unknown) {
+          if (implementationStarted) {
+            await this.options.evolution.finishImplementation(ticketId, {
+              actor: "webui",
+              success: false,
+              summary: error instanceof Error ? error.message : String(error),
+            });
+          }
+          if (
+            workflowAttempt !== undefined &&
+            !workflowAttemptFinished &&
+            this.options.workflows !== undefined
+          ) {
+            const summary = error instanceof Error ? error.message : String(error);
+            await this.options.workflows.finishAttempt({
+              runId: workflowAttempt.workflowRunId,
+              attemptId: workflowAttempt.attemptId,
+              success: false,
+              resultErrorFingerprint: fingerprintError({
+                stepKind: "evolution_implementation",
+                errorCode: error instanceof Error ? error.name : "exception",
+                message: summary,
+              }),
+              diffFingerprint: fingerprintCanonical({
+                state: "diff_unavailable",
+                reason: "implementation_exception",
+              }),
+              contextFingerprint: workflowAttempt.contextFingerprint,
+              summary,
+            }).catch(() => undefined);
+          }
+          throw error;
+        } finally {
+          runOptions.signal?.removeEventListener("abort", abortExternal);
+          this.activeByConversation.delete(EVOLUTION_CHANNEL_NAME);
+        }
+      },
+    });
   }
 
   async deleteChannelWorkspace(conversationId: string): Promise<void> {
@@ -2194,10 +2390,11 @@ function webApprovalView(
     risk: String(pending.request.risk),
     title: approvalTitle(pending.request),
     summary: approvalSummary(pending.request),
-    details: approvalDetails(pending.request.call),
+    details: approvalDetails(pending.request),
     status,
     expiresAt: pending.expiresAt,
     ...(resolvedMessage === undefined ? {} : { resolvedMessage }),
+    runScopeAllowed: pending.request.runScopeAllowed === true,
   };
 }
 
@@ -2219,6 +2416,7 @@ function completedMissingApproval(
     status,
     expiresAt: new Date().toISOString(),
     resolvedMessage,
+    runScopeAllowed: false,
   };
 }
 
@@ -2237,24 +2435,58 @@ function approvalSummary(request: ToolApprovalPromptRequest): string {
     return "Switch this run into read-only planning mode.";
   }
   if (request.call.name === "exit_plan_mode") {
-    return "Leave Plan Mode and continue execution with the saved plan.";
+    return "Freeze the saved plan and TaskGraph, then start runtime scheduling.";
   }
   return request.explanation || `${request.call.name} requires approval.`;
 }
 
-function approvalDetails(call: ToolCall): readonly string[] {
+function approvalDetails(request: ToolApprovalPromptRequest): readonly string[] {
+  const call = request.call;
   const input = readToolInput(call.input);
+  const requested = request.escalation ?? request.capabilities;
+  const capabilities = requested?.requirements.map((requirement) => {
+    if (
+      requirement.capability === "filesystem.read" ||
+      requirement.capability === "filesystem.write"
+    ) {
+      return `Escalation: ${requirement.capability}(${requirement.paths.join(", ")})`;
+    }
+    if (requirement.capability === "network.connect") {
+      return `Escalation: ${requirement.capability}(${requirement.hosts.join(", ")})`;
+    }
+    if (requirement.capability === "process.exec") {
+      return `Escalation: ${requirement.capability}`;
+    }
+    return `Escalation: ${requirement.capability}(${requirement.resources.join(", ")})`;
+  }) ?? [];
+  if (requested?.effects?.destructive === true) {
+    capabilities.push("Escalation effect: destructive");
+  }
+  if (requested?.effects?.openWorld === true) {
+    capabilities.push("Escalation effect: openWorld");
+  }
   switch (call.name) {
     case "enter_plan_mode": {
       const goal = readInputString(input, "goal");
-      return goal.length === 0 ? [] : [`Goal: ${truncateSummary(goal, 240)}`];
+      return [
+        ...capabilities,
+        ...(goal.length === 0 ? [] : [`Goal: ${truncateSummary(goal, 240)}`]),
+      ];
     }
     case "exit_plan_mode": {
       const summary = readInputString(input, "summary");
       const planPath = readInputString(input, "planPath") || "PLAN.md";
       const planExcerpt = readInputString(input, "planExcerpt");
+      const tasksPath = readInputString(input, "tasksPath") || "tasks.json";
+      const graphVersion = readInputNumber(input, "graphVersion");
+      const taskCount = readInputNumber(input, "taskCount");
+      const writeTaskCount = readInputNumber(input, "writeTaskCount");
+      const tasksDigest = readInputString(input, "tasksDigest");
       return [
+        ...capabilities,
         `Plan: ${planPath}`,
+        `TaskGraph: ${tasksPath} v${graphVersion ?? "?"} (${taskCount ?? 0} tasks, ${writeTaskCount ?? 0} write-capable)`,
+        ...(tasksDigest.length === 0 ? [] : [`TaskGraph digest: ${tasksDigest}`]),
         ...(summary.length === 0
           ? []
           : [`Summary: ${truncateSummary(summary, 240)}`]),
@@ -2264,30 +2496,42 @@ function approvalDetails(call: ToolCall): readonly string[] {
       ];
     }
     case "bash":
-      return [`Command: ${truncateSummary(readInputString(input, "command"), 1200)}`];
+      return [
+        ...capabilities,
+        `Command: ${truncateSummary(readInputString(input, "command"), 1200)}`,
+      ];
     case "write":
       return [
+        ...capabilities,
         `Path: ${readInputString(input, "path")}`,
         `Bytes: ${Buffer.byteLength(readInputString(input, "content"), "utf8")}`,
       ];
     case "edit":
       return [
+        ...capabilities,
         `Path: ${readInputString(input, "path")}`,
         `Replacements: ${readInputArray(input, "replacements").length}`,
       ];
     case "read":
     case "attach":
-      return [`Path: ${readInputString(input, "path")}`];
+      return [...capabilities, `Path: ${readInputString(input, "path")}`];
     case "grep":
-      return [`Pattern: ${readInputString(input, "pattern")}`];
+      return [
+        ...capabilities,
+        `Pattern: ${readInputString(input, "pattern")}`,
+      ];
     default:
-      return [`Arguments: ${truncateSummary(JSON.stringify(call.input), 1000)}`];
+      return [
+        ...capabilities,
+        `Arguments: ${truncateSummary(JSON.stringify(call.input), 1000)}`,
+      ];
   }
 }
 
 function approvalDecisionStatus(
   request: ToolApprovalPromptRequest,
   approved: boolean,
+  scope: "once" | "run" = "once",
 ): string {
   if (request.call.name === "enter_plan_mode") {
     return approved
@@ -2299,7 +2543,8 @@ function approvalDecisionStatus(
       ? "Plan approved. Continuing execution."
       : "Plan rejected.";
   }
-  return approved ? "Approved." : "Rejected.";
+  const suffix = scope === "run" ? " for this run." : " once.";
+  return approved ? `Approved${suffix}` : `Rejected${suffix}`;
 }
 
 function deniedApproval(reason: string): ToolApprovalDecision {
@@ -2318,6 +2563,16 @@ function readToolInput(input: unknown): Record<string, unknown> {
 function readInputString(input: Record<string, unknown>, key: string): string {
   const value = input[key];
   return typeof value === "string" ? value : "";
+}
+
+function readInputNumber(
+  input: Record<string, unknown>,
+  key: string,
+): number | undefined {
+  const value = input[key];
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
 }
 
 function readInputArray(

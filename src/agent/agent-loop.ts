@@ -41,8 +41,10 @@ import type {
   AgentLoopEvent,
   AgentLoopEventHandler,
 } from "./events";
+import type { ModelRef } from "../models/types";
 import { modelErrorToAgentLoopError } from "./events";
 import {
+  ContextManager,
   ContextLanesHook,
   type ContextLane,
 } from "../workspace/context-manager";
@@ -52,6 +54,7 @@ type UnknownRecord = Readonly<Record<string, unknown>>;
 export interface MinimalAgentLoopDependencies {
   readonly model: ModelClient;
   readonly tools: ToolExecutor;
+  readonly contextManager?: ContextManager;
   readonly hooks?: readonly RuntimeHook[];
   readonly maxParallelToolCalls?: number;
   readonly toolScheduler?: ToolScheduler;
@@ -71,6 +74,7 @@ export interface MinimalAgentLoopInput {
   readonly maxParallelToolCalls?: number;
   readonly runContext?: AgentRunContext;
   readonly model?: string;
+  readonly modelRef?: ModelRef;
   readonly temperature?: number;
   readonly maxOutputTokens?: number;
   readonly onEvent?: AgentLoopEventHandler;
@@ -81,6 +85,7 @@ export interface AgentLoopResult {
   readonly messages: readonly LlmMessage[];
   readonly steps: number;
   readonly model?: string;
+  readonly provider?: string;
   readonly usage?: ModelUsage;
   readonly error?: AgentLoopError;
 }
@@ -90,20 +95,24 @@ interface StepModelResult extends RuntimeModelCallResult {
   readonly assistantText: string;
   readonly reasoningContent?: string;
   readonly toolCalls: readonly ModelToolCall[];
+  readonly toolResults: Promise<readonly ToolResult[]>;
   readonly aborted: boolean;
 }
 
 interface ModelUsageAccumulator {
   model: string | undefined;
+  provider: string | undefined;
   usage: ModelUsage;
   complete: boolean;
 }
 
 export class MinimalAgentLoop {
   private readonly baseHooks: readonly RuntimeHook[];
+  private readonly contextManager: ContextManager;
 
   constructor(private readonly dependencies: MinimalAgentLoopDependencies) {
     this.baseHooks = dependencies.hooks ?? [];
+    this.contextManager = dependencies.contextManager ?? new ContextManager();
   }
 
   async run(
@@ -120,7 +129,7 @@ export class MinimalAgentLoop {
     const hooks = new RuntimeHookRunner([
       ...(input.contextLanes === undefined || input.contextLanes.length === 0
         ? []
-        : [new ContextLanesHook(input.contextLanes)]),
+        : [new ContextLanesHook(input.contextLanes, this.contextManager)]),
       ...(input.hooks ?? []),
       ...this.baseHooks,
       ...(input.postHooks ?? []),
@@ -154,7 +163,11 @@ export class MinimalAgentLoop {
 
     for (let attemptStep = 1; attemptStep <= maxSteps; attemptStep += 1) {
       completedSteps = attemptStep;
-      const stepContext = captureAgentStepContext(run, input.model);
+      const stepContext = captureAgentStepContext(
+        run,
+        input.model,
+        captureToolExecutionSnapshot(this.dependencies.tools, run),
+      );
       await emit(input.onEvent, {
         type: "step_start",
         step: stepContext.step,
@@ -166,6 +179,7 @@ export class MinimalAgentLoop {
         input,
         messages,
         stepContext,
+        toolScheduler,
         signal,
       );
       addModelStepUsage(usage, modelResult);
@@ -180,6 +194,16 @@ export class MinimalAgentLoop {
         step: modelResult.stepContext.step,
         message: assistantMessage,
       });
+      const toolMessages = (await modelResult.toolResults).map((result) =>
+        toolResultMessage(this.contextManager.admitToolResult(result)));
+      messages = [...messages, ...toolMessages];
+      for (const message of toolMessages) {
+        await emit(input.onEvent, {
+          type: "message_completed",
+          step: modelResult.stepContext.step,
+          message,
+        });
+      }
 
       if (modelResult.aborted || isSignalAborted(signal)) {
         await emitStepEnd(
@@ -258,25 +282,6 @@ export class MinimalAgentLoop {
         );
       }
 
-      const calls = modelResult.toolCalls.map((call) =>
-        this.toExecutableToolCall(modelResult.stepContext, call));
-      const results = await toolScheduler.schedule({
-        run,
-        calls,
-        stepContext: modelResult.stepContext,
-        ...(input.onEvent === undefined ? {} : { onEvent: input.onEvent }),
-        ...(signal === undefined ? {} : { signal }),
-      });
-      const toolMessages = results.map(toolResultMessage);
-      messages = [...messages, ...toolMessages];
-      for (const message of toolMessages) {
-        await emit(input.onEvent, {
-          type: "message_completed",
-          step: modelResult.stepContext.step,
-          message,
-        });
-      }
-
       if (isSignalAborted(signal)) {
         await emitStepEnd(
           input.onEvent,
@@ -343,6 +348,7 @@ export class MinimalAgentLoop {
     input: MinimalAgentLoopInput,
     messages: readonly LlmMessage[],
     initialStepContext: AgentStepContext,
+    toolScheduler: ToolScheduler,
     signal: AbortSignal | undefined,
   ): Promise<StepModelResult> {
     let assistantText = "";
@@ -355,11 +361,14 @@ export class MinimalAgentLoop {
     let usage: ModelUsage | undefined;
     let retryCount = 0;
     const toolCalls: ModelToolCall[] = [];
+    let toolResults: Promise<readonly ToolResult[]> = Promise.resolve([]);
+    let toolSession: ReturnType<ToolScheduler["begin"]> | undefined;
     const startedAtMs = Date.now();
     const baseRequest: ModelRequest = {
       messages: withStepControlMessages(messages, initialStepContext),
       tools: input.tools,
       ...optionalString("model", input.model),
+      ...(input.modelRef === undefined ? {} : { modelRef: input.modelRef }),
       ...optionalNumber("temperature", input.temperature),
       ...optionalNumber("maxOutputTokens", input.maxOutputTokens),
     };
@@ -367,16 +376,27 @@ export class MinimalAgentLoop {
     let stepContext = initialStepContext;
 
     try {
-      request = await hooks.beforeModelCall({
+      stepContext = await hooks.captureStepContext({
         run,
         step: initialStepContext.step,
         stepContext: initialStepContext,
+      });
+      request = await hooks.beforeModelCall({
+        run,
+        step: stepContext.step,
+        stepContext,
         request: baseRequest,
       });
       stepContext = withAdvertisedStepTools(
-        initialStepContext,
+        stepContext,
         request.tools.map((tool) => tool.name),
       );
+      toolSession = toolScheduler.begin({
+        run,
+        stepContext,
+        ...(input.onEvent === undefined ? {} : { onEvent: input.onEvent }),
+        ...(signal === undefined ? {} : { signal }),
+      });
       for await (const modelEvent of this.dependencies.model.stream(request, signal)) {
         switch (modelEvent.type) {
           case "start":
@@ -411,6 +431,9 @@ export class MinimalAgentLoop {
             break;
           case "tool_call":
             toolCalls.push(modelEvent.call);
+            void toolSession.submit(
+              this.toExecutableToolCall(stepContext, modelEvent.call),
+            );
             break;
           case "done":
             finishReason = modelEvent.finishReason;
@@ -418,11 +441,13 @@ export class MinimalAgentLoop {
             break;
           case "error": {
             const error = modelErrorToAgentLoopError(modelEvent.error);
+            toolResults = toolSession.close();
             const result = modelStepResult({
               stepContext,
               assistantText,
               reasoningContent,
               toolCalls,
+              toolResults,
               model,
               provider,
               developerRoleMode,
@@ -440,11 +465,15 @@ export class MinimalAgentLoop {
       }
     } catch (error: unknown) {
       const agentError = unknownToAgentLoopError(error);
+      toolResults = toolSession === undefined
+        ? Promise.resolve([])
+        : toolSession.close();
       const result = modelStepResult({
         stepContext,
         assistantText,
         reasoningContent,
         toolCalls,
+        toolResults,
         model,
         provider,
         developerRoleMode,
@@ -459,11 +488,15 @@ export class MinimalAgentLoop {
       return result;
     }
 
+    toolResults = toolSession === undefined
+      ? Promise.resolve([])
+      : toolSession.close();
     const result = modelStepResult({
       stepContext,
       assistantText,
       reasoningContent,
       toolCalls,
+      toolResults,
       model,
       provider,
       developerRoleMode,
@@ -549,6 +582,7 @@ export class MinimalAgentLoop {
       messages,
       steps,
       ...optionalString("model", usage.model),
+      ...optionalString("provider", usage.provider),
       ...optionalCompleteModelUsage(usage),
       ...optionalAgentError(error),
     };
@@ -560,6 +594,7 @@ function modelStepResult(input: {
   readonly assistantText: string;
   readonly reasoningContent: string;
   readonly toolCalls: readonly ModelToolCall[];
+  readonly toolResults: Promise<readonly ToolResult[]>;
   readonly model?: string | undefined;
   readonly provider?: string | undefined;
   readonly developerRoleMode?: DeveloperRoleMode | undefined;
@@ -575,6 +610,7 @@ function modelStepResult(input: {
     assistantText: input.assistantText,
     ...optionalNonEmptyString("reasoningContent", input.reasoningContent),
     toolCalls: input.toolCalls,
+    toolResults: input.toolResults,
     ...optionalString("model", input.model),
     ...optionalString("provider", input.provider),
     ...(input.developerRoleMode === undefined
@@ -595,6 +631,7 @@ function modelStepResult(input: {
 function createModelUsageAccumulator(): ModelUsageAccumulator {
   return {
     model: undefined,
+    provider: undefined,
     usage: {
       inputTokens: 0,
       cachedInputTokens: 0,
@@ -607,6 +644,7 @@ function createModelUsageAccumulator(): ModelUsageAccumulator {
 
 function addModelStepUsage(accumulator: ModelUsageAccumulator, step: StepModelResult): void {
   accumulator.model = step.model ?? accumulator.model;
+  accumulator.provider = step.provider ?? accumulator.provider;
   if (step.usage === undefined) {
     accumulator.complete = false;
     return;
@@ -839,4 +877,24 @@ function optionalAgentError(
   error: AgentLoopError | undefined,
 ): { readonly error: AgentLoopError } | object {
   return error === undefined ? {} : { error };
+}
+
+function captureToolExecutionSnapshot(
+  tools: ToolExecutor,
+  run: AgentRunContext,
+) {
+  const captured = tools.captureExecutionSnapshot?.();
+  if (captured !== undefined) {
+    return Object.freeze({
+      ...captured,
+      availableTools: Object.freeze([...captured.availableTools]),
+    });
+  }
+  return Object.freeze({
+    schemaVersion: 1 as const,
+    authorityVersion: "unversioned",
+    availableTools: Object.freeze([...tools.listTools()]),
+    runtimeStateVersion: run.state.version,
+    mode: run.state.mode,
+  });
 }

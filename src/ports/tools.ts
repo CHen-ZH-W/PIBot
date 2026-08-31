@@ -6,9 +6,11 @@ import type {
   ToolCallParseResult,
   ToolMetadata,
   ToolName,
+  ToolExecutionSnapshot,
   ToolResult,
   UnparsedToolCall,
 } from "../core/tools";
+import type { ToolCapabilityRequest } from "../core/capabilities";
 
 /**
  * 职责：暴露当前运行环境可用的 coding tools，并执行 read/grep/bash/edit/write 这五类工具调用。
@@ -16,9 +18,16 @@ import type {
  */
 export interface ToolExecutor {
   listTools(): readonly ToolName[];
+  /** Captures the immutable authority that a model Step is allowed to rely on. */
+  captureExecutionSnapshot?(): ToolExecutionSnapshot;
   describeTool?(name: string): ToolMetadata | undefined;
   parseToolCall?(call: UnparsedToolCall): ToolCallParseResult;
-  executeTool(call: ToolCall, signal?: AbortSignal): Promise<ToolResult>;
+  resolveCapabilities?(call: ToolCall): ToolCapabilityRequest;
+  executeTool(
+    call: ToolCall,
+    signal?: AbortSignal,
+    snapshot?: ToolExecutionSnapshot,
+  ): Promise<ToolResult>;
 }
 
 /**

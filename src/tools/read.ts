@@ -6,7 +6,11 @@ import {
   assertFileSize,
   resolveWorkspacePath,
 } from "../workspace/path-boundary";
-import type { CodingToolDefinition, ToolRunContext } from "./index";
+import {
+  assertToolCapability,
+  type CodingToolDefinition,
+  type ToolRunContext,
+} from "./index";
 import { parseReadInput } from "./parsers";
 
 const defaultLineLimit = 200;
@@ -15,6 +19,9 @@ export const readTool: CodingToolDefinition<"read", ReadToolInput, ReadToolOutpu
   name: "read",
   riskLevel: "read-only",
   executionMode: "parallel",
+  resolveCapabilities: (input) => ({
+    requirements: [{ capability: "filesystem.read", paths: [input.path] }],
+  }),
   parse: parseReadInput,
   description:
     "Read a UTF-8 text file inside the workspace. Supports zero-based line offset and line limit. Output is truncated when too long.",
@@ -40,8 +47,10 @@ export const readTool: CodingToolDefinition<"read", ReadToolInput, ReadToolOutpu
     required: ["path"],
   },
   async execute(input, context) {
+    assertToolCapability(context, "filesystem.read", input.path);
     const filePath = await resolveWorkspacePath(context.workspaceRoot, input.path, {
       access: "read",
+      policy: context.sandboxExecutor.policy,
     });
     await assertFileSize(filePath, context.maxFileBytes, "read file");
     const content = await readFile(filePath, "utf8");

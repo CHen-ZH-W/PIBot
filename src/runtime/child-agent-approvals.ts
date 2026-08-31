@@ -213,8 +213,9 @@ async function readDecisionIfExists(
     return deniedDecision("Invalid child approval decision file");
   }
   const approved = parsed.decision.approved;
+  const scope = parsed.decision.scope === "run" ? "run" as const : undefined;
   if (approved === true) {
-    return { approved: true };
+    return { approved: true, ...(scope === undefined ? {} : { scope }) };
   }
   const reason = parsed.decision.reason;
   return {
@@ -222,6 +223,7 @@ async function readDecisionIfExists(
     reason: typeof reason === "string"
       ? reason
       : "Child approval was denied",
+    ...(scope === undefined ? {} : { scope }),
   };
 }
 

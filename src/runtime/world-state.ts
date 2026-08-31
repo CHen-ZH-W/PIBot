@@ -1,12 +1,16 @@
 import { execFile } from "node:child_process";
 import * as path from "node:path";
 import type { ChildAgentRuntime } from "./child-agents";
+import type { SandboxBackendEnforcement } from "../workspace/sandbox";
+import type { SandboxPolicy } from "../workspace/sandbox-policy";
 
 type WorldStateObject = Readonly<Record<string, unknown>>;
 
 export interface RuntimeWorldStateProviderOptions {
   readonly workspaceRoot: string;
   readonly sandboxLabel?: string;
+  readonly sandboxPolicy?: SandboxPolicy;
+  readonly sandboxEnforcement?: SandboxBackendEnforcement;
   readonly approvalMode?: string;
   readonly pendingApprovalCount?: () => number;
   readonly childAgents?: ChildAgentRuntime;
@@ -34,6 +38,25 @@ export function createRuntimeWorldStateProvider(
       sandbox: {
         configured: options.sandboxLabel !== undefined,
         label: options.sandboxLabel ?? "unknown",
+        ...(options.sandboxPolicy === undefined
+          ? {}
+          : {
+              policy: {
+                version: options.sandboxPolicy.version,
+                filesystem: {
+                  scratch: options.sandboxPolicy.filesystem.scratch,
+                  protectedNames:
+                    options.sandboxPolicy.filesystem.protectedDirectoryNames.length +
+                    options.sandboxPolicy.filesystem.protectedFileNames.length,
+                },
+                network: options.sandboxPolicy.network,
+                process: options.sandboxPolicy.process,
+                resourceLimits: options.sandboxPolicy.resourceLimits,
+              },
+            }),
+        ...(options.sandboxEnforcement === undefined
+          ? {}
+          : { enforcement: options.sandboxEnforcement }),
       },
       approval: {
         mode: options.approvalMode ?? "unknown",

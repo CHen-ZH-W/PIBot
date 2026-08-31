@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { LlmToolSchema } from "../core/agent";
+import {
+  capabilityRequestRisk,
+  type ToolCapabilityRequest,
+} from "../core/capabilities";
 import type {
   ToolCallId,
 } from "../core/ids";
@@ -19,6 +23,7 @@ import type {
   TaskStoreSnapshot,
 } from "../workspace/tasks";
 import type { RuntimeHook, RuntimeModelCallHookContext } from "./hooks";
+import { withStepWorldState } from "./context";
 
 export type AgentMode = "execute" | "plan" | "coordinator";
 
@@ -26,6 +31,13 @@ export interface PlanModeApprovalRequest {
   readonly summary?: string;
   readonly planMarkdown?: string;
   readonly planPath?: string;
+  readonly taskGraph?: {
+    readonly path: string;
+    readonly graphVersion: number;
+    readonly tasksDigest: string;
+    readonly taskCount: number;
+    readonly writeTaskCount: number;
+  };
 }
 
 export interface PlanModeApprovalRequester {
@@ -313,6 +325,42 @@ export function isToolAllowedInMode(
     isTaskControlTool(toolName);
 }
 
+/**
+ * Call-time mode ceiling. Unlike schema exposure, this evaluates the parsed
+ * call's actual capability request and is checked again after approval.
+ */
+export function isCapabilityRequestAllowedInMode(
+  mode: AgentMode,
+  toolName: string,
+  request: ToolCapabilityRequest,
+): boolean {
+  if (mode === "execute") {
+    return true;
+  }
+  if (mode === "plan" && isPlanControlTool(toolName)) {
+    return true;
+  }
+  if (
+    mode === "coordinator" &&
+    (
+      isCoordinatorControlTool(toolName) ||
+      isChildAgentControlTool(toolName) ||
+      isTaskControlTool(toolName)
+    )
+  ) {
+    return true;
+  }
+  return capabilityRequestRisk(request) === "read-only" ||
+    isReviewableTicketRequest(request);
+}
+
+function isReviewableTicketRequest(request: ToolCapabilityRequest): boolean {
+  return request.requirements.length === 1 &&
+    request.requirements[0]?.capability === "runtime.control" &&
+    request.requirements[0].resources.length === 1 &&
+    request.requirements[0].resources[0] === "self-evolution:ticket";
+}
+
 export interface RuntimeModeHookOptions {
   readonly state: AgentRuntimeState;
   readonly describeTool?: (name: string) => ToolMetadata | undefined;
@@ -327,19 +375,31 @@ export class RuntimeModeHook implements RuntimeHook {
     this.contextManager = options.contextManager ?? new ContextManager();
   }
 
+  async captureStepContext(context: {
+    readonly stepContext: RuntimeModelCallHookContext["stepContext"];
+  }) {
+    return withStepWorldState(
+      context.stepContext,
+      await captureWorldState(
+        this.options.state,
+        context.stepContext,
+        this.options.worldState,
+      ),
+    );
+  }
+
   async beforeModelCall(context: RuntimeModelCallHookContext) {
+    const stepContext = Object.keys(context.stepContext.snapshot.worldState).length > 0
+      ? context.stepContext
+      : await this.captureStepContext(context);
     const request = this.contextManager.projectContextLane(context.request, {
       id: "world-state",
       authority: "developer",
       kind: "state",
       placement: "dynamic_tail",
-      content: await renderWorldStateMessage(
-        this.options.state,
-        context.stepContext,
-        this.options.worldState,
-      ),
+      content: renderWorldStateMessage(stepContext),
     });
-    if (context.stepContext.mode === "execute") {
+    if (stepContext.mode === "execute") {
       return request;
     }
 
@@ -347,7 +407,7 @@ export class RuntimeModeHook implements RuntimeHook {
       ...request,
       tools: request.tools.filter((tool) =>
         isToolAllowedInMode(
-          context.stepContext.mode,
+          stepContext.mode,
           tool.name,
           this.options.describeTool?.(tool.name),
         )),
@@ -443,6 +503,7 @@ export function createToolPlanApprovalRequester(
       return decision;
     },
     async requestExitPlanMode(request, signal) {
+      const schedulesTasks = (request.taskGraph?.taskCount ?? 0) > 0;
       const approvalRequest: ToolApprovalRequest = {
         call: {
           id: `exit-plan-${randomUUID()}` as ToolCallId,
@@ -451,11 +512,41 @@ export function createToolPlanApprovalRequester(
             summary: request.summary ?? "",
             planPath: request.planPath ?? "PLAN.md",
             planExcerpt: truncateForApproval(request.planMarkdown ?? "", 2400),
+            ...(request.taskGraph === undefined
+              ? {}
+              : {
+                  tasksPath: request.taskGraph.path,
+                  graphVersion: request.taskGraph.graphVersion,
+                  tasksDigest: request.taskGraph.tasksDigest,
+                  taskCount: request.taskGraph.taskCount,
+                  writeTaskCount: request.taskGraph.writeTaskCount,
+                }),
           },
         },
-        risk: "mutating",
+        risk: schedulesTasks ? "external" : "mutating",
         explanation:
-          "Exit Plan Mode and allow pibot to start executing the approved plan.",
+          "Approve and freeze PLAN.md plus tasks.json, then allow the runtime scheduler to execute the frozen task graph.",
+        capabilities: {
+          requirements: [
+            {
+              capability: "filesystem.read",
+              paths: [request.planPath ?? "PLAN.md", "tasks.json"],
+            },
+            {
+              capability: "runtime.control",
+              resources: ["agent-mode:plan", "task-graph:scheduler"],
+            },
+            ...(schedulesTasks
+              ? [
+                  { capability: "process.exec" as const, commands: ["child-agent"] },
+                  {
+                    capability: "external.side_effect" as const,
+                    resources: ["child-agent-runtime"],
+                  },
+                ]
+              : []),
+          ],
+        },
       };
       const decision = await options.prompter.requestToolApproval(
         {
@@ -515,16 +606,16 @@ function renderRuntimeModeMessage(
     return [
       "Runtime mode: plan.",
       "Use only read-only exploration tools plus update_plan/tasks_update/task_update.",
-      "Keep PLAN.md and tasks.json current for executable work. Call exit_plan_mode when the plan is ready; do not ask for plan approval in plain text.",
+      "Keep PLAN.md and a valid TaskGraph in tasks.json current. Include child execution role/readOnly/budgets when defaults are insufficient. Call exit_plan_mode to validate, approve, freeze, and start scheduling; do not ask for approval in plain text.",
     ].join(" ");
   }
 
   if (mode === "coordinator") {
     return [
       "Runtime mode: coordinator.",
-      "Act as a coordinator: decompose work, spawn focused read-only child agents, observe tmux panes, collect structured results, and summarize.",
+      "Act as a coordinator: decompose work, spawn focused child agents, and summarize runtime-pushed structured results.",
       "Do not directly edit files or run shell commands in the main agent while coordinating; use child-agent control tools plus read-only inspection and task control tools.",
-      "Collect terminal child agents before retrying; failed, stopped, or timed-out children should be summarized or replaced deliberately instead of polled repeatedly.",
+      "Runtime maps every agent_spawn to a durable Workflow Step/Attempt, owns mechanical retries, and resumes this Parent Run when that child becomes terminal; do not poll with agent_collect. For an approved frozen TaskGraph, also let the graph scheduler own ready checks and dependency unlock.",
       ...(coordinatorGoal === undefined
         ? []
         : [`Coordinator goal: ${coordinatorGoal}`]),
@@ -537,16 +628,29 @@ function renderRuntimeModeMessage(
   ].join(" ");
 }
 
-async function renderWorldStateMessage(
+async function captureWorldState(
   state: AgentRuntimeState,
   stepContext: RuntimeModelCallHookContext["stepContext"],
   environmentProvider:
     | (() => Promise<Readonly<Record<string, unknown>>> )
     | undefined,
-): Promise<string> {
-  const taskState = await readTaskWorldState(state.workflow.taskStore);
-  const environmentState = await readEnvironmentWorldState(environmentProvider);
-  const worldState = {
+): Promise<Readonly<Record<string, unknown>>> {
+  const plan = {
+    path: state.plan.planPath,
+    ...optionalRuntimeString("enteredAt", state.plan.enteredAt),
+    ...optionalRuntimeString("updatedAt", state.plan.updatedAt),
+    ...optionalRuntimeString("approvedAt", state.plan.approvedAt),
+    ...optionalRuntimeString(
+      "approvalSummary",
+      truncateRuntimeText(state.plan.approvalSummary, 500),
+    ),
+  };
+  const taskStore = state.workflow.taskStore;
+  const [taskState, environmentState] = await Promise.all([
+    readTaskWorldState(taskStore),
+    readEnvironmentWorldState(environmentProvider),
+  ]);
+  return {
     schemaVersion: 1,
     step: {
       id: stepContext.stepId,
@@ -560,23 +664,19 @@ async function renderWorldStateMessage(
         ? {}
         : { coordinatorGoal: stepContext.coordinatorGoal }),
     },
-    plan: {
-      path: state.plan.planPath,
-      ...optionalRuntimeString("enteredAt", state.plan.enteredAt),
-      ...optionalRuntimeString("updatedAt", state.plan.updatedAt),
-      ...optionalRuntimeString("approvedAt", state.plan.approvedAt),
-      ...optionalRuntimeString(
-        "approvalSummary",
-        truncateRuntimeText(state.plan.approvalSummary, 500),
-      ),
-    },
+    plan,
     ...(taskState === undefined ? {} : { tasks: taskState }),
     ...environmentState,
   };
+}
+
+function renderWorldStateMessage(
+  stepContext: RuntimeModelCallHookContext["stepContext"],
+): string {
   return [
     renderRuntimeModeMessage(stepContext.mode, stepContext.coordinatorGoal),
     "The following JSON is current runtime truth for this step; prefer it over stale conversation history:",
-    JSON.stringify(worldState, null, 2),
+    JSON.stringify(stepContext.snapshot.worldState, null, 2),
   ].join("\n");
 }
 
@@ -639,6 +739,10 @@ function summarizeTaskSnapshot(
     path: filePath,
     available: true,
     updatedAt: snapshot.updatedAt,
+    graphVersion: snapshot.graphVersion,
+    graphState: snapshot.graphState,
+    tasksDigest: snapshot.tasksDigest,
+    ...optionalRuntimeString("frozenAt", snapshot.frozenAt),
     replanCount: snapshot.replanCount,
     maxReplans: snapshot.maxReplans,
     counts,
@@ -646,6 +750,10 @@ function summarizeTaskSnapshot(
       .filter((task) => task.status !== "completed")
       .slice(0, 20)
       .map(summarizeActiveTask),
+    completedResults: snapshot.tasks
+      .filter((task) => task.status === "completed" && task.result !== undefined)
+      .slice(-10)
+      .map(summarizeCompletedTask),
     omittedActiveTasks: Math.max(
       0,
       snapshot.tasks.filter((task) => task.status !== "completed").length - 20,
@@ -662,6 +770,16 @@ function summarizeActiveTask(task: PlanTask): Readonly<Record<string, unknown>> 
     dependencies: task.dependencies.slice(0, 20),
     ...optionalRuntimeString("notes", truncateRuntimeText(task.notes, 500)),
     ...optionalRuntimeString("error", truncateRuntimeText(task.error, 500)),
+    ...optionalRuntimeString("lastResult", truncateRuntimeText(task.result, 1000)),
+  };
+}
+
+function summarizeCompletedTask(task: PlanTask): Readonly<Record<string, unknown>> {
+  return {
+    id: truncateRuntimeText(task.id, 120),
+    title: truncateRuntimeText(task.title, 300),
+    attempts: task.attempts,
+    result: truncateRuntimeText(task.result, 2000),
   };
 }
 

@@ -7,7 +7,12 @@ import {
   isProtectedWorkspacePath,
   resolveWorkspacePath,
 } from "../workspace/path-boundary";
-import type { CodingToolDefinition, ToolRunContext } from "./index";
+import type { SandboxPolicy } from "../workspace/sandbox-policy";
+import {
+  assertToolCapability,
+  type CodingToolDefinition,
+  type ToolRunContext,
+} from "./index";
 import { parseGrepInput } from "./parsers";
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
@@ -16,6 +21,12 @@ export const grepTool: CodingToolDefinition<"grep", GrepToolInput, GrepToolOutpu
   name: "grep",
   riskLevel: "read-only",
   executionMode: "parallel",
+  resolveCapabilities: (input) => ({
+    requirements: [{
+      capability: "filesystem.read",
+      paths: input.paths.length === 0 ? ["."] : input.paths,
+    }],
+  }),
   parse: parseGrepInput,
   description:
     "Search workspace text files for a regex pattern. Uses rg when available and falls back to a Node search.",
@@ -50,7 +61,14 @@ export const grepTool: CodingToolDefinition<"grep", GrepToolInput, GrepToolOutpu
     required: ["pattern"],
   },
   async execute(input, context, signal) {
-    const paths = await resolveSearchPaths(context.workspaceRoot, input.paths);
+    for (const searchPath of input.paths.length === 0 ? ["."] : input.paths) {
+      assertToolCapability(context, "filesystem.read", searchPath);
+    }
+    const paths = await resolveSearchPaths(
+      context.workspaceRoot,
+      input.paths,
+      context.sandboxExecutor.policy,
+    );
     const rgResult = await tryRunRg(input, paths, context, signal);
     if (rgResult !== null) {
       return rgResult;
@@ -77,36 +95,10 @@ function tryRunRg(
       ...(input.caseSensitive ? [] : ["--ignore-case"]),
       ...input.includeGlobs.flatMap((glob) => ["--glob", glob]),
       ...input.excludeGlobs.flatMap((glob) => ["--glob", `!${glob}`]),
-      "--glob",
-      "!.git/**",
-      "--glob",
-      "!.pibot/**",
-      "--glob",
-      "!.env",
-      "--glob",
-      "!.env.*",
-      "--glob",
-      "!.npmrc",
-      "--glob",
-      "!.netrc",
-      "--glob",
-      "!.gitconfig",
-      "--glob",
-      "!.pibotignore",
-      "--glob",
-      "!repo.json",
-      "--glob",
-      "!log.jsonl",
-      "--glob",
-      "!context.jsonl",
-      "--glob",
-      "!instructions.md",
-      "--glob",
-      "!MEMORY.md",
-      "--glob",
-      "!trace.jsonl",
-      "--glob",
-      "!usage.jsonl",
+      ...protectedRgGlobs(context.sandboxExecutor.policy).flatMap((glob) => [
+        "--glob",
+        glob,
+      ]),
       input.pattern,
       ...paths,
     ];
@@ -144,7 +136,11 @@ function tryRunRg(
       buffer = lines.pop() ?? "";
 
       for (const line of lines) {
-        const match = parseRgJsonLine(line, context.workspaceRoot);
+        const match = parseRgJsonLine(
+          line,
+          context.workspaceRoot,
+          context.sandboxExecutor.policy,
+        );
         if (match !== null) {
           matches.push(match);
           if (matches.length >= context.maxGrepMatches) {
@@ -180,7 +176,11 @@ function tryRunRg(
 
       settled = true;
       if (buffer.length > 0) {
-        const match = parseRgJsonLine(buffer, context.workspaceRoot);
+        const match = parseRgJsonLine(
+          buffer,
+          context.workspaceRoot,
+          context.sandboxExecutor.policy,
+        );
         if (match !== null) {
           matches.push(match);
         }
@@ -199,7 +199,11 @@ function tryRunRg(
   });
 }
 
-function parseRgJsonLine(line: string, workspaceRoot: string): GrepMatch | null {
+function parseRgJsonLine(
+  line: string,
+  workspaceRoot: string,
+  policy: SandboxPolicy,
+): GrepMatch | null {
   if (line.trim().length === 0) {
     return null;
   }
@@ -221,7 +225,7 @@ function parseRgJsonLine(line: string, workspaceRoot: string): GrepMatch | null 
   }
 
   const relativePath = toWorkspacePath(workspaceRoot, absolutePath);
-  if (isProtectedWorkspacePath(relativePath)) {
+  if (isProtectedWorkspacePath(relativePath, policy)) {
     return null;
   }
 
@@ -242,7 +246,10 @@ async function nodeSearch(
   let truncated = false;
 
   for (const searchPath of paths) {
-    for await (const filePath of walkFiles(searchPath)) {
+    for await (const filePath of walkFiles(
+      searchPath,
+      context.sandboxExecutor.policy,
+    )) {
       const fileStat = await stat(filePath).catch(() => undefined);
       if (fileStat === undefined || fileStat.size > context.maxFileBytes) {
         continue;
@@ -277,7 +284,10 @@ async function nodeSearch(
   };
 }
 
-async function* walkFiles(root: string): AsyncIterable<string> {
+async function* walkFiles(
+  root: string,
+  policy: SandboxPolicy,
+): AsyncIterable<string> {
   const rootStat = await stat(root);
   if (rootStat.isFile()) {
     yield root;
@@ -291,9 +301,7 @@ async function* walkFiles(root: string): AsyncIterable<string> {
   const entries = await readdir(root, { withFileTypes: true });
   for (const entry of entries) {
     if (
-      isProtectedWorkspacePath(entry.name) ||
-      entry.name === ".git" ||
-      entry.name === ".pibot" ||
+      isProtectedWorkspacePath(entry.name, policy) ||
       entry.name === "node_modules" ||
       entry.name === "dist"
     ) {
@@ -302,7 +310,7 @@ async function* walkFiles(root: string): AsyncIterable<string> {
 
     const child = join(root, entry.name);
     if (entry.isDirectory()) {
-      yield* walkFiles(child);
+      yield* walkFiles(child, policy);
     } else if (entry.isFile()) {
       yield child;
     }
@@ -312,6 +320,7 @@ async function* walkFiles(root: string): AsyncIterable<string> {
 async function resolveSearchPaths(
   root: string,
   requestedPaths: readonly WorkspacePath[],
+  policy: SandboxPolicy,
 ): Promise<readonly string[]> {
   if (requestedPaths.length === 0) {
     return [resolve(root)];
@@ -322,9 +331,23 @@ async function resolveSearchPaths(
       resolveWorkspacePath(root, requestedPath, {
         access: "search",
         allowWorkspaceRoot: true,
+        policy,
       }),
     ),
   );
+}
+
+function protectedRgGlobs(policy: SandboxPolicy): readonly string[] {
+  const exceptions = new Set(policy.filesystem.protectedNameExceptions);
+  return [
+    ...policy.filesystem.protectedDirectoryNames
+      .filter((name) => !exceptions.has(name))
+      .map((name) => `!${name}/**`),
+    ...policy.filesystem.protectedFileNames
+      .filter((name) => !exceptions.has(name))
+      .map((name) => `!${name}`),
+    ...policy.filesystem.protectedFilePrefixes.map((prefix) => `!${prefix}*`),
+  ];
 }
 
 function compileRegex(pattern: string, caseSensitive: boolean): RegExp {

@@ -90,6 +90,12 @@ export interface WorkflowAttemptRecord {
   readonly diffFingerprint?: string;
   readonly idempotencyPrefix: string;
   readonly circuitKey?: string;
+  readonly execution?: {
+    readonly kind: "child_agent";
+    readonly externalKey: string;
+    readonly childRunId: string;
+    readonly boundAt: string;
+  };
   readonly versions: WorkflowVersionSnapshot;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -138,4 +144,3 @@ export interface CircuitBreakerRecord {
   readonly cooldownUntil?: string;
   readonly probeRunId?: string;
 }
-

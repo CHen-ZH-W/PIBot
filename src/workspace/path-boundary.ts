@@ -1,5 +1,10 @@
 import { lstat, realpath, stat } from "node:fs/promises";
 import * as path from "node:path";
+import {
+  defaultSandboxPolicy,
+  isSandboxProtectedName,
+  type SandboxPolicy,
+} from "./sandbox-policy";
 
 export type WorkspacePathAccess = "read" | "mutate" | "search" | "cwd";
 
@@ -7,27 +12,8 @@ export interface ResolveWorkspacePathOptions {
   readonly access: WorkspacePathAccess;
   readonly allowMissing?: boolean;
   readonly allowWorkspaceRoot?: boolean;
+  readonly policy?: SandboxPolicy;
 }
-
-const protectedDirectoryNames = new Set([
-  ".git",
-  ".pibot",
-  ".pibot-evolution-workspaces",
-]);
-const protectedFileNames = new Set([
-  ".gitconfig",
-  ".netrc",
-  ".npmrc",
-  ".pibotignore",
-  "instructions.md",
-  "context.jsonl",
-  "log.jsonl",
-  "MEMORY.md",
-  "repo.json",
-  "runtime-state.json",
-  "trace.jsonl",
-  "usage.jsonl",
-]);
 
 /**
  * Resolves an agent-controlled path while rejecting workspace escapes,
@@ -47,7 +33,7 @@ export async function resolveWorkspacePath(
     throw boundaryError("permission_denied", "Workspace root cannot be used as a file path");
   }
 
-  if (isProtectedWorkspacePath(relativePath)) {
+  if (isProtectedWorkspacePath(relativePath, options.policy)) {
     throw boundaryError("permission_denied", `Path is protected: ${requestedPath}`);
   }
 
@@ -88,13 +74,12 @@ export async function resolveWorkspacePath(
   return target;
 }
 
-export function isProtectedWorkspacePath(relativePath: string): boolean {
+export function isProtectedWorkspacePath(
+  relativePath: string,
+  policy: SandboxPolicy = defaultSandboxPolicy,
+): boolean {
   const segments = relativePath.split(/[\\/]+/u).filter((segment) => segment.length > 0);
-  if (segments.some((segment) => protectedDirectoryNames.has(segment))) {
-    return true;
-  }
-
-  return segments.some((segment) => isProtectedFileName(segment));
+  return segments.some((segment) => isSandboxProtectedName(segment, policy));
 }
 
 export async function assertFileSize(
@@ -151,12 +136,4 @@ function isNodeErrorWithCode(error: unknown, code: string): boolean {
     "code" in error &&
     (error as { readonly code?: unknown }).code === code
   );
-}
-
-function isProtectedFileName(fileName: string): boolean {
-  if (protectedFileNames.has(fileName) || fileName === ".env") {
-    return true;
-  }
-
-  return fileName.startsWith(".env.") && fileName !== ".env.example";
 }

@@ -16,6 +16,8 @@ type UnknownRecord = Readonly<Record<string, unknown>>;
 
 export const TOOL_APPROVAL_ALLOW_ACTION = "pibot_tool_approval_allow";
 export const TOOL_APPROVAL_DENY_ACTION = "pibot_tool_approval_deny";
+export const TOOL_APPROVAL_ALLOW_RUN_ACTION = "pibot_tool_approval_allow_run";
+export const TOOL_APPROVAL_DENY_RUN_ACTION = "pibot_tool_approval_deny_run";
 
 interface PendingApproval {
   readonly request: ToolApprovalPromptRequest;
@@ -31,11 +33,12 @@ interface PendingApproval {
 interface ParsedApprovalAction {
   readonly approvalId: string;
   readonly approved: boolean;
+  readonly scope: "once" | "run";
   readonly userId: SlackUserId;
 }
 
 /**
- * Posts one-shot Slack approval buttons and resolves the matching tool call.
+ * Posts Slack approval buttons and resolves the matching tool call.
  * Decisions are intentionally in-memory: a bot restart fails pending calls closed.
  */
 export class SlackToolApprovalBroker
@@ -161,9 +164,21 @@ export class SlackToolApprovalBroker
     await this.finishApproval(
       action.approvalId,
       action.approved
-        ? { approved: true }
-        : deniedDecision("Tool call was rejected in Slack"),
-      approvalDecisionStatus(pending.request.call, action.approved, action.userId),
+        ? (pending.request.runScopeAllowed === true && action.scope === "run"
+            ? { approved: true, scope: "run" }
+            : { approved: true })
+        : (pending.request.runScopeAllowed === true && action.scope === "run"
+            ? {
+                ...deniedDecision("Tool call was rejected in Slack"),
+                scope: "run",
+              }
+            : deniedDecision("Tool call was rejected in Slack")),
+      approvalDecisionStatus(
+        pending.request.call,
+        action.approved,
+        action.userId,
+        pending.request.runScopeAllowed === true ? action.scope : "once",
+      ),
     );
     return true;
   }
@@ -238,13 +253,25 @@ function approvalBlocks(
           value: approvalId,
           style: "primary",
         },
+        ...(request.runScopeAllowed === true ? [{
+          type: "button",
+          actionId: TOOL_APPROVAL_ALLOW_RUN_ACTION,
+          text: { type: "plain_text", text: "Allow for run" },
+          value: approvalId,
+        } as const] : []),
         {
           type: "button",
           actionId: TOOL_APPROVAL_DENY_ACTION,
-          text: { type: "plain_text", text: "Reject" },
+          text: { type: "plain_text", text: "Reject once" },
           value: approvalId,
           style: "danger",
         },
+        ...(request.runScopeAllowed === true ? [{
+          type: "button",
+          actionId: TOOL_APPROVAL_DENY_RUN_ACTION,
+          text: { type: "plain_text", text: "Deny for run" },
+          value: approvalId,
+        } as const] : []),
       ],
     },
     {
@@ -300,7 +327,9 @@ function formatApprovalSummary(request: ToolApprovalPromptRequest): string {
   if (request.call.name === "exit_plan_mode") {
     return [
       "*Plan approval required*",
-      "Approve this to leave Plan Mode and continue execution.",
+      "Approve this to leave Plan Mode, freeze the saved plan and TaskGraph, then start runtime scheduling.",
+      `Risk: *${request.risk}*`,
+      ...formatCapabilityDetails(request),
       formatToolDetails(request.call),
     ].join("\n");
   }
@@ -308,8 +337,43 @@ function formatApprovalSummary(request: ToolApprovalPromptRequest): string {
   return [
     `*Tool approval required*: \`${inlineCode(request.call.name)}\``,
     `Risk: *${request.risk}*`,
+    ...formatCapabilityDetails(request),
     formatToolDetails(request.call),
   ].join("\n");
+}
+
+function formatCapabilityDetails(
+  request: ToolApprovalPromptRequest,
+): readonly string[] {
+  if (request.capabilities === undefined) {
+    return [];
+  }
+  const requested = request.escalation ?? request.capabilities;
+  if (requested === undefined) {
+    return [];
+  }
+  const details = requested.requirements.map((requirement) => {
+    if (
+      requirement.capability === "filesystem.read" ||
+      requirement.capability === "filesystem.write"
+    ) {
+      return `Escalation: \`${inlineCode(requirement.capability)}(${inlineCode(requirement.paths.join(", "))})\``;
+    }
+    if (requirement.capability === "network.connect") {
+      return `Escalation: \`${inlineCode(requirement.capability)}(${inlineCode(requirement.hosts.join(", "))})\``;
+    }
+    if (requirement.capability === "process.exec") {
+      return `Escalation: \`${inlineCode(requirement.capability)}\``;
+    }
+    return `Escalation: \`${inlineCode(requirement.capability)}(${inlineCode(requirement.resources.join(", "))})\``;
+  });
+  if (requested.effects?.destructive === true) {
+    details.push("Escalation effect: `destructive`");
+  }
+  if (requested.effects?.openWorld === true) {
+    details.push("Escalation effect: `openWorld`");
+  }
+  return details;
 }
 
 function formatCompletedApprovalSummary(
@@ -344,8 +408,17 @@ function formatToolDetails(call: ToolCall): string {
       const summary = readInputString(input, "summary");
       const planPath = readInputString(input, "planPath") || "PLAN.md";
       const planExcerpt = readInputString(input, "planExcerpt");
+      const tasksPath = readInputString(input, "tasksPath") || "tasks.json";
+      const graphVersion = readInputNumber(input, "graphVersion");
+      const taskCount = readInputNumber(input, "taskCount");
+      const writeTaskCount = readInputNumber(input, "writeTaskCount");
+      const tasksDigest = readInputString(input, "tasksDigest");
       return [
         `Plan: \`${inlineCode(planPath)}\``,
+        `TaskGraph: \`${inlineCode(tasksPath)}\` v${graphVersion ?? "?"} (${taskCount ?? 0} tasks, ${writeTaskCount ?? 0} write-capable)`,
+        ...(tasksDigest.length === 0
+          ? []
+          : [`TaskGraph digest: \`${inlineCode(tasksDigest)}\``]),
         ...(summary.length === 0
           ? []
           : [`Summary: ${inlineCode(codeFence(summary, 240))}`]),
@@ -373,6 +446,7 @@ function approvalDecisionStatus(
   call: ToolCall,
   approved: boolean,
   userId: SlackUserId,
+  scope: "once" | "run" = "once",
 ): string {
   if (call.name === "enter_plan_mode") {
     return approved
@@ -385,9 +459,10 @@ function approvalDecisionStatus(
       : `Plan rejected by <@${userId}>.`;
   }
 
+  const suffix = scope === "run" ? " for this run" : " once";
   return approved
-    ? `Approved by <@${userId}>.`
-    : `Rejected by <@${userId}>.`;
+    ? `Approved${suffix} by <@${userId}>.`
+    : `Rejected${suffix} by <@${userId}>.`;
 }
 
 function isPlanModeApprovalTool(toolName: string): boolean {
@@ -401,6 +476,13 @@ function readToolInput(input: unknown): UnknownRecord {
 function readInputString(input: UnknownRecord, key: string): string {
   const value = input[key];
   return typeof value === "string" ? value : "";
+}
+
+function readInputNumber(input: UnknownRecord, key: string): number | undefined {
+  const value = input[key];
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
 }
 
 function readInputArray(input: UnknownRecord, key: string): readonly unknown[] {
@@ -430,14 +512,23 @@ function parseApprovalAction(body: UnknownRecord): ParsedApprovalAction | null {
   if (
     approvalId === undefined ||
     (actionId !== TOOL_APPROVAL_ALLOW_ACTION &&
-      actionId !== TOOL_APPROVAL_DENY_ACTION)
+      actionId !== TOOL_APPROVAL_DENY_ACTION &&
+      actionId !== TOOL_APPROVAL_ALLOW_RUN_ACTION &&
+      actionId !== TOOL_APPROVAL_DENY_RUN_ACTION)
   ) {
     return null;
   }
 
   return {
     approvalId,
-    approved: actionId === TOOL_APPROVAL_ALLOW_ACTION,
+    approved:
+      actionId === TOOL_APPROVAL_ALLOW_ACTION ||
+      actionId === TOOL_APPROVAL_ALLOW_RUN_ACTION,
+    scope:
+      actionId === TOOL_APPROVAL_ALLOW_RUN_ACTION ||
+        actionId === TOOL_APPROVAL_DENY_RUN_ACTION
+        ? "run"
+        : "once",
     userId: userId as SlackUserId,
   };
 }

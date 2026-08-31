@@ -27,6 +27,12 @@ export interface AttemptAdmission {
   readonly attempt?: WorkflowAttemptRecord;
 }
 
+export interface WorkflowGraphState {
+  readonly run: WorkflowRunRecord;
+  readonly steps: readonly WorkflowStepRecord[];
+  readonly ready: readonly WorkflowStepRecord[];
+}
+
 export class WorkflowOrchestrator {
   readonly store: FileWorkflowStore;
   private readonly defaultBudget: WorkflowBudget;
@@ -128,11 +134,20 @@ export class WorkflowOrchestrator {
     readonly stepId: string;
     readonly kind: string;
     readonly dependencies?: readonly string[];
+    readonly initialStatus?: "succeeded" | "skipped";
   }): Promise<WorkflowStepRecord> {
     return this.enqueue(async () => {
       const existing = (await this.store.readSteps(input.runId))
         .find((step) => step.stepId === input.stepId);
       if (existing !== undefined) {
+        if (
+          existing.kind !== input.kind ||
+          !sameStrings(existing.dependencies, input.dependencies ?? [])
+        ) {
+          throw new Error(
+            `Workflow step ${input.stepId} already exists with a different definition`,
+          );
+        }
         return existing;
       }
       const now = new Date().toISOString();
@@ -141,7 +156,8 @@ export class WorkflowOrchestrator {
         runId: input.runId,
         stepId: input.stepId,
         kind: input.kind,
-        status: "ready",
+        status: input.initialStatus ??
+          ((input.dependencies?.length ?? 0) === 0 ? "ready" : "pending"),
         dependencies: input.dependencies ?? [],
         attemptsUsed: 0,
         edgeCalls: {},
@@ -152,7 +168,7 @@ export class WorkflowOrchestrator {
       await this.store.appendEvent({
         runId: input.runId,
         stepId: input.stepId,
-        type: "step.ready",
+        type: step.status === "ready" ? "step.ready" : "step.pending",
       });
       return step;
     });
@@ -166,12 +182,31 @@ export class WorkflowOrchestrator {
     readonly edgeKey?: string;
     readonly circuitKey?: string;
     readonly versions?: WorkflowVersionSnapshot;
+    readonly allowDuplicateStrategy?: boolean;
   }): Promise<AttemptAdmission> {
     return this.enqueue(async () => {
       const run = await this.store.readRun(input.runId);
       const step = requireStep(await this.store.readSteps(input.runId), input.stepId);
       const attempts = await this.store.readAttempts(input.runId);
       const strategyFingerprint = fingerprintStrategy(input.strategy);
+
+      const dependencies = new Set(step.dependencies);
+      if (dependencies.size > 0) {
+        const succeeded = new Set(
+          (await this.store.readSteps(input.runId))
+            .filter((candidate) =>
+              candidate.status === "succeeded" || candidate.status === "skipped")
+            .map((candidate) => candidate.stepId),
+        );
+        const unmet = [...dependencies].filter((dependency) => !succeeded.has(dependency));
+        if (unmet.length > 0) {
+          return this.denyAttempt(run, step, `step_dependencies_unmet:${unmet.join(",")}`);
+        }
+      }
+      if (step.status === "running" || step.status === "succeeded" ||
+          step.status === "skipped") {
+        return this.denyAttempt(run, step, `step_is_${step.status}`);
+      }
 
       if (isTerminalWithoutRetry(run.status)) {
         return this.rejectAttempt(run, step, `workflow_is_${run.status}`);
@@ -189,6 +224,7 @@ export class WorkflowOrchestrator {
         return this.rejectAttempt(run, step, `edge_budget_exhausted:${input.edgeKey}`);
       }
       if (
+        input.allowDuplicateStrategy !== true &&
         input.triggerErrorFingerprint !== undefined &&
         attempts.some((attempt) =>
           attempt.resultErrorFingerprint === input.triggerErrorFingerprint &&
@@ -276,6 +312,9 @@ export class WorkflowOrchestrator {
       if (run.status === "cancelled" || attempt.status === "cancelled") {
         return attempt;
       }
+      if (attempt.status === "succeeded" || attempt.status === "failed") {
+        return attempt;
+      }
       const now = new Date().toISOString();
       const completed: WorkflowAttemptRecord = {
         ...attempt,
@@ -304,31 +343,14 @@ export class WorkflowOrchestrator {
       const budgetExhausted = run.attemptsUsed >= run.budget.maxTotalAttempts ||
         attempt.ordinal >= run.budget.maxAttemptsPerStep;
       const blocked = repeatedDiff || budgetExhausted;
-      const nextRunStatus = input.success
-        ? "succeeded"
-        : blocked
-        ? "blocked"
-        : "retrying";
       const nextStepStatus = input.success
         ? "succeeded"
         : blocked
         ? "blocked"
         : "failed";
-      await this.store.updateRun(run.runId, (current) => ({
-        ...current,
-        status: nextRunStatus,
-        updatedAt: now,
-        ...(input.success || blocked ? { endedAt: now } : {}),
-        ...(blocked
-          ? {
-              terminalReason: repeatedDiff
-                ? "duplicate_error_and_diff"
-                : "attempt_budget_exhausted",
-            }
-          : {}),
-      }));
-      await this.store.writeSteps(run.runId, (steps) =>
-        steps.map((step) =>
+      const previousSteps = await this.store.readSteps(run.runId);
+      const updatedSteps = await this.store.writeSteps(run.runId, (steps) =>
+        advanceDependencyState(steps.map((step) =>
           step.stepId === attempt.stepId
             ? {
                 ...step,
@@ -342,7 +364,22 @@ export class WorkflowOrchestrator {
                     }
                   : {}),
               }
-            : step));
+            : step), now));
+      await this.appendStepTransitionEvents(run.runId, previousSteps, updatedSteps);
+      const runState = deriveRunState(updatedSteps, input.success ? "running" : "retrying");
+      await this.store.updateRun(run.runId, (current) => {
+        const terminal = runState.status === "succeeded" || runState.status === "blocked";
+        const { endedAt: _endedAt, terminalReason: _terminalReason, ...active } = current;
+        return {
+          ...active,
+          status: runState.status,
+          updatedAt: now,
+          ...(terminal ? { endedAt: now } : {}),
+          ...(runState.terminalReason === undefined
+            ? {}
+            : { terminalReason: runState.terminalReason }),
+        };
+      });
       await this.store.appendEvent({
         runId: run.runId,
         stepId: attempt.stepId,
@@ -389,6 +426,85 @@ export class WorkflowOrchestrator {
         await this.closeCircuit(attempt.circuitKey);
       }
       return completed;
+    });
+  }
+
+  refreshGraph(runId: string): Promise<WorkflowGraphState> {
+    return this.enqueue(async () => {
+      const existingRun = await this.store.readRun(runId);
+      if (existingRun.status === "cancelled") {
+        return {
+          run: existingRun,
+          steps: await this.store.readSteps(runId),
+          ready: [],
+        };
+      }
+      const now = new Date().toISOString();
+      const before = await this.store.readSteps(runId);
+      const steps = advanceDependencyState(before, now);
+      await this.store.writeSteps(runId, () => steps);
+      await this.appendStepTransitionEvents(runId, before, steps);
+      const derived = deriveRunState(steps, "queued");
+      const run = await this.store.updateRun(runId, (current) => {
+        const terminal = derived.status === "succeeded" || derived.status === "blocked";
+        const { endedAt: _endedAt, terminalReason: _terminalReason, ...active } = current;
+        return {
+          ...active,
+          status: derived.status,
+          updatedAt: now,
+          ...(terminal ? { endedAt: now } : {}),
+          ...(derived.terminalReason === undefined
+            ? {}
+            : { terminalReason: derived.terminalReason }),
+        };
+      });
+      return {
+        run,
+        steps,
+        ready: steps.filter((step) => step.status === "ready"),
+      };
+    });
+  }
+
+  bindAttemptChild(input: {
+    readonly runId: string;
+    readonly attemptId: string;
+    readonly externalKey: string;
+    readonly childRunId: string;
+  }): Promise<WorkflowAttemptRecord> {
+    return this.enqueue(async () => {
+      const attempts = await this.store.readAttempts(input.runId);
+      const attempt = requireAttempt(attempts, input.attemptId);
+      if (attempt.execution !== undefined) {
+        if (
+          attempt.execution.externalKey !== input.externalKey ||
+          attempt.execution.childRunId !== input.childRunId
+        ) {
+          throw new Error(`Workflow attempt ${input.attemptId} is already bound`);
+        }
+        return attempt;
+      }
+      const execution = {
+        kind: "child_agent" as const,
+        externalKey: input.externalKey,
+        childRunId: input.childRunId,
+        boundAt: new Date().toISOString(),
+      };
+      const updated = { ...attempt, execution, updatedAt: execution.boundAt };
+      await this.store.writeAttempts(input.runId, (current) =>
+        current.map((candidate) =>
+          candidate.attemptId === input.attemptId ? updated : candidate));
+      await this.store.appendEvent({
+        runId: input.runId,
+        stepId: attempt.stepId,
+        attemptId: attempt.attemptId,
+        type: "attempt.child_bound",
+        payload: {
+          externalKey: input.externalKey,
+          childRunId: input.childRunId,
+        },
+      });
+      return updated;
     });
   }
 
@@ -525,6 +641,8 @@ export class WorkflowOrchestrator {
 
   cancelRun(runId: string, reason = "cancelled_by_user"): Promise<WorkflowRunRecord> {
     return this.enqueue(async () => {
+      const existing = await this.store.readRun(runId);
+      if (existing.status === "cancelled") return existing;
       const now = new Date().toISOString();
       const run = await this.store.updateRun(runId, (current) => ({
         ...current,
@@ -535,7 +653,9 @@ export class WorkflowOrchestrator {
       }));
       await this.store.writeSteps(runId, (steps) =>
         steps.map((step) =>
-          step.status === "running" || step.status === "ready"
+          step.status === "running" ||
+              step.status === "ready" ||
+              step.status === "pending"
             ? {
                 ...step,
                 status: "blocked",
@@ -599,6 +719,39 @@ export class WorkflowOrchestrator {
       run: updatedRun,
       step: updatedStep,
     };
+  }
+
+  private async denyAttempt(
+    run: WorkflowRunRecord,
+    step: WorkflowStepRecord,
+    reason: string,
+  ): Promise<AttemptAdmission> {
+    await this.store.appendEvent({
+      runId: run.runId,
+      stepId: step.stepId,
+      type: "attempt.denied",
+      payload: { reason },
+    });
+    return { allowed: false, reason, run, step };
+  }
+
+  private async appendStepTransitionEvents(
+    runId: string,
+    before: readonly WorkflowStepRecord[],
+    after: readonly WorkflowStepRecord[],
+  ): Promise<void> {
+    const previous = new Map(before.map((step) => [step.stepId, step.status]));
+    for (const step of after) {
+      if (previous.get(step.stepId) === step.status) continue;
+      await this.store.appendEvent({
+        runId,
+        stepId: step.stepId,
+        type: `step.${step.status}`,
+        ...(step.terminalReason === undefined
+          ? {}
+          : { payload: { reason: step.terminalReason } }),
+      });
+    }
   }
 
   private async admitCircuit(
@@ -717,6 +870,71 @@ function requireAttempt(
 
 function isTerminalWithoutRetry(status: WorkflowRunRecord["status"]): boolean {
   return status === "succeeded" || status === "cancelled";
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function advanceDependencyState(
+  input: readonly WorkflowStepRecord[],
+  now: string,
+): readonly WorkflowStepRecord[] {
+  let steps = [...input];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const byId = new Map(steps.map((step) => [step.stepId, step]));
+    steps = steps.map((step) => {
+      if (step.status !== "pending" && step.status !== "ready") return step;
+      const dependencies = step.dependencies.map((dependency) => byId.get(dependency));
+      const missingDependency = dependencies.some((dependency) => dependency === undefined);
+      const blockedDependency = dependencies.find((dependency) =>
+        dependency?.status === "blocked");
+      if (missingDependency || blockedDependency !== undefined) {
+        changed = true;
+        return {
+          ...step,
+          status: "blocked" as const,
+          updatedAt: now,
+          terminalReason: missingDependency
+            ? "dependency_missing"
+            : `dependency_blocked:${blockedDependency?.stepId ?? "unknown"}`,
+        };
+      }
+      const nextStatus = dependencies.every((dependency) =>
+        dependency?.status === "succeeded" || dependency?.status === "skipped")
+        ? "ready" as const
+        : "pending" as const;
+      if (step.status === nextStatus) return step;
+      changed = true;
+      return { ...step, status: nextStatus, updatedAt: now };
+    });
+  }
+  return steps;
+}
+
+function deriveRunState(
+  steps: readonly WorkflowStepRecord[],
+  activeFallback: "queued" | "running" | "retrying",
+): {
+  readonly status: WorkflowRunRecord["status"];
+  readonly terminalReason?: string;
+} {
+  if (steps.length === 0) return { status: activeFallback };
+  if (steps.every((step) => step.status === "succeeded" || step.status === "skipped")) {
+    return { status: "succeeded" };
+  }
+  if (steps.some((step) => step.status === "running")) return { status: "running" };
+  if (steps.some((step) => step.status === "failed")) return { status: "retrying" };
+  if (steps.some((step) => step.status === "ready" || step.status === "pending")) {
+    return { status: activeFallback };
+  }
+  const blocked = steps.find((step) => step.status === "blocked");
+  return {
+    status: "blocked",
+    terminalReason: blocked?.terminalReason ?? "workflow_steps_blocked",
+  };
 }
 
 function activateStep(

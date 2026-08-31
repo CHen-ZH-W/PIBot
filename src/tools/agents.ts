@@ -1,4 +1,4 @@
-import type { AgentRunId } from "../core/ids";
+import type { AgentRunId, ToolCallId } from "../core/ids";
 import type { ChildAgentRole } from "../workspace/child-agents";
 import type { CodingToolDefinition, ToolInputParseResult, ToolRunContext } from "./index";
 
@@ -47,8 +47,15 @@ export const agentSpawnTool: CodingToolDefinition<
   name: "agent_spawn",
   riskLevel: "external",
   executionMode: "sequential",
+  resolveCapabilities: (input) => ({
+    requirements: [
+      { capability: "process.exec", commands: ["child-agent"] },
+      { capability: "runtime.control", resources: [`child-agent:${input.role}`] },
+      { capability: "external.side_effect", resources: ["child-agent-runtime"] },
+    ],
+  }),
   description:
-    "Spawn a child coding agent in a tmux window. Child agents may edit inside isolated workspaces and write their result to a channel-local run directory.",
+    "Schedule a child coding agent in a tmux window. Runtime maps the child to a durable Workflow attempt and pushes its terminal result back to the parent run.",
   schema: {
     type: "object",
     additionalProperties: false,
@@ -91,7 +98,12 @@ export const agentSpawnTool: CodingToolDefinition<
   parse: parseAgentSpawnInput,
   async execute(input, context) {
     const runtime = requireChildAgentRuntime(context);
-    const run = await runtime.spawnAgent(input);
+    const run = context.childScheduler === undefined
+      ? await runtime.spawnAgent(input)
+      : await context.childScheduler.spawnAgent({
+          ...input,
+          toolCallId: requireToolCallId(context),
+        });
     return {
       childRunId: run.childRunId,
       parentRunId: run.parentRunId,
@@ -119,6 +131,9 @@ export const agentListTool: CodingToolDefinition<
   name: "agent_list",
   riskLevel: "read-only",
   executionMode: "parallel",
+  resolveCapabilities: () => ({
+    requirements: [{ capability: "runtime.read", resources: ["child-agents"] }],
+  }),
   description:
     "List child agents for the current parent run, including their status and tmux target.",
   schema: {
@@ -157,6 +172,12 @@ export const agentCaptureTool: CodingToolDefinition<
   name: "agent_capture",
   riskLevel: "read-only",
   executionMode: "parallel",
+  resolveCapabilities: (input) => ({
+    requirements: [{
+      capability: "runtime.read",
+      resources: [`child-agent:${input.childRunId}`],
+    }],
+  }),
   description:
     "Capture the tail of a child agent's tmux pane for observation without ingesting the full transcript.",
   schema: {
@@ -184,6 +205,15 @@ export const agentSendTool: CodingToolDefinition<
   name: "agent_send",
   riskLevel: "external",
   executionMode: "sequential",
+  resolveCapabilities: (input) => ({
+    requirements: [
+      {
+        capability: "runtime.control",
+        resources: [`child-agent:${input.childRunId}`],
+      },
+      { capability: "external.side_effect", resources: ["child-agent-runtime"] },
+    ],
+  }),
   description:
     "Send text to a running child agent's tmux pane, optionally pressing Enter.",
   schema: {
@@ -211,6 +241,16 @@ export const agentStopTool: CodingToolDefinition<
   name: "agent_stop",
   riskLevel: "external",
   executionMode: "sequential",
+  resolveCapabilities: (input) => ({
+    requirements: [
+      {
+        capability: "runtime.control",
+        resources: [`child-agent:${input.childRunId}`],
+      },
+      { capability: "external.side_effect", resources: ["child-agent-runtime"] },
+    ],
+    effects: { destructive: true },
+  }),
   description:
     "Stop a child agent by killing its tmux window and marking the child run stopped.",
   schema: {
@@ -225,6 +265,10 @@ export const agentStopTool: CodingToolDefinition<
   parse: parseAgentStopInput,
   async execute(input, context) {
     const runtime = requireChildAgentRuntime(context);
+    await context.childScheduler?.cancelChild(
+      input.childRunId,
+      input.reason ?? "stopped_by_parent_agent",
+    );
     const run = await runtime.stopAgent(input);
     return summaryForRun(run);
   },
@@ -238,8 +282,14 @@ export const agentCollectTool: CodingToolDefinition<
   name: "agent_collect",
   riskLevel: "read-only",
   executionMode: "parallel",
+  resolveCapabilities: (input) => ({
+    requirements: [{
+      capability: "runtime.read",
+      resources: [`child-agent:${input.childRunId}`],
+    }],
+  }),
   description:
-    "Collect a child agent's structured status, result.md and usage summary. Does not ingest full transcript logs.",
+    "Read a child agent's structured status, result.md and usage summary for diagnostics. Scheduled terminal results are pushed automatically, so polling is unnecessary.",
   schema: {
     type: "object",
     additionalProperties: false,
@@ -359,6 +409,16 @@ function requireChildAgentRuntime(context: ToolRunContext) {
     throw error;
   }
   return context.childAgents;
+}
+
+function requireToolCallId(context: ToolRunContext): ToolCallId {
+  const callId = context.authorization?.callId;
+  if (callId === undefined) {
+    const error = new Error("Scheduled agent_spawn requires a tool call id");
+    error.name = "invalid_input";
+    throw error;
+  }
+  return callId;
 }
 
 function summaryForRun(run: {

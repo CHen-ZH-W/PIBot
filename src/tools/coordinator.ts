@@ -22,6 +22,12 @@ export const enterCoordinatorModeTool: CodingToolDefinition<
   name: "enter_coordinator_mode",
   riskLevel: "read-only",
   executionMode: "sequential",
+  resolveCapabilities: () => ({
+    requirements: [{
+      capability: "runtime.control",
+      resources: ["agent-mode:coordinator"],
+    }],
+  }),
   description:
     "Switch the current run into Coordinator Mode. The main agent coordinates tmux child agents and summarizes results instead of directly editing files.",
   schema: {
@@ -50,7 +56,7 @@ export const enterCoordinatorModeTool: CodingToolDefinition<
       goal: runtime.coordinator.goal ?? "",
       enteredAt: runtime.coordinator.enteredAt,
       message:
-        "Coordinator Mode is active. Spawn focused child agents, observe tmux panes, collect result.md/usage.json, and summarize without directly mutating files.",
+        "Coordinator Mode is active. Spawn focused child agents; Runtime records Workflow attempts and pushes each terminal result into a resumed Parent UserTurn. Use capture/collect only for diagnostics, then summarize without directly mutating files.",
     };
   },
 };
@@ -63,6 +69,12 @@ export const exitCoordinatorModeTool: CodingToolDefinition<
   name: "exit_coordinator_mode",
   riskLevel: "read-only",
   executionMode: "sequential",
+  resolveCapabilities: () => ({
+    requirements: [{
+      capability: "runtime.control",
+      resources: ["agent-mode:coordinator"],
+    }],
+  }),
   description:
     "Leave Coordinator Mode and return the current run to normal Execute Mode.",
   schema: {

@@ -18,6 +18,7 @@ const {
 } = require("../dist/tools");
 const { ChannelRepoWorkflow } = require("../dist/workspace/repo");
 const { createSandboxExecutor } = require("../dist/workspace/sandbox");
+const { defaultSandboxPolicy } = require("../dist/workspace/sandbox-policy");
 const { WorkspaceSessionStore } = require("../dist/workspace/session");
 const { FileChannelWorkspaceStore } = require("../dist/workspace/store");
 
@@ -105,6 +106,7 @@ async function acceptsSandboxedRepoCheck() {
   const fixture = await createFixture({ checkCommand: "printf sandbox-check" });
   const requests = [];
   const sandboxExecutor = {
+    policy: defaultSandboxPolicy,
     assertWorkspaceAccess() {},
     async execute(request) {
       requests.push(request);
@@ -131,6 +133,13 @@ async function acceptsSandboxedRepoCheck() {
   assert.equal(requests[0].command, "printf sandbox-check");
   assert.equal(requests[0].workspaceRoot, fixture.repoRoot);
   assert.equal(requests[0].cwd, fixture.repoRoot);
+  assert.equal(requests[0].authorization.source, "runtime");
+  assert.equal(requests[0].authorization.policyVersion, defaultSandboxPolicy.version);
+  assert.deepEqual(requests[0].authorization.request.requirements, [
+    { capability: "process.exec", commands: ["printf sandbox-check"] },
+    { capability: "filesystem.read", paths: ["."] },
+    { capability: "filesystem.write", paths: ["."] },
+  ]);
   assert.equal(result.stdout, "sandboxed");
 }
 

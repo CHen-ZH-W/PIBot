@@ -15,6 +15,7 @@ import type {
 import type { ChannelSessionKey } from "../core/session";
 import type { SlackEvent } from "../core/slack";
 import type { AgentRuntimeState } from "../runtime/mode";
+import { MemoryUsageRuntimeHook } from "../runtime/memory-usage";
 import { ToolResultArchiveHook } from "../runtime/tool-result-archive";
 import {
   readChannelRuntimeState,
@@ -41,6 +42,7 @@ import {
   recordRunRolloutSummary,
   type RunRolloutSummaryRequest,
 } from "./memory-sedimentation";
+import type { RunMemoryCurator } from "./memory-curation";
 import type {
   ChannelWorkspaceStore,
   JsonObject,
@@ -50,7 +52,12 @@ import type {
 } from "./store";
 
 type StoredContextRole = "user" | "assistant" | "tool";
-export type ChannelContextSource = "slack_log" | "webui" | "agent" | "compaction";
+export type ChannelContextSource =
+  | "slack_log"
+  | "webui"
+  | "runtime"
+  | "agent"
+  | "compaction";
 type StoredContextSource = ChannelContextSource;
 export type ContextLifecycleState =
   | "Active"
@@ -97,8 +104,9 @@ export interface ChannelContextMessage {
 
 export interface ChannelContextAppendRequest {
   readonly message: LlmMessage;
-  readonly source?: Extract<ChannelContextSource, "webui" | "agent">;
+  readonly source?: Extract<ChannelContextSource, "webui" | "runtime" | "agent">;
   readonly createdAt?: string | Date;
+  readonly eventId?: SlackEventId;
 }
 
 export interface ChannelRunSyncResult {
@@ -143,6 +151,7 @@ export interface WorkspaceSessionStoreOptions {
   readonly store: ChannelWorkspaceStore;
   readonly compactor?: SessionCompactor;
   readonly contextManager?: ContextManager;
+  readonly memoryCurator?: RunMemoryCurator;
   readonly clock?: () => Date;
 }
 
@@ -154,6 +163,7 @@ export class WorkspaceSessionStore {
   private readonly store: ChannelWorkspaceStore;
   private readonly compactor: SessionCompactor | undefined;
   private readonly contextManager: ContextManager;
+  private readonly memoryCurator: RunMemoryCurator | undefined;
   private readonly promptCacheByChannel = new Map<string, PromptCacheObservation>();
   private readonly promptCacheEpochByChannel = new Map<string, number>();
   private readonly clock: () => Date;
@@ -162,6 +172,7 @@ export class WorkspaceSessionStore {
     this.store = options.store;
     this.compactor = options.compactor;
     this.contextManager = options.contextManager ?? new ContextManager();
+    this.memoryCurator = options.memoryCurator;
     this.clock = options.clock ?? (() => new Date());
   }
 
@@ -352,7 +363,10 @@ export class WorkspaceSessionStore {
     const createdAt = normalizeCreatedAt(request.createdAt, this.clock());
     await this.store.appendContextRecord(
       key,
-      contextMessageToRecord(request.message, source, createdAt),
+      {
+        ...contextMessageToRecord(request.message, source, createdAt),
+        ...optionalEventId(request.eventId),
+      },
     );
   }
 
@@ -577,13 +591,28 @@ export class WorkspaceSessionStore {
     });
   }
 
+  createMemoryUsageHook(key: ChannelSessionKey): MemoryUsageRuntimeHook {
+    return new MemoryUsageRuntimeHook({
+      store: this.store,
+      key,
+      clock: this.clock,
+    });
+  }
+
   async recordRunRolloutSummary(
     request: RunRolloutSummaryRequest,
   ): Promise<void> {
-    await recordRunRolloutSummary(this.store, {
+    const normalized = {
       ...request,
       createdAt: request.createdAt ?? this.clock(),
-    });
+    };
+    const rollout = await recordRunRolloutSummary(this.store, normalized);
+    if (this.memoryCurator !== undefined) {
+      await this.memoryCurator.enqueueRun({
+        request: normalized,
+        rollout,
+      });
+    }
   }
 
   async forceCompact(
@@ -1090,7 +1119,7 @@ function agentMessageToContextRecord(
 
 function contextMessageToRecord(
   message: LlmMessage,
-  source: Extract<ChannelContextSource, "webui" | "agent">,
+  source: Extract<ChannelContextSource, "webui" | "runtime" | "agent">,
   createdAt: Date,
 ): JsonObject {
   return {
@@ -1255,6 +1284,7 @@ function isContextSource(
   return (
     source === "slack_log" ||
     source === "webui" ||
+    source === "runtime" ||
     source === "agent" ||
     source === "compaction"
   );

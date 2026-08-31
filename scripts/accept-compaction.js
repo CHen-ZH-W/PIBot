@@ -30,6 +30,7 @@ async function runAcceptance() {
   await runCase("request overhead can trigger proactive compaction", acceptsRequestOverheadCompaction);
   await runCase("working set rehydrates current modified files", acceptsWorkingSetRehydration);
   await runCase("raw tool results are archived before context admission", acceptsToolResultArchive);
+  await runCase("context admission bounds one tool result with head and tail", acceptsToolResultAdmissionPruner);
   await runCase("context lifecycle persists active regenerable pruned and stale states", acceptsContextLifecycle);
   await runCase("long session writes a summary record", acceptsSummaryWrite);
   await runCase("compacted history preserves current goal and modified files", acceptsSummaryShape);
@@ -38,7 +39,7 @@ async function runAcceptance() {
   await runCase("LLM compaction writes a structured summary", acceptsLlmSummary);
   await runCase("LLM compaction keeps long summaries", acceptsLlmLongSummary);
   await runCase("invalid LLM compaction falls back to heuristic summary", acceptsLlmFallback);
-  await runCase("compaction input omits complete regions", acceptsStructuredCompactionInput);
+  await runCase("compaction input summarizes every complete region", acceptsStructuredCompactionInput);
   await runCase("fallback carries the previous durable checkpoint", acceptsRepeatedFallback);
   await runCase("legacy rendered checkpoints remain inheritable", acceptsLegacyCheckpoint);
   await runCase("runner displays compaction status in Slack", acceptsRunnerCompactionStatus);
@@ -220,8 +221,8 @@ async function acceptsStablePromptBoundary() {
   assert.equal(memoryMessageIndex < currentUserIndex, true);
   assert.equal(request.messages[memoryMessageIndex].role, "assistant");
   assert.equal(request.messages[currentUserIndex].role, "user");
-  assert.match(request.messages.at(-1).content, /pibot-context:run-context/u);
-  assert.equal(request.messages.at(-1).role, "developer");
+  assert.equal(request.messages.at(-1).content, "current request");
+  assert.equal(request.messages.at(-1).role, "user");
 }
 
 async function acceptsToolResultArchive() {
@@ -269,6 +270,93 @@ async function acceptsToolResultArchive() {
   });
   const messages = await fixture.session.readChannelContextMessages(channelKey());
   assert.equal(messages.at(-1).lifecycleState, "Regenerable");
+}
+
+async function acceptsToolResultAdmissionPruner() {
+  const fixture = await createFixture({});
+  const requests = [];
+  const fullContent = `HEAD-${"middle".repeat(2_000)}-TAIL`;
+  let callCount = 0;
+  const loop = new MinimalAgentLoop({
+    contextManager: new ContextManager({
+      toolResultAdmission: {
+        thresholdChars: 8_192,
+        headChars: 4_096,
+        tailChars: 1_024,
+      },
+    }),
+    model: {
+      async *stream(request) {
+        requests.push(request);
+        callCount += 1;
+        yield startEvent();
+        if (callCount === 1) {
+          yield {
+            type: "tool_call",
+            call: {
+              id: "read:admission",
+              name: "read",
+              argumentsJson: JSON.stringify({ path: "large.txt" }),
+            },
+          };
+        } else {
+          yield { type: "text_delta", text: "done" };
+        }
+        yield { type: "done" };
+      },
+    },
+    tools: readToolExecutor(fullContent),
+  });
+
+  await loop.run({
+    userText: "read the large file",
+    systemPrompt: "use tools",
+    history: [],
+    tools: readToolSchemas(),
+    postHooks: [fixture.session.createToolResultArchiveHook(channelKey())],
+    maxSteps: 2,
+  });
+
+  const toolMessage = requests[1].messages.find((message) =>
+    message.role === "tool" && message.toolCallId === "read:admission");
+  assert.notEqual(toolMessage, undefined);
+  assert.equal(toolMessage.content.length < 8_192, true);
+  const admitted = JSON.parse(toolMessage.content);
+  assert.equal(admitted.output.contextAdmission.strategy, "head_tail");
+  assert.equal(admitted.output.contextAdmission.truncated, true);
+  assert.equal(admitted.output.head.length, 4_096);
+  assert.equal(admitted.output.tail.length, 1_024);
+  assert.match(admitted.output.head, /HEAD-/u);
+  assert.match(admitted.output.tail, /-TAIL/u);
+  assert.match(admitted.output.contextAdmission.artifactPath, /tool-results/u);
+
+  const root = fixture.store.getPaths(channelKey()).rootDir;
+  const blob = JSON.parse(await readFile(
+    join(root, admitted.artifact.path),
+    "utf8",
+  ));
+  assert.equal(blob.result.output.content, fullContent);
+
+  const failed = new ContextManager({
+    toolResultAdmission: {
+      thresholdChars: 8_192,
+      headChars: 4_096,
+      tailChars: 1_024,
+    },
+  }).admitToolResult({
+    ok: false,
+    callId: "bash:failed-admission",
+    error: {
+      code: "execution_failed",
+      message: `FAILURE-HEAD-${"failure-middle".repeat(1_000)}-FAILURE-TAIL`,
+      retryable: false,
+    },
+  });
+  assert.equal(JSON.stringify(failed).length < 8_192, true);
+  assert.equal(failed.ok, false);
+  assert.match(failed.error.message, /FAILURE-HEAD/u);
+  assert.match(failed.error.message, /FAILURE-TAIL/u);
+  assert.match(failed.error.message, /middle omitted by context admission/u);
 }
 
 async function acceptsContextLifecycle() {
@@ -382,17 +470,42 @@ async function acceptsDynamicTailReplacement() {
   const replaced = manager.replaceHistoryMessages(request, [
     { role: "user", content: "fresh durable history" },
   ]);
+  const dynamicLane = request.messages.find((message) =>
+    message.contextLane?.id === "world-state");
+  assert.notEqual(dynamicLane, undefined);
 
   assert.deepEqual(
     replaced.messages.map((message) => message.content),
     [
       "stable system prompt",
       "fresh durable history",
+      dynamicLane.content,
       "Steering message received during this run:\nkeep the API stable",
-      request.messages.at(-1).content,
     ],
   );
-  assert.match(replaced.messages.at(-1).content, /dynamic-tail/u);
+  assert.match(replaced.messages.at(-2).content, /dynamic-tail/u);
+  assert.equal(replaced.messages.at(-1).role, "user");
+
+  const afterTool = manager.projectContextLane({
+    messages: [
+      { role: "system", content: "stable system prompt" },
+      { role: "user", content: "current run request" },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "read:tail", name: "read", argumentsJson: "{}" }],
+      },
+      { role: "tool", toolCallId: "read:tail", content: "{}" },
+    ],
+    tools: [],
+  }, {
+    id: "world-state",
+    authority: "developer",
+    kind: "state",
+    placement: "dynamic_tail",
+    content: '{"step":2}',
+  });
+  assert.match(afterTool.messages.at(-1).content, /dynamic-tail/u);
 }
 
 async function acceptsCacheAwareMicrocompact() {
@@ -1230,10 +1343,15 @@ async function acceptsStructuredCompactionInput() {
   });
 
   await fixture.session.forceCompact(channelKey());
-  const transcript = summaryRequests[0].messages.at(-1).content;
-  assert.match(transcript, /complete context region\(s\) omitted/u);
+  const transcript = summaryRequests
+    .map((request) => request.messages.at(-1).content)
+    .join("\n");
+  assert.equal(summaryRequests.length, 1);
+  assert.doesNotMatch(transcript, /complete context region\(s\) omitted/u);
   assert.doesNotMatch(transcript, /older transcript middle truncated/u);
   assert.match(transcript, /First request must preserve tool pairs/u);
+  assert.match(transcript, /middle assistant context/u);
+  assert.match(transcript, /structured-tool/u);
   assert.match(transcript, /Latest pending work stays visible/u);
 }
 

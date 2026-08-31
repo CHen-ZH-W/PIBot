@@ -31,6 +31,7 @@ const {
 const {
   SlackToolApprovalBroker,
   TOOL_APPROVAL_ALLOW_ACTION,
+  TOOL_APPROVAL_ALLOW_RUN_ACTION,
   TOOL_APPROVAL_DENY_ACTION,
 } = require("../dist/slack/approval");
 const {
@@ -53,6 +54,8 @@ const {
 const {
   FileChildAgentRunStore,
 } = require("../dist/workspace/child-agents");
+const { FileWorkflowStore } = require("../dist/workflow/store");
+const { WorkflowOrchestrator } = require("../dist/workflow/orchestrator");
 const { EvolutionController } = require("../dist/evolution/controller");
 const { FileEvolutionStore } = require("../dist/evolution/store");
 const {
@@ -165,7 +168,7 @@ async function runTests() {
   await runCase("Slack interactive tool approval", testSlackInteractiveToolApproval);
   await runCase("child agent approvals bridge through Slack", testChildAgentApprovalBridge);
   await runCase(
-    "write-capable child agents skip per-tool approval by default",
+    "child agent approval modes preserve parent boundaries",
     testChildAgentWriteApprovalMode,
   );
   await runCase(
@@ -331,7 +334,10 @@ async function testWebUiBrowserScriptParses() {
   assert.match(WEBUI_SCRIPT, /renderCachedContextMessageSequence\(contextMessages, 30\) \+ renderLiveMessage\(live, EVOLUTION_CONVERSATION_ID\)/u);
   assert.match(WEBUI_SCRIPT, /blocks: \[\]/u);
   assert.doesNotMatch(WEBUI_SCRIPT, /renderLiveApprovals\(live\) \+ toolChipsHtml/u);
-  assert.match(WEBUI_SCRIPT, /function sendApprovalDecision\(approvalId, approved\)/u);
+  assert.match(WEBUI_SCRIPT, /function sendApprovalDecision\(approvalId, approved, scope\)/u);
+  assert.match(WEBUI_SCRIPT, /data-approval-scope="run"/u);
+  assert.match(WEBUI_SCRIPT, /Allow for run/u);
+  assert.match(WEBUI_SCRIPT, /Deny for run/u);
   assert.match(WEBUI_SCRIPT, /event\.type === "approval_requested"/u);
   assert.match(WEBUI_SCRIPT, /approve-web-approval/u);
   assert.match(WEBUI_SCRIPT, /function timelineMessageForDisplay\(event\)/u);
@@ -1702,6 +1708,23 @@ async function testPersistentMemoryCandidatePromptGuidance() {
   );
   assert.match(
     prompt,
+    /extracts typed extension_note candidates from fuller run evidence, and uses a separate consolidation pass/u,
+  );
+  assert.match(
+    prompt,
+    /do not write current-run claims straight into accepted topic, MEMORY\.md, or memory_summary\.md/u,
+  );
+  assert.match(
+    prompt,
+    /Keep evidence, staged candidates, and accepted knowledge as distinct states/u,
+  );
+  assert.match(
+    prompt,
+    /claim-level source runs, and verified versus not-verified dimensions/u,
+  );
+  assert.match(prompt, /retrieval frequency is not validation/u);
+  assert.match(
+    prompt,
     /Do not store one-off task details, secrets, private data, raw transcripts, speculative conclusions/u,
   );
   assert.match(
@@ -1790,10 +1813,12 @@ async function testWebUiSelfEvolutionModelClassification() {
           assert.equal(userMessage.role, "user");
           assert.match(userMessage.content, /请求 pibot 自进化/u);
           assert.match(userMessage.content, /原始请求：/u);
-          assert.match(
-            request.messages.at(-1).content,
-            /\[pibot-context:world-state\]/u,
+          assert.equal(request.messages.at(-1), userMessage);
+          const worldStateIndex = request.messages.findIndex((message) =>
+            /\[pibot-context:world-state\]/u.test(message.content),
           );
+          assert.equal(worldStateIndex >= 0, true);
+          assert.equal(worldStateIndex < request.messages.length - 1, true);
           yield {
             type: "tool_call",
             call: {
@@ -2607,7 +2632,9 @@ async function testWebUiContextOverflowRetry() {
   const sessions = new WorkspaceSessionStore({
     store,
     compactor: createSessionCompactor({
-      contextWindowTokens: 10_000,
+      // Keep proactive threshold compaction out of this fixture even as tool
+      // schemas grow; this case specifically exercises Provider overflow retry.
+      contextWindowTokens: 100_000,
       reserveTokens: 1_000,
       keepRecentTokens: 1,
     }),
@@ -2737,6 +2764,16 @@ async function testWebUiPlanModeApproval() {
   });
   const conversations = new FileWebConversationStore(storeRoot);
   const conversation = await conversations.create("Web session");
+  const childStore = new FileChildAgentRunStore({ store });
+  const childKey = {
+    teamId: "webui",
+    channelId: conversation.id,
+  };
+  const spawnedChildren = [];
+  const childCompletionErrors = [];
+  const workflows = new WorkflowOrchestrator({
+    store: new FileWorkflowStore({ rootDir: join(storeRoot, "workflows") }),
+  });
   const modelRequests = [];
   const runner = new WebAgentRunner({
     conversations,
@@ -2744,8 +2781,8 @@ async function testWebUiPlanModeApproval() {
     store,
     sessions,
     model: {
-      async *stream() {
-        modelRequests.push({});
+      async *stream(request) {
+        modelRequests.push(request);
         yield {
           type: "start",
           provider: "openai_compatible",
@@ -2794,6 +2831,13 @@ async function testWebUiPlanModeApproval() {
             },
           };
         } else {
+          if (modelRequests.length === 5) {
+            const runtimeMessage = request.messages.findLast((message) =>
+              message.role === "user");
+            assert.notEqual(runtimeMessage, undefined);
+            assert.match(runtimeMessage.content, /Runtime TaskGraph completion event/u);
+            assert.match(runtimeMessage.content, /is succeeded/u);
+          }
           yield {
             type: "text_delta",
             text: "Execution after approval complete.",
@@ -2804,6 +2848,44 @@ async function testWebUiPlanModeApproval() {
         };
       },
     },
+    childAgents: {
+      store: childStore,
+      supervisor: {
+        async spawn(record) {
+          spawnedChildren.push(record);
+          setTimeout(() => {
+            void (async () => {
+              await writeFile(
+                record.paths.resultFile,
+                `${record.task.includes("inspect") ? "Inspection" : "Edit"} evidence`,
+                "utf8",
+              );
+              await childStore.updateRun(childKey, record.childRunId, {
+                status: "completed",
+                endedAt: new Date().toISOString(),
+              });
+            })().catch((error) => {
+              childCompletionErrors.push(error);
+            });
+          }, 40);
+          return {
+            session: "webui-task-graph-resume",
+            window: record.childRunId,
+            target: `webui-task-graph-resume:${record.childRunId}`,
+          };
+        },
+        async capture() {
+          return "";
+        },
+        async send() {},
+        async stop() {},
+        async isAlive() {
+          return true;
+        },
+      },
+      maxConcurrent: 4,
+    },
+    workflows,
     tools: getCodingToolSchemas(),
     sandboxExecutor: {
       assertWorkspaceAccess() {},
@@ -2871,7 +2953,9 @@ async function testWebUiPlanModeApproval() {
 
   const result = await run;
   assert.equal(result.reason, "completed");
-  assert.equal(modelRequests.length, 4);
+  assert.equal(modelRequests.length, 5);
+  assert.equal(spawnedChildren.length, 2);
+  assert.deepEqual(childCompletionErrors, []);
   const channelDir = store.getPaths({
     teamId: "webui",
     channelId: conversation.id,
@@ -2879,6 +2963,10 @@ async function testWebUiPlanModeApproval() {
   assert.match(await readFile(join(channelDir, "PLAN.md"), "utf8"), /# Plan/u);
   const tasks = JSON.parse(await readFile(join(channelDir, "tasks.json"), "utf8"));
   assert.equal(tasks.tasks.length, 2);
+  assert.equal(tasks.tasks.every((task) => task.status === "completed"), true);
+  assert.equal(events.filter((event) =>
+    event.type === "runtime_transition" &&
+    event.transition.type === "start_followup_turn").length, 1);
   assert.equal(
     events.some(
       (event) =>
@@ -3084,7 +3172,16 @@ async function testWebUiChildAgentRuntimeAvailable() {
   });
   const conversations = new FileWebConversationStore(storeRoot);
   const conversation = await conversations.create("Web child agent session");
+  const childStore = new FileChildAgentRunStore({ store });
+  const childKey = {
+    teamId: "webui",
+    channelId: conversation.id,
+  };
+  const workflows = new WorkflowOrchestrator({
+    store: new FileWorkflowStore({ rootDir: join(storeRoot, "workflows") }),
+  });
   const spawned = [];
+  const childCompletionErrors = [];
   const modelRequests = [];
   const runner = new WebAgentRunner({
     conversations,
@@ -3117,7 +3214,7 @@ async function testWebUiChildAgentRuntimeAvailable() {
               }),
             },
           };
-        } else {
+        } else if (modelRequests.length === 2) {
           assert.equal(
             request.messages.some(
               (message) =>
@@ -3128,7 +3225,17 @@ async function testWebUiChildAgentRuntimeAvailable() {
           );
           yield {
             type: "text_delta",
-            text: "Child agent spawned.",
+            text: "Child agent scheduled.",
+          };
+        } else {
+          const runtimeMessage = request.messages.findLast((message) =>
+            message.role === "user");
+          assert.notEqual(runtimeMessage, undefined);
+          assert.match(runtimeMessage.content, /Runtime child completion event/u);
+          assert.match(runtimeMessage.content, /child evidence/u);
+          yield {
+            type: "text_delta",
+            text: "Child evidence integrated.",
           };
         }
         yield {
@@ -3152,10 +3259,21 @@ async function testWebUiChildAgentRuntimeAvailable() {
       maxShellTimeoutMs: 1_000,
     },
     childAgents: {
-      store: new FileChildAgentRunStore({ store }),
+      store: childStore,
       supervisor: {
         async spawn(record) {
           spawned.push(record);
+          setTimeout(() => {
+            void (async () => {
+              await writeFile(record.paths.resultFile, "child evidence", "utf8");
+              await childStore.updateRun(childKey, record.childRunId, {
+                status: "completed",
+                endedAt: new Date().toISOString(),
+              });
+            })().catch((error) => {
+              childCompletionErrors.push(error);
+            });
+          }, 40);
           return {
             session: "webui-child-agent-test",
             window: "child",
@@ -3168,11 +3286,12 @@ async function testWebUiChildAgentRuntimeAvailable() {
         async send() {},
         async stop() {},
         async isAlive() {
-          return false;
+          return true;
         },
       },
       maxConcurrent: 20,
     },
+    workflows,
     evolution,
     maxSteps: 3,
   });
@@ -3189,7 +3308,15 @@ async function testWebUiChildAgentRuntimeAvailable() {
   assert.equal(typeof spawned[0].worktreePath, "string");
   assert.notEqual(spawned[0].worktreePath, workspaceRoot);
   assert.equal(spawned[0].budget.timeoutMs, 1000);
-  assert.equal(modelRequests.length, 2);
+  assert.equal(modelRequests.length, 3);
+  assert.deepEqual(childCompletionErrors, []);
+  const workflowRuns = await workflows.store.listRuns();
+  assert.equal(workflowRuns.length, 1);
+  assert.equal(workflowRuns[0].kind, "coordinator_child");
+  assert.equal(workflowRuns[0].status, "succeeded");
+  const attempts = await workflows.store.readAttempts(workflowRuns[0].runId);
+  assert.equal(attempts.length, 1);
+  assert.equal(attempts[0].status, "succeeded");
 }
 
 async function testWebUiToolApproval() {
@@ -3292,11 +3419,20 @@ async function testWebUiToolApproval() {
       event.approval.toolName === "write",
   ).approval;
   assert.match(approval.title, /Approve write/u);
+  assert.equal(approval.runScopeAllowed, true);
   assert.equal(
     approval.details.some((detail) => /approved\.txt/u.test(detail)),
     true,
   );
-  assert.equal((await runner.decideApproval(approval.id, true)).ok, true);
+  assert.equal(
+    approval.details.some((detail) => /Escalation: filesystem\.write/u.test(detail)),
+    true,
+  );
+  assert.equal(
+    approval.details.some((detail) => /Escalation: filesystem\.read/u.test(detail)),
+    false,
+  );
+  assert.equal((await runner.decideApproval(approval.id, true, "run")).ok, true);
 
   const result = await run;
   assert.equal(result.reason, "completed");
@@ -3472,17 +3608,30 @@ async function testSlackInteractiveToolApproval() {
 
   assert.equal(
     await broker.handleSlackInteraction(
-      approvalAction(approvalId, TOOL_APPROVAL_ALLOW_ACTION, "U-requester"),
+      approvalAction(approvalId, TOOL_APPROVAL_ALLOW_RUN_ACTION, "U-requester"),
     ),
     true,
   );
-  assert.deepEqual(await decisionPromise, { approved: true });
+  assert.deepEqual(await decisionPromise, { approved: true, scope: "run" });
   assert.equal(slack.events.length, 2);
   assert.equal(slack.events[1].type, "message.update");
   assert.equal(
     slack.events[1].update.blocks.some((block) => block.type === "actions"),
     false,
   );
+  assert.deepEqual(
+    await gate.reviewToolCall({
+      call: {
+        id: "bash-approval-reused",
+        name: "bash",
+        input: { command: "npm test" },
+      },
+      risk: "high",
+      explanation: "test approval reuse",
+    }),
+    { approved: true, scope: "run" },
+  );
+  assert.equal(slack.events.length, 2);
 
   const deniedPromise = gate.reviewToolCall({
     call: {
@@ -3714,7 +3863,7 @@ function testChildAgentWriteApprovalMode() {
       readOnly: false,
       hasApprovalContext: true,
     }),
-    "full-access",
+    "approval-required",
   );
   assert.equal(
     resolveChildAgentToolApprovalMode({
@@ -3736,7 +3885,13 @@ function testChildAgentWriteApprovalMode() {
       readOnly: true,
       allowBash: true,
     }),
-    "full-access",
+    "workspace-write",
+  );
+  assert.equal(
+    resolveChildAgentToolApprovalMode({
+      readOnly: false,
+    }),
+    "workspace-write",
   );
 }
 

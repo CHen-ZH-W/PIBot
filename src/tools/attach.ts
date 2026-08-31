@@ -6,7 +6,11 @@ import {
   assertFileSize,
   resolveWorkspacePath,
 } from "../workspace/path-boundary";
-import type { CodingToolDefinition, ToolInputParseResult } from "./index";
+import {
+  assertToolCapability,
+  type CodingToolDefinition,
+  type ToolInputParseResult,
+} from "./index";
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
 
@@ -31,6 +35,13 @@ export const attachTool: CodingToolDefinition<
   name: "attach",
   riskLevel: "external",
   executionMode: "sequential",
+  resolveCapabilities: (input) => ({
+    requirements: [
+      { capability: "filesystem.read", paths: [input.path] },
+      { capability: "external.side_effect", resources: ["attachment-channel"] },
+    ],
+    effects: { openWorld: true },
+  }),
   description:
     "Upload a generated workspace file through the current attachment channel. Use for files the user should download or inspect directly.",
   schema: {
@@ -54,12 +65,15 @@ export const attachTool: CodingToolDefinition<
   },
   parse: parseAttachInput,
   async execute(input, context) {
+    assertToolCapability(context, "filesystem.read", input.path);
+    assertToolCapability(context, "external.side_effect", "attachment-channel");
     if (context.attach === undefined) {
       throw toolError("invalid_input", "Attachment context is not available");
     }
 
     const filePath = await resolveWorkspacePath(context.workspaceRoot, input.path, {
       access: "read",
+      policy: context.sandboxExecutor.policy,
     });
     await assertFileSize(filePath, context.attach.maxFileBytes, "attach file");
     const fileStat = await stat(filePath);

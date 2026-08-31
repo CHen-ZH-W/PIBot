@@ -1,5 +1,10 @@
 import type { AgentLoopError } from "../agent/events";
-import type { AgentRunId, AgentUserTurnId } from "../core/ids";
+import type {
+  AgentRunId,
+  AgentStepId,
+  AgentUserTurnId,
+  ToolCallId,
+} from "../core/ids";
 import type { RuntimeCancellation } from "./cancellation";
 
 export type RuntimeTransition =
@@ -12,8 +17,52 @@ export type RuntimeTransition =
   | { readonly type: "retry_model"; readonly step: number; readonly attempt: number }
   | { readonly type: "recover_context"; readonly attempt: number }
   | {
+      readonly type: "queue_tool_call";
+      readonly runId: AgentRunId;
+      readonly userTurnId: AgentUserTurnId;
+      readonly stepId: AgentStepId;
+      readonly callId: ToolCallId;
+      readonly tool: string;
+    }
+  | {
+      readonly type: "dispatch_tool_call";
+      readonly runId: AgentRunId;
+      readonly userTurnId: AgentUserTurnId;
+      readonly stepId: AgentStepId;
+      readonly callId: ToolCallId;
+      readonly tool: string;
+    }
+  | {
+      readonly type: "complete_tool_call";
+      readonly runId: AgentRunId;
+      readonly userTurnId: AgentUserTurnId;
+      readonly stepId: AgentStepId;
+      readonly callId: ToolCallId;
+      readonly tool: string;
+      readonly outcome: "success" | "error";
+    }
+  | {
+      readonly type: "abort_tool_call";
+      readonly runId: AgentRunId;
+      readonly userTurnId: AgentUserTurnId;
+      readonly stepId: AgentStepId;
+      readonly callId: ToolCallId;
+      readonly tool: string;
+      readonly phase: "queued" | "executing";
+    }
+  | {
       readonly type: "start_followup_turn";
       readonly userTurnId: AgentUserTurnId;
+    }
+  | {
+      readonly type: "defer_run_completion";
+      readonly reason: string;
+      readonly holds: number;
+    }
+  | {
+      readonly type: "release_run_completion";
+      readonly reason: string;
+      readonly holds: number;
     }
   | { readonly type: "start_reflection"; readonly attempt: number }
   | {

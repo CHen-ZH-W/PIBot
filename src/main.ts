@@ -3,15 +3,10 @@ import { validateStartupConfig } from "./app/config";
 import { ConsoleJsonLogger, errorFields } from "./app/logging";
 import {
   calculateUsage,
-  defaultUsagePricingForModel,
   JsonlUsageRecorder,
-  usagePricingFromEnv,
+  usagePricingForRuntimeModel,
 } from "./app/usage";
 import { MinimalAgentLoop } from "./agent/agent-loop";
-import {
-  OpenAICompatibleProviderAdapter,
-  RetryingModelClient,
-} from "./agent/model";
 import {
   isAgentStopCommand,
   PerChannelAgentRunner,
@@ -27,6 +22,7 @@ import {
   createCodingToolExecutor,
   createToolApprovalGate,
   getCodingToolSchemas,
+  toolApprovalRulesForRun,
   type CodingToolExecutorOptions,
   type ToolApprovalMode,
 } from "./tools";
@@ -38,6 +34,7 @@ import {
   type SandboxExecutor,
 } from "./workspace/sandbox";
 import { WorkspaceSessionStore } from "./workspace/session";
+import { MemoryCurationPipeline } from "./workspace/memory-curation";
 import {
   FileChannelWorkspaceStore,
   type WorkspaceStoreWarning,
@@ -72,24 +69,47 @@ import {
 import { FileWebConversationStore } from "./web/conversations";
 import { startWebUiServer } from "./web/server";
 import { WorkflowOrchestrator } from "./workflow/orchestrator";
+import {
+  ChildWorkflowScheduler,
+  childWorkflowExternalKeyPrefix,
+  formatChildWorkflowParentResume,
+} from "./workflow/child-scheduler";
+import {
+  formatTaskGraphParentResume,
+  TaskGraphScheduler,
+  taskGraphExternalKeyPrefix,
+} from "./workflow/task-scheduler";
 import { FileWorkflowStore } from "./workflow/store";
+import { createConfiguredModelClient } from "./models/runtime";
+import { formatModelRef } from "./models/types";
+import { AgentRuntime } from "./runtime/agent-runtime";
 
 async function main(): Promise<void> {
   const workspaceRoot = process.env.WORKSPACE_ROOT ?? process.cwd();
   const storeRoot = process.env.PIBOT_STORE_ROOT ?? path.join(workspaceRoot, ".pibot");
   const pibotSkillsRoot = path.join(storeRoot, "skills");
-  const configuredModel = readOptionalEnv("OPENAI_MODEL");
+  const configuredModelClient = await createConfiguredModelClient({ storeRoot });
+  const modelRuntime = configuredModelClient.runtime;
+  const model = configuredModelClient.client;
+  const configuredModel = modelRuntime.activeModelRef().model;
   const titleModelName = resolveConversationTitleModelName(
     configuredModel,
     readOptionalEnv("PIBOT_TITLE_MODEL"),
   );
-  const configuredBaseUrl = readOptionalEnv("OPENAI_BASE_URL");
   const modelContextWindowTokens =
     readPositiveIntegerEnv("MODEL_CONTEXT_WINDOW_TOKENS") ??
-    defaultModelContextWindowTokens();
+    modelRuntime.minimumKnownContextWindow(defaultModelContextWindowTokens());
   const sessionCompactionReserveTokens =
     readPositiveIntegerEnv("SESSION_COMPACTION_RESERVE_TOKENS") ?? 32768;
   const contextManager = new ContextManager({
+    toolResultAdmission: {
+      thresholdChars:
+        readPositiveIntegerEnv("TOOL_RESULT_CONTEXT_THRESHOLD_CHARS") ?? 8_192,
+      headChars:
+        readNonNegativeIntegerEnv("TOOL_RESULT_CONTEXT_HEAD_CHARS") ?? 4_096,
+      tailChars:
+        readNonNegativeIntegerEnv("TOOL_RESULT_CONTEXT_TAIL_CHARS") ?? 1_024,
+    },
     ...((readBooleanEnv("SESSION_MICROCOMPACT_ENABLED") ?? true)
       ? {
           microcompact: {
@@ -117,11 +137,13 @@ async function main(): Promise<void> {
   const approvalTimeoutMs =
     readPositiveIntegerEnv("TOOL_APPROVAL_TIMEOUT_MS") ?? 300000;
   const codingToolLimits = codingToolLimitsFromEnv();
+  const modelCredential = modelRuntime.credentialRequirement();
   await validateStartupConfig({
     slackAppToken: process.env.SLACK_APP_TOKEN,
     slackBotToken: process.env.SLACK_BOT_TOKEN,
-    modelApiKey: process.env.OPENAI_API_KEY,
-    modelApiKeyEnvVar: "OPENAI_API_KEY",
+    modelApiKey: modelCredential.configured ? "configured" : undefined,
+    modelApiKeyEnvVar:
+      modelCredential.apiKeyEnv ?? `provider ${modelCredential.provider} credential`,
     workspaceRoot,
     sandboxLabel: sandbox.label,
   });
@@ -161,17 +183,6 @@ async function main(): Promise<void> {
   });
   childAgentApprovalResponder.start();
   const approvalGate = createToolApprovalGate(approvalMode);
-  const model = new RetryingModelClient(
-    new OpenAICompatibleProviderAdapter(),
-    {
-      maxRetries: readNonNegativeIntegerEnv("MODEL_MAX_RETRIES") ?? 2,
-      fallbackModels: readCsvEnv("OPENAI_FALLBACK_MODELS"),
-      baseRetryDelayMs:
-        readPositiveIntegerEnv("MODEL_RETRY_BASE_DELAY_MS") ?? 500,
-      maxRetryDelayMs:
-        readPositiveIntegerEnv("MODEL_RETRY_MAX_DELAY_MS") ?? 8000,
-    },
-  );
   const workspaceStore = new FileChannelWorkspaceStore({
     rootDir: storeRoot,
     onWarning: logWorkspaceWarning,
@@ -185,7 +196,31 @@ async function main(): Promise<void> {
       readPositiveIntegerEnv("SESSION_MAX_MEMORY_INDEX_FILE_BYTES") ?? 8_000,
     maxMemoryAuditFileBytes:
       readPositiveIntegerEnv("SESSION_MAX_MEMORY_AUDIT_FILE_BYTES") ?? 2_000_000,
+    maxMemoryUsageFileBytes:
+      readPositiveIntegerEnv("SESSION_MAX_MEMORY_USAGE_FILE_BYTES") ?? 2_000_000,
+    maxMemoryCurationJobFileBytes:
+      readPositiveIntegerEnv("SESSION_MAX_MEMORY_CURATION_JOB_FILE_BYTES") ?? 256_000,
   });
+  const memoryCurator =
+    (readBooleanEnv("MEMORY_CURATION_ENABLED") ?? true)
+      ? new MemoryCurationPipeline({
+          store: workspaceStore,
+          model,
+          resolveModelRef: () => modelRuntime.activeModelRef(),
+          maxOutputTokens:
+            readPositiveIntegerEnv("MEMORY_CURATION_MAX_OUTPUT_TOKENS") ?? 5000,
+          maxEvidenceChars:
+            readPositiveIntegerEnv("MEMORY_CURATION_MAX_EVIDENCE_CHARS") ?? 30_000,
+          requestTimeoutMs:
+            readPositiveIntegerEnv("MEMORY_CURATION_TIMEOUT_MS") ?? 60_000,
+        })
+      : undefined;
+  const recoveredMemoryCurationJobs = await memoryCurator?.recoverPending() ?? 0;
+  if (recoveredMemoryCurationJobs > 0) {
+    logger.info("memory_curation_jobs_recovered", {
+      count: recoveredMemoryCurationJobs,
+    });
+  }
   const workflows = new WorkflowOrchestrator({
     store: new FileWorkflowStore({
       rootDir: path.join(storeRoot, "workflows"),
@@ -206,13 +241,13 @@ async function main(): Promise<void> {
   const sessionStore = new WorkspaceSessionStore({
     store: workspaceStore,
     contextManager,
+    ...(memoryCurator === undefined ? {} : { memoryCurator }),
     compactor: createLlmSessionCompactor({
       contextWindowTokens: modelContextWindowTokens,
       reserveTokens: sessionCompactionReserveTokens,
       keepRecentTokens:
         readPositiveIntegerEnv("SESSION_COMPACTION_KEEP_RECENT_TOKENS") ?? 20000,
       model,
-      ...(configuredModel === undefined ? {} : { modelName: configuredModel }),
     }),
   });
   const evolutionContext = new SessionEvolutionContextRecorder(sessionStore);
@@ -246,9 +281,7 @@ async function main(): Promise<void> {
   const usageRecorder = new JsonlUsageRecorder({
     filePath: path.join(storeRoot, "usage.jsonl"),
   });
-  const usagePricing = usagePricingFromEnv(
-    defaultUsagePricingForModel(configuredModel, configuredBaseUrl),
-  );
+  const usagePricing = usagePricingForRuntimeModel(modelRuntime);
   const traceRecorder = new JsonlTraceRecorder({
     filePath: path.join(storeRoot, "trace.jsonl"),
     maxFileBytes:
@@ -260,8 +293,15 @@ async function main(): Promise<void> {
       contextWindowTokens: modelContextWindowTokens,
       reserveTokens: sessionCompactionReserveTokens,
     },
-    calculateCost: (usage) => {
-      const calculated = calculateUsage(usage, usagePricing);
+    calculateCost: (usage, selected) => {
+      const calculated = calculateUsage(
+        usage,
+        usagePricingForRuntimeModel(
+          modelRuntime,
+          selected.provider,
+          selected.model,
+        ),
+      );
       return {
         cost: calculated.cost,
         currency: calculated.currency,
@@ -310,14 +350,22 @@ async function main(): Promise<void> {
     defaultCaptureMaxChars:
       readPositiveIntegerEnv("CHILD_AGENT_CAPTURE_MAX_CHARS") ?? 20000,
   });
+  const agentRuntime = new AgentRuntime();
   const handler = new PerChannelAgentRunner({
+    runtime: agentRuntime,
     slack: adapter,
-    agentLoop: new MinimalAgentLoop({ model, tools, hooks: [traceHook] }),
+    agentLoop: new MinimalAgentLoop({
+      model,
+      tools,
+      contextManager,
+      hooks: [traceHook],
+    }),
     createAgentLoopForWorkspace: (
       runWorkspaceRoot,
       approvalContext,
       runContext,
       workspaceSkills,
+      runtimeControl,
     ) => {
       const taskStore = new FileTaskStore({
         workspaceRoot: runWorkspaceRoot,
@@ -352,6 +400,79 @@ async function main(): Promise<void> {
         defaultMaxTokens:
           readPositiveIntegerEnv("CHILD_AGENT_MAX_TOKENS") ?? 120000,
       });
+      const conversationKey =
+        `${approvalContext.conversation.teamId}:${approvalContext.conversation.channelId}`;
+      const childScheduler = new ChildWorkflowScheduler({
+        workflows,
+        childAgents,
+        parentAgentRunId: runContext.runId,
+        externalKeyPrefix: childWorkflowExternalKeyPrefix({
+          workspaceRoot: runWorkspaceRoot,
+          conversationKey,
+        }),
+        metadata: {
+          transport: "slack",
+          teamId: approvalContext.conversation.teamId,
+          channelId: approvalContext.conversation.channelId,
+        },
+        parentResume: {
+          acquireHold: ({ workflowRunId }) =>
+            runtimeControl.deferRunCompletion(
+              `coordinator_child:${workflowRunId}`,
+            ),
+          enqueue: (event) =>
+            runtimeControl.enqueueRuntimeFollowUp(
+              formatChildWorkflowParentResume(event),
+            ),
+        },
+      });
+      const taskScheduler = new TaskGraphScheduler({
+        taskStore,
+        workflows,
+        externalKeyPrefix: taskGraphExternalKeyPrefix({
+          workspaceRoot: runWorkspaceRoot,
+          conversationKey,
+        }),
+        metadata: {
+          transport: "slack",
+          teamId: approvalContext.conversation.teamId,
+          channelId: approvalContext.conversation.channelId,
+        },
+        parentResume: {
+          acquireHold: ({ graphVersion, tasksDigest }) =>
+            runtimeControl.deferRunCompletion(
+              `task_graph:v${graphVersion}:${tasksDigest}`,
+            ),
+          enqueue: (event) =>
+            runtimeControl.enqueueRuntimeFollowUp(
+              formatTaskGraphParentResume(event),
+            ),
+        },
+        createChildRuntime: (workflowRunId) => new ChildAgentRuntime({
+          key: {
+            teamId: approvalContext.conversation.teamId,
+            channelId: approvalContext.conversation.channelId,
+          },
+          parentRunId: workflowRunId,
+          workspaceRoot: runWorkspaceRoot,
+          store: childAgentStore,
+          supervisor: childAgentSupervisor,
+          approvalContext,
+          maxConcurrent:
+            readPositiveIntegerEnv("CHILD_AGENT_MAX_CONCURRENT") ?? 20,
+          defaultTimeoutMs:
+            readPositiveIntegerEnv("CHILD_AGENT_DEFAULT_TIMEOUT_MS") ?? 900000,
+          maxTimeoutMs:
+            readPositiveIntegerEnv("CHILD_AGENT_MAX_TIMEOUT_MS") ?? 1800000,
+          defaultMaxToolCalls:
+            readPositiveIntegerEnv("CHILD_AGENT_MAX_TOOL_CALLS") ?? 40,
+          defaultMaxTokens:
+            readPositiveIntegerEnv("CHILD_AGENT_MAX_TOKENS") ?? 120000,
+        }),
+      });
+      const taskSchedulerReady = taskScheduler.resumeFrozenGraph().catch((error: unknown) => {
+        logger.warn("task_graph_resume_failed", errorFields(error));
+      });
       const runTools = createCodingToolExecutor({
         workspaceRoot: runWorkspaceRoot,
         pibotSkillsRoot,
@@ -360,6 +481,8 @@ async function main(): Promise<void> {
         runtime: runContext.state,
         tasks: taskStore,
         childAgents,
+        childScheduler,
+        taskScheduler,
         attach: {
           publisher: adapter,
           conversation: approvalContext.conversation,
@@ -387,6 +510,7 @@ async function main(): Promise<void> {
         approvalGate: createToolApprovalGate(approvalMode, {
           prompter: approvalBroker,
           context: approvalContext,
+          rules: toolApprovalRulesForRun(runContext.state),
           timeoutMs: approvalTimeoutMs,
           onDecision: createTraceApprovalObserver(traceRecorder, runContext),
         }),
@@ -394,13 +518,21 @@ async function main(): Promise<void> {
       });
       return new MinimalAgentLoop({
         model,
+        contextManager,
         hooks: [
+          {
+            beforeModelCall: async () => {
+              await taskSchedulerReady;
+            },
+          },
           new RuntimeModeHook({
             state: runContext.state,
             describeTool: (name) => runTools.describeTool(name),
             worldState: createRuntimeWorldStateProvider({
               workspaceRoot: runWorkspaceRoot,
               sandboxLabel: sandbox.label,
+              sandboxPolicy: sandbox.executor.policy,
+              sandboxEnforcement: sandbox.executor.enforcement,
               approvalMode,
               pendingApprovalCount: () =>
                 approvalBroker.pendingApprovalCount(approvalContext.conversation),
@@ -422,6 +554,7 @@ async function main(): Promise<void> {
       80,
     maxParallelToolCalls:
       readPositiveIntegerEnv("AGENT_MAX_PARALLEL_TOOL_CALLS") ?? 8,
+    resolveModelRef: () => modelRuntime.activeModelRef(),
     maxContextOverflowRetries:
       readNonNegativeIntegerEnv("SESSION_COMPACTION_MAX_OVERFLOW_RETRIES") ?? 1,
     longTaskStatusUpdateMs:
@@ -443,12 +576,17 @@ async function main(): Promise<void> {
         80,
       verifyCommands: readCsvEnv("REFLECTION_VERIFY_COMMANDS"),
     },
-    ...(configuredModel === undefined ? {} : { model: configuredModel }),
     repoWorkflow,
     attachmentDownloader,
     logger,
     usageRecorder,
     usagePricing,
+    resolveUsagePricing: (provider, selectedModel) =>
+      usagePricingForRuntimeModel(
+        modelRuntime,
+        provider,
+        selectedModel,
+      ),
     traceRecorder,
     evolution: evolutionController,
     agentSelfInstructionsProvider: () =>
@@ -467,6 +605,7 @@ async function main(): Promise<void> {
       evolutionContext,
       runtimeActivation,
       conversations,
+      models: modelRuntime,
       workflows,
       pibotSkillsRoot,
       disabledSkills: readCsvEnv("SKILLS_DISABLED"),
@@ -476,6 +615,8 @@ async function main(): Promise<void> {
       titleEmptyRetryMs:
         readPositiveIntegerEnv("PIBOT_TITLE_EMPTY_RETRY_MS") ?? 300_000,
       agent: new WebAgentRunner({
+        contextManager,
+        runtime: agentRuntime,
         conversations,
         workspaceRoot,
         store: workspaceStore,
@@ -521,13 +662,13 @@ async function main(): Promise<void> {
           80,
         maxParallelToolCalls:
           readPositiveIntegerEnv("AGENT_MAX_PARALLEL_TOOL_CALLS") ?? 8,
+        resolveModelRef: () => modelRuntime.activeModelRef(),
         runtimeHooks: [traceHook],
         disabledSkills: readCsvEnv("SKILLS_DISABLED"),
         maxSkills: readPositiveIntegerEnv("SKILLS_MAX_COUNT") ?? 100,
         maxSkillFileBytes:
           readPositiveIntegerEnv("SKILLS_MAX_FILE_BYTES") ?? 64_000,
         pibotSkillsRoot,
-        ...(configuredModel === undefined ? {} : { modelName: configuredModel }),
         ...(titleModelName === undefined ? {} : { titleModelName }),
       }),
     });
@@ -537,6 +678,7 @@ async function main(): Promise<void> {
     workspace: workspaceRoot,
     store: storeRoot,
     sandbox: sandbox.label,
+    model: formatModelRef(modelRuntime.activeModelRef()),
     webui: webUiEnabled ? webUiPublicUrl : "disabled",
   });
 

@@ -1,7 +1,7 @@
 # pibot
 
 pibot is a local-first coding-agent runtime for real repository work. It brings
-an OpenAI-compatible model client together with workspace tools, persistent
+a multi-provider model runtime together with workspace tools, persistent
 memory, reusable Skills, Plan/Coordinator/Reflection workflows, Slack and WebUI
 entry points, a WebUI self-evolution control plane, and Linux-native or Docker
 command sandboxes.
@@ -32,8 +32,10 @@ Open `http://127.0.0.1:8787`.
   Slack approvals, attachment download/upload, and long-task status updates.
 - **Coding tools**: read, grep, LSP, bash, edit/write, repo
   checks, and generated file attachment.
-- **Controlled memory**: global memory summaries, detailed topics,
-  rollout summaries, extension notes, and append-only audit logs.
+- **Controlled memory**: run evidence is distilled through staged candidates
+  and a separate consolidation pass into semantic Task Groups, with compact
+  routing indexes, claim-level provenance, outcome feedback, evidence-gated
+  stale/superseded lifecycle transitions, and append-only audit.
 - **Skills**: workspace Skills plus pibot-wide Skills loaded only
   when the current task matches them.
 - **Agent workflows**: Execute, Plan, Coordinator, optional Reflection, and
@@ -57,6 +59,12 @@ OPENAI_API_KEY=...
 OPENAI_BASE_URL=...
 OPENAI_MODEL=...
 ```
+
+This legacy profile remains supported. For multiple providers, copy
+`docs/models.example.json` to `.pibot/models.json`, configure the referenced
+credential environment variables, and use `provider/model` references. PIBot
+currently includes OpenAI Chat Completions and native Anthropic Messages
+protocol adapters.
 
 Load the environment and start the WebUI:
 
@@ -95,6 +103,11 @@ npm run typecheck         # TypeScript type check
 npm test                  # build, production checks, acceptance scripts
 npm run validate:skills   # validate Skill packages
 npm run build:native      # rebuild the Linux sandbox launcher
+npm run models:list       # show active and cached/configured models
+npm run models:check      # compare live provider catalogs without writing
+npm run models:sync       # atomically update models-store.json
+npm run models:diff       # display live-vs-local model changes
+npm run memory:backfill -- --limit 10  # curate recent historical rollout recaps
 ```
 
 ## Workspace
@@ -104,8 +117,8 @@ By default, pibot stores local runtime state under `.pibot/` in the workspace:
 - `webui/conversations.json`: WebUI conversation index
 - `channels/webui/<session-id>/context.jsonl`: WebUI session history
 - `channels/<team>/<channel>/context.jsonl`: Slack channel history
-- `memories/`: global memory summary, index, topics, rollout summaries, notes,
-  and audit log
+- `memories/`: global memory summary, index, accepted Task Groups, rollout
+  summaries, staged notes, durable curation jobs, usage feedback, and audit log
 - `skills/`: pibot-wide Skill packages
 - `evolution/`: self-evolution tickets, signals, versions, and audit events
 - `runs/`: child-agent and long-run artifacts
@@ -120,16 +133,19 @@ edit a real repo, create
 ```text
 WebUI / Slack
   -> session and context storage
-  -> AgentRunController
+  -> AgentRuntime (active Run registry + transport-neutral control routing)
+     -> AgentRunController
      -> NextStepInbox (active-message / `steer:` -> next Step)
      -> NextTurnQueue (explicit `follow-up:` -> next UserTurn)
      -> RunCancellation (first cancellation reason wins)
      -> lifecycle policies + fail-open transition observers
   -> Run
      -> UserTurn
-        -> Step (model call)
-           -> ToolScheduler (serial barriers + bounded parallel batch)
-  -> OpenAI-compatible provider
+        -> StepSnapshot (model/world-state/execution authority)
+        -> Step (model stream)
+           -> ToolScheduler (incremental intake + serial barriers + bounded pool)
+  -> ModelRuntime (provider/model selection + cross-provider fallback)
+     -> protocol adapter (OpenAI Chat Completions or Anthropic Messages)
   -> ToolRegistry and approval hooks
   -> workspace tools, sandbox, memory, Skills, and child agents
 ```

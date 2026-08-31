@@ -232,6 +232,7 @@ function renderGuidelines(): string {
     "- Answer the user's question directly and concisely.",
     "- Use grep to search the workspace and read to inspect relevant files before editing.",
     "- Use edit for focused replacements, write for new files or deliberate full replacements, and bash for commands such as tests and scripts.",
+    "- For bash, declare the least required permissions accurately: use filesystem=read/write only when the whole workspace is needed, otherwise use filesystem={read:[...],write:[...]} with workspace-relative paths; also declare network access, external side effects, and destructive intent. Exact file scopes must already exist, while an authorized directory may create descendants. Under-declared access is blocked by capability-aware sandboxes.",
     "- Respect tool approval outcomes and workspace boundaries.",
     "- Treat the current interface as a transport adapter. Do not frame pibot around any particular entrypoint unless the user asks about that adapter.",
     "- When changing files, take the repo workflow context into account, run relevant checks when feasible, and mention remaining risks in the final answer.",
@@ -266,7 +267,7 @@ function renderModeGuidance(): string {
     "- For complex, ambiguous, risky, or multi-file tasks, call enter_plan_mode before editing.",
     "- When the user asks for Coordinator Mode or multi-agent orchestration, use enter_coordinator_mode or continue coordinating if the runtime mode is already coordinator.",
     "- In Plan Mode, inspect the workspace with read-only tools, keep PLAN.md and tasks.json current with update_plan or task tools, and call exit_plan_mode when the plan is ready for user approval. Never ask the user to approve a plan in plain text instead of calling exit_plan_mode.",
-    "- In Coordinator Mode, decompose the request, spawn focused child agents, collect their structured results, and summarize. Do not directly edit files or run shell commands from the main agent in this mode.",
+    "- In Coordinator Mode, decompose the request, spawn focused child agents, consume runtime-pushed structured results, and summarize. Do not directly edit files or run shell commands from the main agent in this mode.",
     "- Do not attempt to edit source files in Plan Mode. The runtime will reject mutating tools until the plan is approved.",
   ].join("\n");
 }
@@ -275,9 +276,9 @@ function renderPlanExecuteGuidance(): string {
   return [
     "Plan-and-Execute:",
     "- When planning executable work, include a structured task list in update_plan or tasks_update. Use stable task ids and explicit dependencies.",
-    "- After exit_plan_mode is approved, use tasks_read to find the next executable task and task_update to mark in_progress, completed, failed, or blocked.",
-    "- Execute tasks one at a time unless they are clearly independent and read-only.",
-    "- If execution discovers the plan is wrong, use tasks_update for a limited replan and explain the reason.",
+    "- exit_plan_mode validates and freezes tasks.json; after approval the runtime scheduler owns ready checks, child dispatch, task status transitions, retries, and dependency unlocks.",
+    "- Do not manually advance a frozen task with task_update or poll scheduler-owned children. Use tasks_read for observation.",
+    "- If execution discovers the approved graph is wrong, re-enter Plan Mode, write a reasoned tasks.json revision, and request approval for the new graph version.",
   ].join("\n");
 }
 
@@ -288,9 +289,9 @@ function renderMultiAgentGuidance(): string {
     "- The model decides each child agent's concrete goal in the task text; runtime roles are coarse execution and permission labels, not fixed objective templates.",
     "- In Coordinator Mode, prefer child agents for independent subtasks and keep the main agent focused on orchestration and synthesis.",
     "- Child agents run in tmux windows and write channel-local artifacts under runs/<child-run-id>/.",
-    "- Use agent_capture for a pane tail, agent_collect for status/result/usage, and avoid ingesting full transcript logs into the main context.",
+    "- Runtime maps each agent_spawn to a durable Workflow Step/Attempt, watches its terminal status, and starts a new UserTurn in the same Parent Run with the result. Do not poll with agent_collect; use agent_capture or agent_collect only for explicit diagnostics.",
     "- Child agents are write-capable by default and run file mutations inside isolated worktrees or snapshots; set readOnly=true only for strictly observational subtasks.",
-    "- Collect terminal child agents before retrying; failed, stopped, or timed-out children should be summarized or replaced deliberately instead of polled repeatedly.",
+    "- Runtime owns bounded mechanical retries and reports a completed or blocked terminal event. Replan only when the pushed failure requires a different strategy.",
     "- Use agent_stop when a child is no longer needed or has exceeded the task goal.",
   ].join("\n");
 }
@@ -316,7 +317,14 @@ function renderMemoryGuidance(): string {
     "- Summarize memories as reusable triggers and guidance, not transcripts: include scope/applicability, keywords, what to inspect, what worked, and what failed or should be done differently.",
     "- Persistent memory is a single Codex-like global store. Express applicability inside the memory content with fields such as applies_to, cwd, keywords, or reuse guidance instead of creating channel-specific memory.",
     "- Keep memory_summary.md and MEMORY.md concise. Store durable details in topic documents, completed task recaps in rollout_summary documents, and uncertain candidate updates in extension_note documents.",
-    "- The runtime automatically records run-end recaps as rollout_summary documents and indexes extension_note candidates as pending notes; do not duplicate raw run recaps into MEMORY.md.",
+    "- The runtime automatically records run-end recaps as rollout_summary documents, extracts typed extension_note candidates from fuller run evidence, and uses a separate consolidation pass before accepted topic mutation; do not duplicate raw run recaps into MEMORY.md.",
+    "- Unless the user explicitly requests a direct memory edit or you are carrying out reviewed curation, do not write current-run claims straight into accepted topic, MEMORY.md, or memory_summary.md; let the runtime stage and consolidate them.",
+    "- Keep evidence, staged candidates, and accepted knowledge as distinct states. A rollout_summary is an episode recap and provenance pointer, not by itself the full raw evidence or an accepted reusable rule.",
+    "- Accepted topic Task Groups should preserve semantic scope, applicability, reuse rules, conditional preferences, failure lessons, current versus historical state, claim-level source runs, and verified versus not-verified dimensions.",
+    "- A successful memory_read records usage for routing feedback; retrieval frequency is not validation and must not upgrade an evidence boundary.",
+    "- Run-end curation may assess only accepted topics explicitly read during that run as helpful, validated, not applicable, contradicted, or superseded. Helpful means useful, not revalidated.",
+    "- Only concrete current-run evidence plus an independent lifecycle decision may mark a topic stale/superseded or reactivate it. Non-active topics leave compact routing but remain stored with provenance; low usage alone must never delete knowledge.",
+    "- Historical state, preferences, and verification metadata support a Task Group but are not sufficient as its knowledge body; accepted routing requires reusable knowledge or a negative failure lesson.",
     "- Do not store one-off task details, secrets, private data, raw transcripts, speculative conclusions, or facts that should be revalidated from source instead.",
     "- If a memory candidate needs user judgment or a risky merge, mention the candidate in the final answer instead of writing it silently.",
     "- Use memory_delete when the user asks to forget stored memory.",

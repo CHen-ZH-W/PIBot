@@ -1,5 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { watch } from "node:fs";
 import { cp, mkdir, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -41,6 +42,7 @@ export interface SpawnChildAgentRequest {
   readonly maxToolCalls?: number;
   readonly maxTokens?: number;
   readonly worktreePath?: string;
+  readonly externalKey?: string;
 }
 
 export interface CaptureChildAgentRequest {
@@ -98,9 +100,22 @@ export class ChildAgentRuntime {
   async spawnAgent(
     request: SpawnChildAgentRequest,
   ): Promise<ChildAgentRunRecord> {
+    return enqueueChildSpawn(this.options.store, () => this.spawnAgentOnce(request));
+  }
+
+  private async spawnAgentOnce(
+    request: SpawnChildAgentRequest,
+  ): Promise<ChildAgentRunRecord> {
     const task = request.task.trim();
     if (task.length === 0) {
       throw runtimeError("invalid_input", "agent_spawn.task must not be empty");
+    }
+    if (request.externalKey !== undefined) {
+      const existing = (await this.options.store.listRuns(this.options.key, {
+        parentRunId: this.options.parentRunId,
+        includeCompleted: true,
+      })).find((run) => run.externalKey === request.externalKey);
+      if (existing !== undefined) return existing;
     }
     const readOnly = request.readOnly ?? false;
     this.assertWriteRules(request, readOnly);
@@ -116,6 +131,7 @@ export class ChildAgentRuntime {
       record = await this.options.store.createRun({
         key: this.options.key,
         parentRunId: this.options.parentRunId,
+        ...optionalString("externalKey", request.externalKey),
         role: request.role,
         task,
         workspaceRoot: this.options.workspaceRoot,
@@ -231,18 +247,7 @@ export class ChildAgentRuntime {
     readonly usage: unknown;
     readonly captureTail?: string;
   }> {
-    let run = await this.readRun(childRunId);
-    let alive = run.tmux === undefined
-      ? false
-      : await this.options.supervisor.isAlive(run.tmux);
-    if (!alive && run.tmux !== undefined && !isTerminalChildStatus(run.status)) {
-      run = await this.options.store.updateRun(this.options.key, run.childRunId, {
-        status: "failed",
-        endedAt: new Date().toISOString(),
-        stopReason: "tmux_pane_exited_before_status_update",
-      });
-      alive = false;
-    }
+    const { run, alive } = await this.refreshRunLiveness(childRunId);
     const result = await this.options.store.readResult(this.options.key, childRunId);
     const usage = await this.options.store.readUsage(this.options.key, childRunId);
     const captureTail =
@@ -262,6 +267,75 @@ export class ChildAgentRuntime {
     };
   }
 
+  async availableSlots(): Promise<number> {
+    const active = await this.options.store.listRuns(this.options.key, {
+      parentRunId: this.options.parentRunId,
+      includeCompleted: false,
+    });
+    return Math.max(0, this.maxConcurrent - active.length);
+  }
+
+  async waitForTerminal(
+    childRunId: AgentRunId,
+    signal?: AbortSignal,
+  ): Promise<ChildAgentRunRecord> {
+    const initial = await this.readRun(childRunId);
+    if (isTerminalChildStatus(initial.status)) return initial;
+    return new Promise<ChildAgentRunRecord>((resolve, reject) => {
+      let settled = false;
+      let checking = false;
+      let watcher: ReturnType<typeof watch> | undefined;
+      let integrityTimer: NodeJS.Timeout | undefined;
+      const cleanup = () => {
+        watcher?.close();
+        if (integrityTimer !== undefined) clearInterval(integrityTimer);
+        signal?.removeEventListener("abort", abort);
+      };
+      const finish = (run: ChildAgentRunRecord) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(run);
+      };
+      const fail = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const abort = () => fail(signal?.reason ?? new Error("Child terminal wait aborted"));
+      const check = async () => {
+        if (settled || checking) return;
+        checking = true;
+        try {
+          const current = await this.refreshRunLiveness(childRunId);
+          if (isTerminalChildStatus(current.run.status)) finish(current.run);
+        } catch (error: unknown) {
+          if (!isTransientStatusReadError(error)) fail(error);
+        } finally {
+          checking = false;
+        }
+      };
+      watcher = watch(initial.paths.statusFile, { persistent: true }, () => {
+        void check();
+      });
+      watcher.on("error", () => {
+        watcher?.close();
+        watcher = undefined;
+        void check();
+      });
+      integrityTimer = setInterval(() => {
+        void check();
+      }, 1000);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted === true) {
+        abort();
+        return;
+      }
+      void check();
+    });
+  }
+
   private async readRun(childRunId: AgentRunId): Promise<ChildAgentRunRecord> {
     const run = await this.options.store.readRun(this.options.key, childRunId);
     if (run.parentRunId !== this.options.parentRunId) {
@@ -271,6 +345,26 @@ export class ChildAgentRuntime {
       );
     }
     return run;
+  }
+
+  private async refreshRunLiveness(
+    childRunId: AgentRunId,
+  ): Promise<{ readonly run: ChildAgentRunRecord; readonly alive: boolean }> {
+    let run = await this.readRun(childRunId);
+    const alive = run.tmux === undefined
+      ? false
+      : await this.options.supervisor.isAlive(run.tmux);
+    if (!alive && run.tmux !== undefined && !isTerminalChildStatus(run.status)) {
+      const latest = await this.readRun(childRunId);
+      run = isTerminalChildStatus(latest.status)
+        ? latest
+        : await this.options.store.updateRun(this.options.key, latest.childRunId, {
+            status: "failed",
+            endedAt: new Date().toISOString(),
+            stopReason: "tmux_pane_exited_before_status_update",
+          });
+    }
+    return { run, alive };
   }
 
   private budgetFor(request: SpawnChildAgentRequest): ChildAgentBudget {
@@ -390,6 +484,18 @@ export class ChildAgentRuntime {
       }
     }
   }
+}
+
+const childSpawnQueues = new WeakMap<ChildAgentRunStore, Promise<void>>();
+
+function enqueueChildSpawn<T>(
+  store: ChildAgentRunStore,
+  work: () => Promise<T>,
+): Promise<T> {
+  const previous = childSpawnQueues.get(store) ?? Promise.resolve();
+  const next = previous.then(work, work);
+  childSpawnQueues.set(store, next.then(() => undefined, () => undefined));
+  return next;
 }
 
 function positiveInteger(
@@ -582,4 +688,10 @@ function execFile(
 
 function sanitizePathPart(value: string): string {
   return value.replace(/[^A-Za-z0-9_.-]+/gu, "_").slice(0, 80) || "run";
+}
+
+function isTransientStatusReadError(error: unknown): boolean {
+  if (error instanceof SyntaxError) return true;
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  return error.code === "ENOENT" || error.code === "EBUSY";
 }

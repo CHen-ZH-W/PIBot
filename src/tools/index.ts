@@ -1,9 +1,24 @@
 import type { LlmToolSchema } from "../core/agent";
 import * as path from "node:path";
+import {
+  capabilityKinds,
+  capabilityRequestRisk,
+  grantAllowsCapability,
+  issueToolCapabilityGrant,
+  legacyToolCapabilityRequest,
+  normalizeCapabilityRequest,
+  toolCapabilityCallDigest,
+  validateToolCapabilityGrant,
+  withActiveToolCapabilityGrant,
+  type ToolCapabilityGrant,
+  type ToolCapabilityKind,
+  type ToolCapabilityRequest,
+} from "../core/capabilities";
 import type {
   ToolCall,
   ToolCallParseResult,
   ToolError,
+  ToolExecutionSnapshot,
   ToolExecutionMode,
   ToolMetadata,
   ToolName,
@@ -15,10 +30,13 @@ import type { ToolApprovalGate, ToolExecutor } from "../ports/tools";
 import type { ChannelSessionKey } from "../core/session";
 import type { SlackConversationRef } from "../core/slack";
 import {
+  isCapabilityRequestAllowedInMode,
   isPlanControlTool,
   type AgentRuntimeState,
 } from "../runtime/mode";
 import type { ChildAgentRuntime } from "../runtime/child-agents";
+import type { ChildWorkflowScheduler } from "../workflow/child-scheduler";
+import type { TaskGraphScheduler } from "../workflow/task-scheduler";
 import type { SlackEventPublisher } from "../ports/slack";
 import type { ManualEvolutionSignalInput } from "../evolution/controller";
 import type {
@@ -35,6 +53,7 @@ import {
   createSandboxExecutor,
   type SandboxExecutor,
 } from "../workspace/sandbox";
+import { defaultSandboxPolicy } from "../workspace/sandbox-policy";
 import { bashTool } from "./bash";
 import {
   agentCaptureTool,
@@ -92,6 +111,12 @@ export interface ToolRunContext {
   readonly maxGrepOutputChars: number;
   readonly defaultShellTimeoutMs: number;
   readonly maxShellTimeoutMs: number;
+  readonly authorization?: {
+    readonly request: ToolCapabilityRequest;
+    readonly grant: ToolCapabilityGrant;
+    readonly callId: ToolCall["id"];
+    readonly callDigest: string;
+  };
   readonly memory?: {
     readonly store: ChannelWorkspaceStore;
     readonly key: ChannelSessionKey;
@@ -105,6 +130,8 @@ export interface ToolRunContext {
     readonly maxFileBytes: number;
   };
   readonly childAgents?: ChildAgentRuntime;
+  readonly childScheduler?: ChildWorkflowScheduler;
+  readonly taskScheduler?: TaskGraphScheduler;
   readonly evolution?: {
     readonly submitManualSignal: (
       input: ManualEvolutionSignalInput,
@@ -134,6 +161,10 @@ export interface CodingToolDefinition<
   readonly schema: JsonSchema;
   readonly riskLevel: ToolRiskLevel;
   readonly executionMode: ToolExecutionMode;
+  resolveCapabilities?(
+    input: Input,
+    context: ToolRunContext,
+  ): ToolCapabilityRequest;
   parse(input: UnknownRecord): ToolInputParseResult<Input>;
   execute(
     input: Input,
@@ -149,6 +180,10 @@ interface RegisteredCodingToolDefinition {
   readonly schema: JsonSchema;
   readonly riskLevel: ToolRiskLevel;
   readonly executionMode: ToolExecutionMode;
+  resolveCapabilities?(
+    input: unknown,
+    context: ToolRunContext,
+  ): ToolCapabilityRequest;
   parse(input: UnknownRecord): ToolInputParseResult<unknown>;
   execute(
     input: unknown,
@@ -231,6 +266,29 @@ export class CodingToolRegistry {
     return definition.execute(call.input, context, signal);
   }
 
+  resolveCapabilities(
+    call: ToolCall,
+    context: ToolRunContext,
+  ): ToolCapabilityRequest {
+    const definition = this.tools.get(call.name);
+    if (definition === undefined) {
+      throw toolError("invalid_input", `Tool "${call.name}" is not registered`);
+    }
+    try {
+      return normalizeCapabilityRequest(
+        definition.resolveCapabilities?.(call.input, context) ??
+          legacyToolCapabilityRequest(definition.name, definition.riskLevel),
+      );
+    } catch (error: unknown) {
+      throw toolError(
+        error instanceof Error && error.name === "permission_denied"
+          ? "permission_denied"
+          : "invalid_input",
+        error instanceof Error ? error.message : "Invalid capability request",
+      );
+    }
+  }
+
   concurrencyKey(call: ToolCall): string | undefined {
     return this.tools.get(call.name)?.concurrencyKey?.(call.input);
   }
@@ -256,7 +314,11 @@ export interface CodingToolExecutorOptions {
   readonly tasks?: TaskStore;
   readonly attach?: ToolRunContext["attach"];
   readonly childAgents?: ChildAgentRuntime;
+  readonly childScheduler?: ChildWorkflowScheduler;
+  readonly taskScheduler?: TaskGraphScheduler;
   readonly evolution?: ToolRunContext["evolution"];
+  /** Hard ceiling independent from approval mode; useful for read-only child runs. */
+  readonly deniedCapabilities?: readonly ToolCapabilityKind[];
 }
 
 export class CodingToolExecutor implements ToolExecutor {
@@ -264,6 +326,7 @@ export class CodingToolExecutor implements ToolExecutor {
   private readonly approvalGate: ToolApprovalGate;
   private readonly registry: CodingToolRegistry;
   private readonly disabledTools: ReadonlySet<ToolName>;
+  private readonly deniedCapabilities: ReadonlySet<ToolCapabilityKind>;
 
   constructor(options: CodingToolExecutorOptions) {
     const sandboxExecutor = options.sandboxExecutor ?? createSandboxExecutor();
@@ -305,6 +368,12 @@ export class CodingToolExecutor implements ToolExecutor {
       ...(options.childAgents === undefined
         ? {}
         : { childAgents: options.childAgents }),
+      ...(options.childScheduler === undefined
+        ? {}
+        : { childScheduler: options.childScheduler }),
+      ...(options.taskScheduler === undefined
+        ? {}
+        : { taskScheduler: options.taskScheduler }),
       ...(options.evolution === undefined ? {} : { evolution: options.evolution }),
     };
     if (this.context.defaultShellTimeoutMs > this.context.maxShellTimeoutMs) {
@@ -313,10 +382,26 @@ export class CodingToolExecutor implements ToolExecutor {
     this.approvalGate = options.approvalGate ?? createToolApprovalGate();
     this.registry = options.registry ?? codingToolRegistry;
     this.disabledTools = new Set(options.disabledTools ?? []);
+    this.deniedCapabilities = new Set(options.deniedCapabilities ?? []);
   }
 
   listTools(): readonly ToolName[] {
     return this.registry.listTools().filter((name) => !this.disabledTools.has(name));
+  }
+
+  captureExecutionSnapshot(): ToolExecutionSnapshot {
+    return Object.freeze({
+      schemaVersion: 1 as const,
+      authorityVersion: this.authorityVersion(),
+      availableTools: Object.freeze([...this.listTools()]),
+      workspaceRoot: this.context.workspaceRoot,
+      ...(this.context.runtime === undefined
+        ? {}
+        : {
+            runtimeStateVersion: this.context.runtime.version,
+            mode: this.context.runtime.mode,
+          }),
+    });
   }
 
   describeTool(name: string): ToolMetadata | undefined {
@@ -333,8 +418,23 @@ export class CodingToolExecutor implements ToolExecutor {
     return this.registry.parseToolCall(call);
   }
 
-  async executeTool(call: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
+  resolveCapabilities(call: ToolCall): ToolCapabilityRequest {
+    if (this.disabledTools.has(call.name)) {
+      throw toolError("permission_denied", `Tool "${call.name}" is disabled in this run`);
+    }
+    return this.registry.resolveCapabilities(call, this.context);
+  }
+
+  async executeTool(
+    call: ToolCall,
+    signal?: AbortSignal,
+    snapshot?: ToolExecutionSnapshot,
+  ): Promise<ToolResult> {
     try {
+      const snapshotDenial = this.findSnapshotDenial(call, snapshot);
+      if (snapshotDenial !== undefined) {
+        return deniedToolResult(call, snapshotDenial);
+      }
       if (this.disabledTools.has(call.name)) {
         return deniedToolResult(call, `Tool "${call.name}" is disabled in this run`);
       }
@@ -342,28 +442,98 @@ export class CodingToolExecutor implements ToolExecutor {
       if (metadata === undefined) {
         return deniedToolResult(call, `Tool "${call.name}" is not registered`);
       }
-      if (!isPlanModeControlCall(this.context.runtime, call.name)) {
+      const capabilities = this.resolveCapabilities(call);
+      const snapshotModeDenial = this.findSnapshotModeDenial(
+        call,
+        capabilities,
+        snapshot,
+      );
+      if (snapshotModeDenial !== undefined) {
+        return deniedToolResult(call, snapshotModeDenial);
+      }
+      const callDigest = toolCapabilityCallDigest(call.id, call.name, call.input);
+      const capabilityDenial = this.findCapabilityDenial(capabilities);
+      if (capabilityDenial !== undefined) {
+        return deniedToolResult(call, capabilityDenial);
+      }
+      const initialModeDenial = this.findModeDenial(call, capabilities);
+      if (initialModeDenial !== undefined) {
+        return deniedToolResult(call, initialModeDenial);
+      }
+      const approvalStateVersion =
+        snapshot?.runtimeStateVersion ?? this.context.runtime?.version;
+      if (!isRuntimeControlCall(this.context.runtime, call.name)) {
+        const risk = capabilityRequestRisk(capabilities);
         const decision = await this.approvalGate.reviewToolCall({
           call,
-          risk: metadata.riskLevel,
-          explanation: `${call.name} is classified as ${metadata.riskLevel}`,
+          risk,
+          explanation: capabilityExplanation(call.name, capabilities),
+          capabilities,
         }, signal);
         if (!decision.approved) {
           return deniedToolResult(call, decision.reason);
         }
       }
 
-      const execute = () => this.registry.executeTool(call, this.context, signal);
+      // Approval is asynchronous. Re-read mutable runtime state before issuing
+      // authority so a mode tightening during the prompt cannot inherit a stale allow.
+      const finalModeDenial = this.findModeDenial(call, capabilities);
+      if (finalModeDenial !== undefined) {
+        return deniedToolResult(call, finalModeDenial);
+      }
+      const transitionDenial = this.findModeTighteningSince(
+        call,
+        capabilities,
+        approvalStateVersion,
+      );
+      if (transitionDenial !== undefined) {
+        return deniedToolResult(call, transitionDenial);
+      }
+      if (toolCapabilityCallDigest(call.id, call.name, call.input) !== callDigest) {
+        return deniedToolResult(
+          call,
+          `Tool "${call.name}" changed while approval was pending`,
+        );
+      }
+
+      const grant = issueToolCapabilityGrant({
+        callId: call.id,
+        toolName: call.name,
+        input: call.input,
+        request: capabilities,
+        policyVersion: sandboxPolicyVersion(this.context.sandboxExecutor),
+        ttlMs: this.context.maxShellTimeoutMs + 60_000,
+        source: isRuntimeControlCall(this.context.runtime, call.name)
+          ? "runtime-control"
+          : "policy",
+        ...(this.context.runtime === undefined
+          ? {}
+          : {
+              runtimeStateVersion:
+                snapshot?.runtimeStateVersion ?? this.context.runtime.version,
+            }),
+      });
+      const callContext: ToolRunContext = {
+        ...this.context,
+        authorization: {
+          request: capabilities,
+          grant,
+          callId: call.id,
+          callDigest,
+        },
+      };
+
+      const execute = () => this.registry.executeTool(call, callContext, signal);
       const concurrencyKey = this.registry.concurrencyKey(call);
       return {
         ok: true,
         callId: call.id,
         output:
           concurrencyKey === undefined
-            ? await execute()
+            ? await withActiveToolCapabilityGrant(grant, execute)
             : await codingToolFileQueue.run(
                 workspaceConcurrencyKey(this.context.workspaceRoot, concurrencyKey),
-                execute,
+                () => withActiveToolCapabilityGrant(grant, execute),
               ),
       };
     } catch (error: unknown) {
@@ -374,13 +544,153 @@ export class CodingToolExecutor implements ToolExecutor {
       };
     }
   }
+
+  private findCapabilityDenial(
+    request: ToolCapabilityRequest,
+  ): string | undefined {
+    const denied = capabilityKinds(request).find((capability) =>
+      this.deniedCapabilities.has(capability)
+    );
+    return denied === undefined
+      ? undefined
+      : `Capability "${denied}" is denied by this run's capability ceiling`;
+  }
+
+  private findSnapshotDenial(
+    call: ToolCall,
+    snapshot: ToolExecutionSnapshot | undefined,
+  ): string | undefined {
+    if (snapshot === undefined) {
+      return undefined;
+    }
+    if (!snapshot.availableTools.includes(call.name)) {
+      return `Tool "${call.name}" was not available in the Step execution snapshot`;
+    }
+    if (
+      snapshot.workspaceRoot !== undefined &&
+      snapshot.workspaceRoot !== this.context.workspaceRoot
+    ) {
+      return `Tool "${call.name}" belongs to a different workspace snapshot`;
+    }
+    if (snapshot.authorityVersion !== this.authorityVersion()) {
+      return `Tool "${call.name}" execution authority changed after the model Step started`;
+    }
+    return undefined;
+  }
+
+  private findSnapshotModeDenial(
+    call: ToolCall,
+    request: ToolCapabilityRequest,
+    snapshot: ToolExecutionSnapshot | undefined,
+  ): string | undefined {
+    const mode = snapshot?.mode;
+    if (
+      mode === undefined ||
+      (mode !== "execute" && mode !== "plan" && mode !== "coordinator") ||
+      isCapabilityRequestAllowedInMode(mode, call.name, request)
+    ) {
+      return undefined;
+    }
+    return `Tool "${call.name}" was not allowed by the Step mode snapshot (${mode})`;
+  }
+
+  private authorityVersion(): string {
+    return [
+      sandboxPolicyVersion(this.context.sandboxExecutor),
+      [...this.disabledTools].sort().join(","),
+      [...this.deniedCapabilities].sort().join(","),
+    ].join("|");
+  }
+
+  private findModeDenial(
+    call: ToolCall,
+    request: ToolCapabilityRequest,
+  ): string | undefined {
+    const runtime = this.context.runtime;
+    if (
+      runtime === undefined ||
+      isCapabilityRequestAllowedInMode(runtime.mode, call.name, request)
+    ) {
+      return undefined;
+    }
+    return (
+      `Tool "${call.name}" requires ${capabilityKinds(request).join(", ")} ` +
+      `and is not allowed while AgentMode=${runtime.mode}`
+    );
+  }
+
+  private findModeTighteningSince(
+    call: ToolCall,
+    request: ToolCapabilityRequest,
+    stateVersion: number | undefined,
+  ): string | undefined {
+    const runtime = this.context.runtime;
+    if (runtime === undefined || stateVersion === undefined) {
+      return undefined;
+    }
+    const tightening = runtime.modeTransitions.find((transition) =>
+      transition.version > stateVersion &&
+      !isCapabilityRequestAllowedInMode(transition.mode, call.name, request)
+    );
+    return tightening === undefined
+      ? undefined
+      : `Tool "${call.name}" approval became stale when AgentMode=${tightening.mode}`;
+  }
 }
 
-function isPlanModeControlCall(
+export function assertToolCapability(
+  context: ToolRunContext,
+  capability: ToolCapabilityKind,
+  resource?: string,
+): void {
+  const grant = context.authorization?.grant;
+  if (grant !== undefined && context.authorization !== undefined) {
+    validateToolCapabilityGrant(grant, {
+      callId: context.authorization.callId,
+      callDigest: context.authorization.callDigest,
+      policyVersion: sandboxPolicyVersion(context.sandboxExecutor),
+    });
+  }
+  if (grant === undefined || !grantAllowsCapability(grant, capability, resource)) {
+    throw toolError(
+      "permission_denied",
+      `Tool execution lacks capability ${capability}${
+        resource === undefined ? "" : ` for ${resource}`
+      }`,
+    );
+  }
+}
+
+function capabilityExplanation(
+  toolName: string,
+  request: ToolCapabilityRequest,
+): string {
+  const resources = request.requirements.map((requirement) => {
+    if (
+      requirement.capability === "filesystem.read" ||
+      requirement.capability === "filesystem.write"
+    ) {
+      return `${requirement.capability}(${requirement.paths.join(", ")})`;
+    }
+    if (requirement.capability === "network.connect") {
+      return `${requirement.capability}(${requirement.hosts.join(", ")})`;
+    }
+    if (requirement.capability === "process.exec") {
+      return requirement.capability;
+    }
+    return `${requirement.capability}(${requirement.resources.join(", ")})`;
+  });
+  return `${toolName} requests ${resources.join(", ")}`;
+}
+
+function isRuntimeControlCall(
   runtime: AgentRuntimeState | undefined,
   toolName: string,
 ): boolean {
-  return runtime?.mode === "plan" && isPlanControlTool(toolName);
+  return toolName === "enter_plan_mode" ||
+    toolName === "enter_coordinator_mode" ||
+    toolName === "exit_coordinator_mode" ||
+    (runtime?.mode === "plan" && isPlanControlTool(toolName));
 }
 
 class KeyedSerialQueue {
@@ -543,6 +853,10 @@ function toolError(code: ToolError["code"], message: string): Error {
   const error = new Error(message);
   error.name = code;
   return error;
+}
+
+function sandboxPolicyVersion(executor: SandboxExecutor): string {
+  return executor.policy?.version ?? defaultSandboxPolicy.version;
 }
 
 export function createCodingToolExecutor(

@@ -4,7 +4,12 @@ import type {
   LlmMessageContentPart,
   LlmToolSchema,
 } from "../core/agent";
-import type { AgentId, AgentRunId, SlackChannelId } from "../core/ids";
+import type {
+  AgentId,
+  AgentRunId,
+  SlackChannelId,
+  SlackEventId,
+} from "../core/ids";
 import type { AppLogger, LogFields } from "../app/logging";
 import { errorFields, NoopLogger } from "../app/logging";
 import type { UsagePricing, UsageRecorder } from "../app/usage";
@@ -74,6 +79,7 @@ import {
 import type { AgentLoopResult, MinimalAgentLoop } from "./agent-loop";
 import type { AgentLoopEvent } from "./events";
 import type { ModelRequest, ModelUsage } from "./model";
+import type { ModelRef } from "../models/types";
 import {
   buildCodingAgentPromptParts,
   formatChannelWorkspacePrompt,
@@ -104,7 +110,9 @@ import type { RuntimeHook } from "../runtime/hooks";
 import { WorkingSetHook } from "../runtime/working-set";
 import {
   AgentRunController,
+  type AgentRunCompletionHold,
 } from "../runtime/run-controller";
+import { AgentRuntime } from "../runtime/agent-runtime";
 import type { EvolutionRunFailureReporter } from "../evolution/types";
 
 export interface AgentRunnerOptions {
@@ -115,6 +123,7 @@ export interface AgentRunnerOptions {
     approvalContext: ToolApprovalContext,
     runContext: AgentRunContext,
     workspaceSkills: readonly WorkspaceSkill[],
+    runtimeControl: AgentWorkspaceRunControl,
   ) => MinimalAgentLoop;
   readonly resolveChannelWorkspaceRoot?: (
     key: ChannelSessionKey,
@@ -124,6 +133,7 @@ export interface AgentRunnerOptions {
   readonly maxSteps: number;
   readonly maxParallelToolCalls?: number;
   readonly model?: string;
+  readonly resolveModelRef?: () => ModelRef;
   readonly temperature?: number;
   readonly maxOutputTokens?: number;
   readonly updateThrottleMs?: number;
@@ -133,6 +143,10 @@ export interface AgentRunnerOptions {
   readonly logger?: AppLogger;
   readonly usageRecorder?: UsageRecorder;
   readonly usagePricing?: UsagePricing;
+  readonly resolveUsagePricing?: (
+    provider: string | undefined,
+    model: string | undefined,
+  ) => UsagePricing;
   readonly traceRecorder?: TraceRecorder;
   readonly agentId?: AgentId;
   readonly maxContextOverflowRetries?: number;
@@ -146,6 +160,12 @@ export interface AgentRunnerOptions {
   readonly evolution?: EvolutionRunFailureReporter;
   readonly agentSelfInstructionsProvider?: () => Promise<string | undefined>;
   readonly thinkingLanguage?: string;
+  readonly runtime?: AgentRuntime;
+}
+
+export interface AgentWorkspaceRunControl {
+  deferRunCompletion(reason: string): AgentRunCompletionHold | undefined;
+  enqueueRuntimeFollowUp(text: string): boolean;
 }
 
 interface ActiveRun {
@@ -178,6 +198,7 @@ interface PreparedSlackRunInput {
   readonly event: SlackEvent;
   readonly userContentParts: readonly LlmMessageContentPart[];
   readonly control?: AgentRunController<PreparedSlackRunInput>;
+  readonly source?: "slack" | "runtime";
 }
 
 interface SlackUserTurnOutcome {
@@ -199,6 +220,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
   private readonly usageRecorder: UsageRecorder;
   private readonly usagePricing: UsagePricing;
   private readonly traceRecorder: TraceRecorder;
+  private readonly runtime: AgentRuntime;
 
   constructor(private readonly options: AgentRunnerOptions) {
     this.updateThrottleMs = options.updateThrottleMs ?? 2000;
@@ -215,6 +237,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
       outputCostPerMillionTokens: 0,
     };
     this.traceRecorder = options.traceRecorder ?? new NoopTraceRecorder();
+    this.runtime = options.runtime ?? new AgentRuntime();
   }
 
   async handleSlackMessage(event: SlackEvent): Promise<void> {
@@ -292,9 +315,25 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
       ? this.activeByChannel.get(channelId)
       : undefined;
     if (existing !== undefined) {
+      if (existing.control.awaitingFollowUp) {
+        const receipt = this.runtime.enqueueFollowUp(
+          existing.runId,
+          { ...input, source: "slack" },
+          { text: event.text, source: "slack" },
+        );
+        await postSplitMrkdwnMessage(
+          this.options.slack,
+          replyConversationFor(event),
+          !receipt.accepted || receipt.position === undefined
+            ? formatBusyMessage()
+            : formatFollowUpQueuedMessage(receipt.position),
+        );
+        return;
+      }
       const modeSwitch = parseModeSwitchMessage(event.text);
       if (modeSwitch !== undefined) {
-        const receipt = existing.control.changeMode(
+        const receipt = this.runtime.changeMode(
+          existing.runId,
           modeSwitch,
           renderModeSwitchSteering(modeSwitch),
           "slack",
@@ -311,7 +350,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
 
       const steering = parseSteeringMessage(event.text);
       if (steering !== undefined) {
-        const receipt = existing.control.steer(steering, "slack");
+        const receipt = this.runtime.steer(existing.runId, steering, "slack");
         await postSplitMrkdwnMessage(
           this.options.slack,
           replyConversationFor(event),
@@ -324,7 +363,8 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
 
       const followUp = parseFollowUpMessage(event.text);
       if (followUp === undefined) {
-        const receipt = existing.control.steer(
+        const receipt = this.runtime.steer(
+          existing.runId,
           renderInlineSteering(event.text),
           "slack",
         );
@@ -338,7 +378,8 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         return;
       }
 
-      const receipt = existing.control.enqueueFollowUp(
+      const receipt = this.runtime.enqueueFollowUp(
+        existing.runId,
         {
           ...input,
           event: {
@@ -367,7 +408,8 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
       const controlRef: {
         current?: AgentRunController<PreparedSlackRunInput>;
       } = {};
-      const control = new AgentRunController<PreparedSlackRunInput>({
+      const control = this.runtime.createRun<PreparedSlackRunInput>({
+        scope: `slack:${channelId}`,
         runContext: initialRuntime,
         maxFollowUps: this.maxFollowUpQueueSize,
         onTransition: (transition) =>
@@ -388,7 +430,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
 
       let finalOutcome: SlackUserTurnOutcome = { reason: "unknown" };
       try {
-        finalOutcome = await control.runUserTurns({
+        finalOutcome = await this.runtime.runUserTurns(control, {
           initial: { ...input, control },
           execute: async (turnInput) =>
             await this.runAgent({ ...turnInput, control }) ?? { reason: "unknown" },
@@ -418,7 +460,8 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     const runtime = control.runContext;
     const initialModeSwitch = parseModeSwitchMessage(event.text);
     if (initialModeSwitch !== undefined) {
-      control.changeMode(
+      this.runtime.changeMode(
+        control.runId,
         initialModeSwitch,
         renderModeSwitchSteering(initialModeSwitch),
         "slack",
@@ -448,6 +491,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     let runReason = "unknown";
     let errorCode: string | undefined;
     let usageModel = this.options.model;
+    let usageProvider: string | undefined;
     let providerUsage: ModelUsage | undefined;
     let stopStatusTicker: (() => void) | undefined;
     let usageInput:
@@ -495,6 +539,17 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
           );
         },
       });
+      if (input.source === "runtime") {
+        await this.options.sessions.appendContextMessage(preparedRun.key, {
+          message: {
+            role: "user",
+            content: event.text,
+          },
+          source: "runtime",
+          eventId: event.eventId,
+          createdAt: event.receivedAt,
+        });
+      }
       await this.recordCompactionTrace(active, preparedRun.compaction);
       await this.renderCompactionStatus(active, renderState, preparedRun.compaction);
       const repoStart = await this.safePrepareRepoWorkflow(
@@ -550,6 +605,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         event,
         active.runtime,
         workspaceSkills,
+        active.control,
       );
       let persistence: RunPersistenceState = {
         prepared: preparedRun,
@@ -566,6 +622,9 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         : new WorkingSetHook({ workspaceRoot: runWorkspaceRoot });
       const toolResultArchiveHook =
         this.options.sessions.createToolResultArchiveHook(preparedRun.key);
+      const memoryUsageHook =
+        this.options.sessions.createMemoryUsageHook(preparedRun.key);
+      const runModelRef = this.options.resolveModelRef?.();
       const result = await active.control.run({
         execute: () => agentLoop.run(
           {
@@ -578,6 +637,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
             postHooks: [
               realtimeCompactionHook,
               ...(workingSetHook === undefined ? [] : [workingSetHook]),
+              memoryUsageHook,
               toolResultArchiveHook,
             ],
             maxSteps: this.options.maxSteps,
@@ -586,6 +646,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
               : { maxParallelToolCalls: this.options.maxParallelToolCalls }),
             runContext: active.runtime,
             ...optionalString("model", this.options.model),
+            ...(runModelRef === undefined ? {} : { modelRef: runModelRef }),
             ...optionalNumber("temperature", this.options.temperature),
             ...optionalNumber("maxOutputTokens", this.options.maxOutputTokens),
             onEvent: async (agentEvent) => {
@@ -697,6 +758,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
               contextLanes,
               userText: event.text,
               signal: active.control.signal,
+              ...(runModelRef === undefined ? {} : { modelRef: runModelRef }),
             }),
           },
         },
@@ -707,6 +769,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         return { reason: runReason };
       }
       usageModel = result.model ?? usageModel;
+      usageProvider = result.provider ?? usageProvider;
       providerUsage = result.usage;
       generatedMessages = result.messages.slice(
         preparedRun.generatedMessageStartIndex,
@@ -725,6 +788,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         event,
         active,
         result,
+        generatedMessages,
       );
 
       if (result.error !== undefined) {
@@ -756,6 +820,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         runReason,
         errorCode,
         usageModel,
+        usageProvider,
         providerUsage,
         usageInput,
         generatedMessages,
@@ -803,6 +868,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     event: SlackEvent,
     active: ActiveRun,
     result: AgentLoopResult,
+    evidenceMessages: readonly LlmMessage[],
   ): Promise<void> {
     try {
       await this.options.sessions.recordRunRolloutSummary({
@@ -811,7 +877,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         userText: event.text,
         reason: result.reason,
         steps: result.steps,
-        messages: result.messages,
+        messages: evidenceMessages,
         ...(result.error === undefined
           ? {}
           : {
@@ -843,6 +909,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     readonly contextLanes: readonly ContextLane[];
     readonly userText: string;
     readonly signal: AbortSignal;
+    readonly modelRef?: ModelRef;
   }): Promise<AgentLoopResult> {
     const options = this.options.reflection;
     if (
@@ -860,6 +927,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     let steps = input.initialResult.steps;
     let usage = input.initialResult.usage;
     let model = input.initialResult.model;
+    let provider = input.initialResult.provider;
 
     let fixAttempts = 0;
     let reflectionPass = 0;
@@ -894,6 +962,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
             : { maxParallelToolCalls: this.options.maxParallelToolCalls }),
           runContext: input.active.runtime,
           ...optionalString("model", this.options.model),
+          ...(input.modelRef === undefined ? {} : { modelRef: input.modelRef }),
           ...optionalNumber("temperature", this.options.temperature),
           ...optionalNumber("maxOutputTokens", this.options.maxOutputTokens),
           onEvent: async (agentEvent) => {
@@ -919,6 +988,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
       steps += reflectionResult.steps;
       usage = addModelUsage(usage, reflectionResult.usage);
       model = reflectionResult.model ?? model;
+      provider = reflectionResult.provider ?? provider;
 
       if (reflectionResult.error !== undefined || input.active.control.cancelled) {
         return {
@@ -926,6 +996,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
           messages,
           steps,
           ...optionalString("model", model),
+          ...optionalString("provider", provider),
           ...optionalModelUsage(usage),
           reason: reflectionResult.reason,
           ...optionalAgentLoopError(reflectionResult.error),
@@ -978,6 +1049,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
       messages,
       steps,
       ...optionalString("model", model),
+      ...optionalString("provider", provider),
       ...optionalModelUsage(usage),
     };
   }
@@ -993,7 +1065,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
       return;
     }
 
-    const receipt = active.control.cancel({
+    const receipt = this.runtime.cancel(active.runId, {
       reason: "user_stop",
       source: "slack",
     });
@@ -1308,6 +1380,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     event: SlackEvent,
     runContext: AgentRunContext,
     workspaceSkills: readonly WorkspaceSkill[],
+    control: AgentRunController<PreparedSlackRunInput>,
   ): MinimalAgentLoop {
     if (
       workspaceRoot !== undefined &&
@@ -1321,6 +1394,23 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         },
         runContext,
         workspaceSkills,
+        {
+          deferRunCompletion: (reason) =>
+            this.runtime.deferRunCompletion(control.runId, reason),
+          enqueueRuntimeFollowUp: (text) => {
+            const receipt = this.runtime.enqueueFollowUp(
+              control.runId,
+              {
+                event: runtimeFollowUpEvent(event, text),
+                userContentParts: [],
+                control,
+                source: "runtime",
+              },
+              { text, source: "runtime", reserveCapacity: true },
+            );
+            return receipt.accepted;
+          },
+        },
       );
     }
 
@@ -1423,6 +1513,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     reason: string,
     errorCode: string | undefined,
     model: string | undefined,
+    provider: string | undefined,
     providerUsage: ModelUsage | undefined,
     usageInput:
       | {
@@ -1435,9 +1526,11 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
     generatedMessages: readonly LlmMessage[],
   ): Promise<void> {
     const endedAt = new Date();
+    const usagePricing =
+      this.options.resolveUsagePricing?.(provider, model) ?? this.usagePricing;
     const usage =
       providerUsage !== undefined
-        ? calculateUsage(providerUsage, this.usagePricing)
+        ? calculateUsage(providerUsage, usagePricing)
         : usageInput === undefined
           ? calculateUsage(
               {
@@ -1446,12 +1539,12 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
                 outputTokens: 0,
                 totalTokens: 0,
               },
-              this.usagePricing,
+              usagePricing,
             )
           : estimateRunUsage({
               ...usageInput,
               generatedMessages,
-              pricing: this.usagePricing,
+              pricing: usagePricing,
             });
 
     try {
@@ -1462,6 +1555,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         startedAt: active.startedAt.toISOString(),
         endedAt: endedAt.toISOString(),
         durationMs: endedAt.getTime() - active.startedAt.getTime(),
+        ...optionalString("provider", provider),
         ...optionalString("model", model),
         reason,
         ...optionalString("errorCode", errorCode),
@@ -1471,7 +1565,7 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
         cacheHitRatio: usage.cacheHitRatio,
         outputTokens: usage.outputTokens,
         totalTokens: usage.totalTokens,
-        pricingStrategy: this.usagePricing.strategy,
+        pricingStrategy: usagePricing.strategy,
         cost: usage.cost,
         cacheSavings: usage.cacheSavings,
         currency: usage.currency,
@@ -1603,6 +1697,16 @@ export class PerChannelAgentRunner implements SlackMessageHandler {
       compactedItems: result.compactedItems,
     });
   }
+}
+
+function runtimeFollowUpEvent(event: SlackEvent, text: string): SlackEvent {
+  return {
+    ...event,
+    eventId: randomUUID() as SlackEventId,
+    text,
+    files: [],
+    receivedAt: new Date(),
+  };
 }
 
 export function isAgentStopCommand(text: string): boolean {

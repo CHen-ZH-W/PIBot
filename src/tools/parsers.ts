@@ -78,13 +78,74 @@ export function parseBashInput(
   if (command === undefined) {
     return invalidInput("bash.command must be a string");
   }
+  const permissions = parseBashPermissions(input.permissions);
+  if (permissions === null) {
+    return invalidInput(
+      "bash.permissions must contain filesystem, network, externalSideEffect, and destructive; filesystem must be read, write, or { read: string[], write: string[] }",
+    );
+  }
   return {
     ok: true,
     input: {
       command,
       ...optionalWorkspacePath("cwd", readString(input, "cwd")),
       ...optionalNumber("timeoutMs", readNumber(input, "timeoutMs")),
+      ...(permissions === undefined ? {} : { permissions }),
     },
+  };
+}
+
+function parseBashPermissions(
+  value: unknown,
+): BashToolInput["permissions"] | null {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!isRecord(value)) {
+    return null;
+  }
+  const filesystem = parseBashFilesystemPermissions(value.filesystem);
+  const network = readBoolean(value, "network");
+  const externalSideEffect = readBoolean(value, "externalSideEffect");
+  const destructive = readBoolean(value, "destructive");
+  if (
+    filesystem === null ||
+    network === undefined ||
+    externalSideEffect === undefined ||
+    destructive === undefined
+  ) {
+    return null;
+  }
+  return {
+    filesystem,
+    network,
+    externalSideEffect,
+    destructive,
+  };
+}
+
+function parseBashFilesystemPermissions(
+  value: unknown,
+): NonNullable<BashToolInput["permissions"]>["filesystem"] | null {
+  if (value === "read" || value === "write") {
+    return value;
+  }
+  if (!isRecord(value)) {
+    return null;
+  }
+  const read = readStrictStringArray(value, "read");
+  const write = readStrictStringArray(value, "write");
+  if (
+    read === null ||
+    write === null ||
+    read.length > 128 ||
+    write.length > 128
+  ) {
+    return null;
+  }
+  return {
+    read: read.map((item) => item as WorkspacePath),
+    write: write.map((item) => item as WorkspacePath),
   };
 }
 
@@ -197,6 +258,16 @@ function readStringArray(record: UnknownRecord, key: string): readonly string[] 
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string")
     : [];
+}
+
+function readStrictStringArray(
+  record: UnknownRecord,
+  key: string,
+): readonly string[] | null {
+  const value = record[key];
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? value
+    : null;
 }
 
 function isRecord(value: unknown): value is UnknownRecord {

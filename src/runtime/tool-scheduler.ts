@@ -6,6 +6,7 @@ import type {
 } from "../agent/events";
 import type { AgentRunContext, AgentStepContext } from "./context";
 import { RuntimeHookRunner } from "./hooks";
+import type { RuntimeTransition } from "./transitions";
 
 export interface ToolBatchScheduleInput {
   readonly run: AgentRunContext;
@@ -15,7 +16,17 @@ export interface ToolBatchScheduleInput {
   readonly onEvent?: AgentLoopEventHandler;
 }
 
+export type ToolStreamScheduleInput = Omit<ToolBatchScheduleInput, "calls">;
+
+export interface ToolScheduleSession {
+  /** Submits one complete tool call as soon as the provider closes its block. */
+  submit(call: ToolCall): Promise<ToolResult>;
+  /** Seals this Step and resolves all results in model call order. */
+  close(): Promise<readonly ToolResult[]>;
+}
+
 export interface ToolScheduler {
+  begin(input: ToolStreamScheduleInput): ToolScheduleSession;
   schedule(input: ToolBatchScheduleInput): Promise<readonly ToolResult[]>;
 }
 
@@ -39,61 +50,42 @@ export class BoundedToolScheduler implements ToolScheduler {
     }
   }
 
+  begin(input: ToolStreamScheduleInput): ToolScheduleSession {
+    return new BoundedToolScheduleSession(this, input);
+  }
+
   async schedule(
     input: ToolBatchScheduleInput,
   ): Promise<readonly ToolResult[]> {
-    const results: ToolResult[] = [];
-    let pending: Array<{ readonly index: number; readonly call: ToolCall }> = [];
-    const flush = async (): Promise<void> => {
-      const batch = pending;
-      pending = [];
-      let next = 0;
-      const worker = async (): Promise<void> => {
-        while (true) {
-          const queued = batch[next];
-          next += 1;
-          if (queued === undefined) {
-            return;
-          }
-          results[queued.index] = await this.execute(queued.call, input);
-        }
-      };
-      await Promise.all(
-        Array.from(
-          {
-            length: Math.min(
-              this.options.maxParallelToolCalls,
-              batch.length,
-            ),
-          },
-          () => worker(),
-        ),
-      );
-    };
-
-    for (const [index, call] of input.calls.entries()) {
-      if (
-        !isInvalidToolCall(call) &&
-        isParallelToolCall(this.options.tools, call)
-      ) {
-        pending.push({ index, call });
-        continue;
-      }
-      await flush();
-      results[index] = await this.execute(call, input);
+    const session = this.begin(input);
+    for (const call of input.calls) {
+      void session.submit(call);
     }
-    await flush();
-    return results;
+    return session.close();
   }
 
-  private async execute(
+  isParallel(call: ToolCall): boolean {
+    return !isInvalidToolCall(call) &&
+      isParallelToolCall(this.options.tools, call);
+  }
+
+  get parallelLimit(): number {
+    return this.options.maxParallelToolCalls;
+  }
+
+  async executeCall(
     originalCall: ToolCall,
-    input: ToolBatchScheduleInput,
+    input: ToolStreamScheduleInput,
   ): Promise<ToolResult> {
     const startedAtMs = Date.now();
     let metadata: ReturnType<NonNullable<ToolExecutor["describeTool"]>>;
     const abortedBeforeDispatch = isSignalAborted(input.signal);
     if (!abortedBeforeDispatch) {
+      recordTransition(input.run, toolTransition(
+        "dispatch_tool_call",
+        input.stepContext,
+        originalCall,
+      ));
       await safeEmit(input.onEvent, {
         type: "tool_start",
         step: input.stepContext.step,
@@ -124,7 +116,15 @@ export class BoundedToolScheduler implements ToolScheduler {
             ? abortedToolResult(call)
             : isInvalidToolCall(call)
               ? invalidToolResult(call)
-              : await safelyExecuteTool(this.options.tools, call, input.signal);
+              : await safelyExecuteTool(
+                  this.options.tools,
+                  call,
+                  input.signal,
+                  stepExecutionSnapshot(
+                    input.stepContext,
+                    this.options.tools,
+                  ),
+                );
         }
       }
     } catch (error: unknown) {
@@ -158,7 +158,187 @@ export class BoundedToolScheduler implements ToolScheduler {
       call,
       result,
     });
+    recordTransition(
+      input.run,
+      result.ok || result.error.code !== "aborted"
+        ? {
+            ...toolTransition(
+              "complete_tool_call",
+              input.stepContext,
+              originalCall,
+            ),
+            outcome: result.ok ? "success" : "error",
+          }
+        : {
+            ...toolTransition(
+              "abort_tool_call",
+              input.stepContext,
+              originalCall,
+            ),
+            phase: abortedBeforeDispatch ? "queued" : "executing",
+          },
+    );
     return result;
+  }
+}
+
+interface PendingToolCall {
+  readonly index: number;
+  readonly call: ToolCall;
+  readonly parallel: boolean;
+  readonly resolve: (result: ToolResult) => void;
+}
+
+/**
+ * A rolling Step-local intake queue. Parallel calls start immediately up to the
+ * bound; sequential calls are strict barriers for calls before and after them.
+ */
+class BoundedToolScheduleSession implements ToolScheduleSession {
+  private readonly pending: PendingToolCall[] = [];
+  private readonly results: ToolResult[] = [];
+  private active = 0;
+  private nextIndex = 0;
+  private sequentialActive = false;
+  private sealed = false;
+  private settled = false;
+  private readonly completion: Promise<readonly ToolResult[]>;
+  private resolveCompletion: (results: readonly ToolResult[]) => void = () => {};
+  private readonly onAbort = (): void => this.pump();
+
+  constructor(
+    private readonly scheduler: BoundedToolScheduler,
+    private readonly input: ToolStreamScheduleInput,
+  ) {
+    this.completion = new Promise((resolve) => {
+      this.resolveCompletion = resolve;
+    });
+    input.signal?.addEventListener("abort", this.onAbort, { once: true });
+  }
+
+  submit(call: ToolCall): Promise<ToolResult> {
+    if (this.sealed) {
+      throw new Error("Tool schedule session is already sealed");
+    }
+    let resolveResult: (result: ToolResult) => void = () => {};
+    const result = new Promise<ToolResult>((resolve) => {
+      resolveResult = resolve;
+    });
+    this.pending.push({
+      index: this.nextIndex,
+      call,
+      parallel: this.scheduler.isParallel(call),
+      resolve: resolveResult,
+    });
+    this.nextIndex += 1;
+    recordTransition(this.input.run, toolTransition(
+      "queue_tool_call",
+      this.input.stepContext,
+      call,
+    ));
+    this.pump();
+    return result;
+  }
+
+  close(): Promise<readonly ToolResult[]> {
+    if (!this.sealed) {
+      this.sealed = true;
+      this.pump();
+    }
+    return this.completion;
+  }
+
+  private pump(): void {
+    if (this.settled || this.sequentialActive) {
+      return;
+    }
+
+    while (this.active < this.scheduler.parallelLimit) {
+      const next = this.pending[0];
+      if (next === undefined) {
+        this.finishIfReady();
+        return;
+      }
+      if (!next.parallel) {
+        if (this.active > 0) {
+          return;
+        }
+        this.pending.shift();
+        this.sequentialActive = true;
+        this.launch(next);
+        return;
+      }
+      this.pending.shift();
+      this.launch(next);
+    }
+  }
+
+  private launch(entry: PendingToolCall): void {
+    this.active += 1;
+    void this.scheduler.executeCall(entry.call, this.input).then((result) => {
+      this.results[entry.index] = result;
+      entry.resolve(result);
+    }).finally(() => {
+      this.active -= 1;
+      if (!entry.parallel) {
+        this.sequentialActive = false;
+      }
+      this.pump();
+      this.finishIfReady();
+    });
+  }
+
+  private finishIfReady(): void {
+    if (
+      this.settled ||
+      !this.sealed ||
+      this.pending.length > 0 ||
+      this.active > 0
+    ) {
+      return;
+    }
+    this.settled = true;
+    this.input.signal?.removeEventListener("abort", this.onAbort);
+    this.resolveCompletion(Object.freeze([...this.results]));
+  }
+}
+
+function toolTransition<
+  Type extends
+    | "queue_tool_call"
+    | "dispatch_tool_call"
+    | "complete_tool_call"
+    | "abort_tool_call",
+>(
+  type: Type,
+  stepContext: AgentStepContext,
+  call: ToolCall,
+): {
+  readonly type: Type;
+  readonly runId: AgentStepContext["runId"];
+  readonly userTurnId: AgentStepContext["userTurnId"];
+  readonly stepId: AgentStepContext["stepId"];
+  readonly callId: ToolCall["id"];
+  readonly tool: string;
+} {
+  return {
+    type,
+    runId: stepContext.runId,
+    userTurnId: stepContext.userTurnId,
+    stepId: stepContext.stepId,
+    callId: call.id,
+    tool: call.name,
+  };
+}
+
+function recordTransition(
+  run: AgentRunContext,
+  transition: RuntimeTransition,
+): void {
+  try {
+    const observation = run.onTransition?.(transition);
+    void Promise.resolve(observation).catch(() => undefined);
+  } catch {
+    // Runtime observers are fail-open and cannot alter scheduler state.
   }
 }
 
@@ -172,6 +352,19 @@ function isParallelToolCall(tools: ToolExecutor, call: ToolCall): boolean {
   } catch {
     return false;
   }
+}
+
+function stepExecutionSnapshot(
+  stepContext: AgentStepContext,
+  tools: ToolExecutor,
+): AgentStepContext["snapshot"]["execution"] {
+  const captured = (stepContext as Partial<AgentStepContext>).snapshot?.execution ??
+    tools.captureExecutionSnapshot?.();
+  return captured ?? {
+    schemaVersion: 1,
+    authorityVersion: "unversioned",
+    availableTools: tools.listTools(),
+  };
 }
 
 function invalidToolResult(call: ToolCall): ToolResult {
@@ -216,9 +409,10 @@ async function safelyExecuteTool(
   tools: ToolExecutor,
   call: ToolCall,
   signal: AbortSignal | undefined,
+  snapshot: AgentStepContext["snapshot"]["execution"],
 ): Promise<ToolResult> {
   try {
-    return await tools.executeTool(call, signal);
+    return await tools.executeTool(call, signal, snapshot);
   } catch (error: unknown) {
     return failedToolResult(call, error);
   }

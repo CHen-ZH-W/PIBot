@@ -55,6 +55,7 @@ export interface ChildAgentRunPaths {
 export interface ChildAgentRunRecord {
   readonly childRunId: AgentRunId;
   readonly parentRunId: AgentRunId;
+  readonly externalKey?: string;
   readonly role: ChildAgentRole;
   readonly agentId: string;
   readonly status: ChildAgentStatus;
@@ -87,6 +88,7 @@ export interface ChildAgentUsage {
 export interface CreateChildAgentRunRequest {
   readonly key: ChannelSessionKey;
   readonly parentRunId: AgentRunId;
+  readonly externalKey?: string;
   readonly role: ChildAgentRole;
   readonly agentId?: string;
   readonly task: string;
@@ -178,6 +180,7 @@ export class FileChildAgentRunStore implements ChildAgentRunStore {
     const record: ChildAgentRunRecord = {
       childRunId: path.basename(paths.runDir) as AgentRunId,
       parentRunId: request.parentRunId,
+      ...optionalString("externalKey", request.externalKey),
       role: request.role,
       agentId: request.agentId ?? roleAgentId(request.role),
       status: "starting",

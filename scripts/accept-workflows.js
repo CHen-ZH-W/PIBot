@@ -8,6 +8,7 @@ const {
   configureAgentRuntimeState,
   createToolPlanApprovalRequester,
   createAgentRuntimeState,
+  enterPlanMode,
   RuntimeModeHook,
 } = require("../dist/runtime/mode");
 const {
@@ -41,6 +42,10 @@ async function runAcceptance() {
     acceptsTaskStoreReplanLimit,
   );
   await runCase(
+    "TaskGraph rejects invalid DAGs and preserves only runtime-completed work",
+    acceptsTaskGraphValidationAndRuntimeAuthority,
+  );
+  await runCase(
     "Reflection stops after the configured fix budget",
     acceptsReflectionFixBudget,
   );
@@ -55,6 +60,10 @@ async function runAcceptance() {
   await runCase(
     "Explicit follow-up messages queue while a run is active",
     acceptsFollowUpQueue,
+  );
+  await runCase(
+    "runtime completion resumes Slack as a new UserTurn",
+    acceptsRuntimeGeneratedFollowUp,
   );
   console.log("Workflow acceptance passed");
 }
@@ -167,6 +176,19 @@ async function acceptsPlanModeApproval() {
   assert.match(await readFile(join(workspaceRoot, "PLAN.md"), "utf8"), /# Plan/u);
   const tasks = JSON.parse(await readFile(join(workspaceRoot, "tasks.json"), "utf8"));
   assert.equal(tasks.tasks.length, 2);
+  assert.equal(tasks.graphState, "frozen");
+  assert.equal(tasks.graphVersion, 1);
+  assert.equal(tasks.tasksDigest.length, 64);
+  assert.equal(tasks.planDigest.length, 64);
+  assert.equal(approvals[1].request.taskGraph.taskCount, 2);
+  assert.equal(approvals[1].request.taskGraph.tasksDigest, tasks.tasksDigest);
+  const manualTransition = await tools.executeTool({
+    id: "manual-frozen-task-update",
+    name: "task_update",
+    input: { id: "t1", status: "completed" },
+  });
+  assert.equal(manualTransition.ok, false);
+  assert.equal(manualTransition.error.code, "permission_denied");
 }
 
 async function acceptsSlackPlanApprovalResumesOutput() {
@@ -448,6 +470,22 @@ async function acceptsTaskStoreReplanLimit() {
     })).ok,
     true,
   );
+  let current = await taskStore.read();
+  await taskStore.freezeGraph({
+    planDigest: "plan-v1",
+    expectedTasksDigest: current.tasksDigest,
+  });
+  const outsidePlan = await tools.executeTool({
+    id: "tasks-replan-outside-plan",
+    name: "tasks_update",
+    input: {
+      reason: "must enter Plan Mode",
+      tasks: [{ id: "t1", title: "Initial task" }],
+    },
+  });
+  assert.equal(outsidePlan.ok, false);
+  assert.equal(outsidePlan.error.code, "permission_denied");
+  enterPlanMode(runtime);
   const firstReplan = await tools.executeTool({
     id: "tasks-replan-1",
     name: "tasks_update",
@@ -461,6 +499,12 @@ async function acceptsTaskStoreReplanLimit() {
   });
   assert.equal(firstReplan.ok, true);
   assert.equal(firstReplan.output.replanCount, 1);
+  assert.equal((await taskStore.read()).tasks[0].status, "pending");
+  current = await taskStore.read();
+  await taskStore.freezeGraph({
+    planDigest: "plan-v2",
+    expectedTasksDigest: current.tasksDigest,
+  });
 
   const secondReplan = await tools.executeTool({
     id: "tasks-replan-2",
@@ -472,6 +516,60 @@ async function acceptsTaskStoreReplanLimit() {
   });
   assert.equal(secondReplan.ok, false);
   assert.equal(secondReplan.error.code, "conflict");
+}
+
+async function acceptsTaskGraphValidationAndRuntimeAuthority() {
+  const workspaceRoot = await createWorkspace("pibot-task-graph-validation-");
+  const taskStore = new FileTaskStore({ workspaceRoot });
+  await assert.rejects(
+    taskStore.writeTasks({
+      tasks: [{ id: "missing", title: "Missing", dependencies: ["unknown"] }],
+    }),
+    /depends on missing task unknown/u,
+  );
+  await assert.rejects(
+    taskStore.writeTasks({
+      tasks: [
+        { id: "a", title: "A", dependencies: ["b"] },
+        { id: "b", title: "B", dependencies: ["a"] },
+      ],
+    }),
+    /dependency cycle/u,
+  );
+  await assert.rejects(
+    taskStore.writeTasks({
+      tasks: [
+        { id: "a", title: "A" },
+        { id: "b", title: "B", dependencies: ["a", "a"] },
+      ],
+    }),
+    /duplicate dependencies/u,
+  );
+
+  const draft = await taskStore.writeTasks({
+    tasks: [{ id: "a", title: "A", status: "completed" }],
+  });
+  assert.equal(draft.tasks[0].status, "pending");
+  await taskStore.syncExecutionState({
+    a: { id: "a", status: "completed", attempts: 1, result: "runtime evidence" },
+  });
+  const frozen = await taskStore.freezeGraph({
+    planDigest: "plan-v1",
+    expectedTasksDigest: draft.tasksDigest,
+  });
+  const replanned = await taskStore.writeTasks({
+    reason: "add dependent task",
+    tasks: [
+      { id: "a", title: "A" },
+      { id: "b", title: "B", dependencies: ["a"] },
+    ],
+  });
+  assert.equal(frozen.graphVersion, 1);
+  assert.equal(replanned.graphVersion, 2);
+  assert.equal(replanned.graphState, "draft");
+  assert.equal(replanned.tasks[0].status, "completed");
+  assert.equal(replanned.tasks[0].result, "runtime evidence");
+  assert.equal(replanned.tasks[1].status, "pending");
 }
 
 async function acceptsReflectionFixBudget() {
@@ -753,6 +851,94 @@ async function acceptsFollowUpQueue() {
     ),
     true,
   );
+}
+
+async function acceptsRuntimeGeneratedFollowUp() {
+  const workspaceRoot = await createWorkspace("pibot-workflows-runtime-resume-");
+  const requests = [];
+  const traces = [];
+  let runtimeControl;
+  let completionHold;
+  let factoryCalls = 0;
+  const model = {
+    async *stream(request) {
+      requests.push(request);
+      yield startEvent();
+      yield {
+        type: "text_delta",
+        text: requests.length === 1
+          ? "TaskGraph is running."
+          : "TaskGraph evidence integrated.",
+      };
+      yield { type: "done" };
+    },
+  };
+  const store = new FileChannelWorkspaceStore({
+    rootDir: join(workspaceRoot, ".pibot"),
+  });
+  const sessions = new WorkspaceSessionStore({ store });
+  const tools = emptyTools();
+  const runner = new PerChannelAgentRunner({
+    slack: new FakeSlackPublisher(),
+    agentLoop: new MinimalAgentLoop({ model, tools }),
+    createAgentLoopForWorkspace: (
+      _root,
+      _approval,
+      _runContext,
+      _skills,
+      control,
+    ) => {
+      factoryCalls += 1;
+      if (factoryCalls === 1) {
+        runtimeControl = control;
+        completionHold = control.deferRunCompletion("task_graph:v1:digest");
+      }
+      return new MinimalAgentLoop({ model, tools });
+    },
+    resolveChannelWorkspaceRoot: async () => workspaceRoot,
+    sessions,
+    tools: [],
+    maxSteps: 1,
+    traceRecorder: {
+      async record(event) {
+        traces.push(event);
+      },
+    },
+  });
+
+  const running = runner.handleSlackMessage(slackEvent("execute approved graph"));
+  await waitFor(() => requests.length === 1 && completionHold !== undefined);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(traces.some((event) => event.type === "run.completed"), false);
+  await runner.handleSlackMessage(slackEvent("human note while graph runs"));
+  await waitFor(() => requests.length === 2);
+  const humanFollowUp = requests[1].messages.findLast((message) =>
+    message.role === "user");
+  assert.equal(humanFollowUp.content, "human note while graph runs");
+  const completionText = [
+    "[Runtime TaskGraph completion event]",
+    "Frozen TaskGraph v1 is succeeded.",
+  ].join("\n");
+  assert.equal(runtimeControl.enqueueRuntimeFollowUp(completionText), true);
+  completionHold.release();
+  await running;
+
+  assert.equal(requests.length, 3);
+  const resumedUserMessage = requests[2].messages.findLast((message) =>
+    message.role === "user");
+  assert.notEqual(resumedUserMessage, undefined);
+  assert.equal(resumedUserMessage.content, completionText);
+  const userTurns = traces.filter((event) => event.type === "user_turn.started");
+  assert.equal(userTurns.length, 3);
+  assert.equal(new Set(userTurns.map((event) => event.runId)).size, 1);
+  assert.equal(new Set(userTurns.map((event) => event.userTurnId)).size, 3);
+  const context = await sessions.readChannelContextMessages({
+    teamId: "T-workflows",
+    channelId: "D-workflows",
+  });
+  const runtimeMessage = context.find((message) =>
+    message.source === "runtime" && message.message.content === completionText);
+  assert.notEqual(runtimeMessage, undefined);
 }
 
 async function createWorkspace(prefix) {

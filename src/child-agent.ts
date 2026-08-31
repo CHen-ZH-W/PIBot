@@ -1,11 +1,8 @@
 import { appendFile, readFile, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { MinimalAgentLoop } from "./agent/agent-loop";
-import {
-  OpenAICompatibleProviderAdapter,
-  RetryingModelClient,
-  type ModelUsage,
-} from "./agent/model";
+import type { ModelUsage } from "./agent/model";
+import { createConfiguredModelClient } from "./models/runtime";
 import type {
   AgentRunId,
   AgentId,
@@ -18,6 +15,7 @@ import type { LlmToolSchema } from "./core/agent";
 import type { ToolApprovalContext } from "./core/tools";
 import type { AgentLoopEvent } from "./agent/events";
 import { createAgentRunContext } from "./runtime/context";
+import { AgentRuntime } from "./runtime/agent-runtime";
 import { FileChildAgentApprovalPrompter } from "./runtime/child-agent-approvals";
 import {
   createAgentRuntimeState,
@@ -36,6 +34,7 @@ import {
 } from "./workspace/sandbox";
 import { ToolResultArchiveHook } from "./runtime/tool-result-archive";
 import { createRuntimeWorldStateProvider } from "./runtime/world-state";
+import { ContextManager } from "./workspace/context-manager";
 
 interface ChildAgentEnv {
   readonly childRunId: AgentRunId;
@@ -75,66 +74,90 @@ async function main(): Promise<void> {
 
   try {
     const task = await readFile(env.taskFile, "utf8");
-    const model = new RetryingModelClient(
-      new OpenAICompatibleProviderAdapter(),
-      {
-        maxRetries: readNonNegativeIntegerEnv("MODEL_MAX_RETRIES") ?? 2,
-        fallbackModels: readCsvEnv("OPENAI_FALLBACK_MODELS"),
-        baseRetryDelayMs:
-          readPositiveIntegerEnv("MODEL_RETRY_BASE_DELAY_MS") ?? 500,
-        maxRetryDelayMs:
-          readPositiveIntegerEnv("MODEL_RETRY_MAX_DELAY_MS") ?? 8000,
-      },
-    );
+    const storeRoot = process.env.PIBOT_STORE_ROOT ??
+      path.join(env.workspaceRoot, ".pibot");
+    const configuredModel = await createConfiguredModelClient({ storeRoot });
+    const model = configuredModel.client;
+    const sandboxExecutor = sandboxExecutorFromEnv(env.workspaceRoot);
+    const runtimeState = createAgentRuntimeState();
     const tools = createCodingToolExecutor({
       workspaceRoot: env.workspaceRoot,
-      sandboxExecutor: sandboxExecutorFromEnv(env.workspaceRoot),
+      sandboxExecutor,
+      ...(env.readOnly
+        ? { deniedCapabilities: ["filesystem.write" as const] }
+        : {}),
       approvalGate: createToolApprovalGate(
         childToolApprovalMode(env),
         childToolApprovalGateOptions(env),
       ),
+      runtime: runtimeState,
       ...codingToolLimitsFromEnv(),
     });
-    const runtime = createAgentRunContext({
+    const runContext = createAgentRunContext({
       runId: env.childRunId,
       parentRunId: env.parentRunId,
       agentId: env.agentId,
-      state: createAgentRuntimeState(),
+      state: runtimeState,
+    });
+    const runtime = new AgentRuntime();
+    const control = runtime.createRun<void>({
+      scope: `child:${env.childRunId}`,
+      runContext,
+      maxFollowUps: 0,
+    });
+    const contextManager = new ContextManager({
+      toolResultAdmission: {
+        thresholdChars:
+          readPositiveIntegerEnv("TOOL_RESULT_CONTEXT_THRESHOLD_CHARS") ?? 8_192,
+        headChars:
+          readNonNegativeIntegerEnv("TOOL_RESULT_CONTEXT_HEAD_CHARS") ?? 4_096,
+        tailChars:
+          readNonNegativeIntegerEnv("TOOL_RESULT_CONTEXT_TAIL_CHARS") ?? 1_024,
+      },
     });
     const loop = new MinimalAgentLoop({
       model,
       tools,
+      contextManager,
       hooks: [
         new RuntimeModeHook({
-          state: runtime.state,
+          state: control.runContext.state,
+          contextManager,
           describeTool: (name) => tools.describeTool(name),
           worldState: createRuntimeWorldStateProvider({
             workspaceRoot: env.workspaceRoot,
             sandboxLabel: process.env.SANDBOX_EXECUTOR ?? "host(disabled)",
+            sandboxPolicy: sandboxExecutor.policy,
+            sandboxEnforcement: sandboxExecutor.enforcement,
             approvalMode: childToolApprovalMode(env),
           }),
         }),
       ],
     });
 
-    const result = await loop.run({
-      userText: task,
-      systemPrompt: childSystemPrompt(env),
-      history: [],
-      tools: childToolSchemas(env),
-      postHooks: [
-        new ToolResultArchiveHook({
-          directory: path.join(env.runDir, "tool-results"),
-          locatorRoot: env.runDir,
+    const result = await runtime.runUserTurns(control, {
+      initial: undefined,
+      execute: () => control.run({
+        execute: () => loop.run({
+          userText: task,
+          systemPrompt: childSystemPrompt(env),
+          history: [],
+          tools: childToolSchemas(env),
+          postHooks: [
+            new ToolResultArchiveHook({
+              directory: path.join(env.runDir, "tool-results"),
+              locatorRoot: env.runDir,
+            }),
+          ],
+          maxSteps: childMaxSteps(env),
+          runContext: control.runContext,
+          modelRef: configuredModel.runtime.activeModelRef(),
+          ...optionalNumber("maxOutputTokens", env.maxTokens),
+          onEvent: async (event) => {
+            await handleChildAgentEvent(env, stats, event);
+          },
         }),
-      ],
-      maxSteps: childMaxSteps(env),
-      runContext: runtime,
-      ...optionalString("model", readOptionalEnv("OPENAI_MODEL")),
-      ...optionalNumber("maxOutputTokens", env.maxTokens),
-      onEvent: async (event) => {
-        await handleChildAgentEvent(env, stats, event);
-      },
+      }),
     });
     stats.usage = result.usage;
 
@@ -199,7 +222,7 @@ function childSystemPrompt(env: ChildAgentEnv): string {
     `Role: ${env.role}. Parent run: ${env.parentRunId}.`,
     `Workspace root: ${env.workspaceRoot}.`,
     env.readOnly
-      ? "Permission: read-only by default. Inspect files and report findings. Shell commands require parent approval."
+      ? "Permission: read-only by default. Inspect files and report findings. Shell commands require parent approval and must declare bash.permissions.filesystem=read or a scoped {read:[...],write:[]} object; filesystem.write is a hard ceiling even after approval."
       : "Permission: elevated child execution. Stay within the assigned task and workspace boundaries.",
     "Treat the assigned task text as authoritative. The role is a coarse execution label, not a fixed functional objective.",
     "Write a concise final result with findings, evidence, risks, and recommended next steps.",
@@ -239,14 +262,14 @@ export function resolveChildAgentToolApprovalMode(
       "CHILD_AGENT_TOOL_APPROVAL_MODE",
     );
   }
-  if (!options.readOnly) {
-    return "full-access";
-  }
   if (options.hasApprovalContext === true) {
     return "approval-required";
   }
+  if (!options.readOnly) {
+    return "workspace-write";
+  }
   if (options.allowBash === true) {
-    return "full-access";
+    return "workspace-write";
   }
   return "read-only";
 }

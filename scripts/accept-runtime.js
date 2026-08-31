@@ -16,6 +16,7 @@ const {
   AgentRunController,
   driveWithContextRecovery,
 } = require("../dist/runtime/run-controller");
+const { AgentRuntime } = require("../dist/runtime/agent-runtime");
 const {
   NextStepInbox,
   NextTurnQueue,
@@ -39,12 +40,15 @@ const {
   withRun,
 } = require("../dist/runtime/trace");
 const {
+  assertToolCapability,
   CodingToolRegistry,
   createCodingToolExecutor,
   createToolApprovalGate,
   getCodingToolSchemas,
+  toolApprovalRulesForRun,
 } = require("../dist/tools");
 const { createSandboxExecutor } = require("../dist/workspace/sandbox");
+const { defaultSandboxPolicy } = require("../dist/workspace/sandbox-policy");
 const { FileTaskStore } = require("../dist/workspace/tasks");
 const {
   createRuntimeWorldStateProvider,
@@ -52,6 +56,15 @@ const {
 
 async function runAcceptance() {
   await runCase("registry executes a newly registered tool", acceptsRegisteredTool);
+  await runCase("capability policy overrides static tool risk", acceptsCapabilityPolicy);
+  await runCase("one-shot grants enforce declared resources", acceptsCapabilityGrantResources);
+  await runCase("inactive grants cannot be replayed", acceptsCapabilityGrantReplayDenial);
+  await runCase("sandbox grants are bound to the approved command", acceptsCapabilityGrantCommandBinding);
+  await runCase("run-scoped approval rules match exact capabilities", acceptsRunScopedApprovalRules);
+  await runCase("bash path scopes participate in approval rules", acceptsBashPathScopedApprovalRules);
+  await runCase("direct file tools consume the executor sandbox policy", acceptsDirectFileToolSandboxPolicy);
+  await runCase("tool execution rejects a stale Step authority snapshot", acceptsStaleStepAuthoritySnapshot);
+  await runCase("mode tightening during approval revokes stale authority", acceptsApprovalModeTightening);
   await runCase("parallel tools overlap while file writes serialize", acceptsExecutionModes);
   await runCase("parallel tool batches apply bounded backpressure", acceptsBoundedParallelTools);
   await runCase("aborted queued tools keep complete tool-result pairing", acceptsAbortPairing);
@@ -62,6 +75,8 @@ async function runAcceptance() {
   await runCase("step-end observer steering reaches the next step", acceptsTerminalSteeringRace);
   await runCase("control mailboxes enforce delivery and terminal boundaries", acceptsControlMailboxes);
   await runCase("run controller owns control transitions and follow-ups", acceptsRunController);
+  await runCase("agent runtime owns active run registration and release", acceptsAgentRuntimeOwnership);
+  await runCase("runtime completion holds resume the same run", acceptsDeferredRunCompletion);
   await runCase("context recovery keeps next-step steering open", acceptsRecoverySteering);
   await runCase("failed user turns terminate before queued follow-ups", acceptsFailurePrecedence);
   await runCase("cancellation is first-cause and produces one terminal event", acceptsCancellationRace);
@@ -92,6 +107,12 @@ async function acceptsWorldStateProjection() {
     worldState: createRuntimeWorldStateProvider({
       workspaceRoot,
       sandboxLabel: "linux-native(test)",
+      sandboxPolicy: defaultSandboxPolicy,
+      sandboxEnforcement: {
+        backend: "linux-native",
+        filesystem: "path-scoped",
+        network: "per-call",
+      },
       approvalMode: "approval-required",
       pendingApprovalCount: () => 2,
       childAgents: {
@@ -133,6 +154,9 @@ async function acceptsWorldStateProjection() {
   assert.match(first.messages[1].content, /"branch": "context-test"/u);
   assert.match(first.messages[1].content, /"dirty": true/u);
   assert.match(first.messages[1].content, /linux-native\(test\)/u);
+  assert.match(first.messages[1].content, /sandbox-policy-v1/u);
+  assert.match(first.messages[1].content, /"filesystem": "path-scoped"/u);
+  assert.match(first.messages[1].content, /"network": "per-call"/u);
   assert.match(first.messages[1].content, /"pending": 2/u);
   assert.match(first.messages[1].content, /"supported": false/u);
   assert.match(first.messages[1].content, /"childRunId": "child-1"/u);
@@ -154,6 +178,21 @@ async function acceptsWorldStateProjection() {
     ).length,
     1,
   );
+
+  await taskStore.updateTask({
+    id: "context-1",
+    status: "completed",
+    result: "event-driven child evidence",
+  });
+  const thirdStep = captureAgentStepContext(run, "fake-model");
+  const third = await hook.beforeModelCall({
+    run,
+    step: thirdStep.step,
+    stepContext: thirdStep,
+    request: second,
+  });
+  assert.match(third.messages[1].content, /"completedResults"/u);
+  assert.match(third.messages[1].content, /event-driven child evidence/u);
 }
 
 async function runCase(name, test) {
@@ -217,6 +256,508 @@ async function acceptsRegisteredTool() {
     riskLevel: "read-only",
     executionMode: "parallel",
   });
+}
+
+async function acceptsCapabilityPolicy() {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pibot-runtime-capability-"));
+  const workspaceTools = createCodingToolExecutor({
+    workspaceRoot,
+    sandboxExecutor: createSandboxExecutor({ kind: "host", enabled: true }),
+    approvalGate: createToolApprovalGate("workspace-write"),
+  });
+  const localCommand = await workspaceTools.executeTool({
+    id: "local-process",
+    name: "bash",
+    input: {
+      command: "printf local-only",
+      permissions: {
+        filesystem: "read",
+        network: false,
+        externalSideEffect: false,
+        destructive: false,
+      },
+    },
+  });
+  assert.equal(localCommand.ok, true);
+  assert.equal(localCommand.output.stdout, "local-only");
+  const networkCommand = await workspaceTools.executeTool({
+    id: "network-process",
+    name: "bash",
+    input: {
+      command: "printf should-not-run",
+      permissions: {
+        filesystem: "read",
+        network: true,
+        externalSideEffect: false,
+        destructive: false,
+      },
+    },
+  });
+  assert.equal(networkCommand.ok, false);
+  assert.match(networkCommand.error.message, /interactive approval/u);
+  const destructiveCommand = await workspaceTools.executeTool({
+    id: "destructive-process",
+    name: "bash",
+    input: {
+      command: "printf should-not-run",
+      permissions: {
+        filesystem: "write",
+        network: false,
+        externalSideEffect: false,
+        destructive: true,
+      },
+    },
+  });
+  assert.equal(destructiveCommand.ok, false);
+  assert.match(destructiveCommand.error.message, /interactive approval/u);
+
+  const readOnlyChildTools = createCodingToolExecutor({
+    workspaceRoot,
+    sandboxExecutor: createSandboxExecutor({ kind: "host", enabled: true }),
+    approvalGate: createToolApprovalGate("full-access"),
+    deniedCapabilities: ["filesystem.write"],
+  });
+  const ceilingResult = await readOnlyChildTools.executeTool({
+    id: "read-only-ceiling",
+    name: "bash",
+    input: {
+      command: "printf should-not-run > ceiling.txt",
+      permissions: {
+        filesystem: "write",
+        network: false,
+        externalSideEffect: false,
+        destructive: false,
+      },
+    },
+  });
+  assert.equal(ceilingResult.ok, false);
+  assert.match(ceilingResult.error.message, /capability ceiling/u);
+  await assert.rejects(readFile(join(workspaceRoot, "ceiling.txt"), "utf8"), {
+    code: "ENOENT",
+  });
+
+  let requestedApproval;
+  const tools = createCodingToolExecutor({
+    workspaceRoot,
+    sandboxExecutor: createSandboxExecutor({ kind: "host", enabled: true }),
+    approvalGate: createToolApprovalGate("approval-required", {
+      context: {
+        conversation: { teamId: "T-capability", channelId: "D-capability" },
+        requestedByUserId: "U-capability",
+      },
+      prompter: {
+        async requestToolApproval(request) {
+          requestedApproval = request;
+          return { approved: true };
+        },
+      },
+    }),
+  });
+  const result = await tools.executeTool({
+    id: "capability-write",
+    name: "write",
+    input: { path: "scoped.txt", content: "scoped\n", overwrite: true },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(requestedApproval.risk, "mutating");
+  assert.deepEqual(requestedApproval.capabilities.requirements, [
+    { capability: "filesystem.read", paths: ["scoped.txt"] },
+    { capability: "filesystem.write", paths: ["scoped.txt"] },
+  ]);
+
+  const registry = new CodingToolRegistry();
+  let executed = false;
+  registry.registerTool({
+    name: "misclassified-write",
+    description: "Static read-only metadata with a write capability.",
+    schema: {},
+    riskLevel: "read-only",
+    executionMode: "sequential",
+    parse: (input) => ({ ok: true, input }),
+    resolveCapabilities: () => ({
+      requirements: [{ capability: "filesystem.write", paths: ["target.txt"] }],
+    }),
+    execute: () => {
+      executed = true;
+      return {};
+    },
+  });
+  const denied = createCodingToolExecutor({
+    workspaceRoot,
+    registry,
+    approvalGate: createToolApprovalGate("read-only"),
+  });
+  const deniedResult = await denied.executeTool({
+    id: "capability-denied",
+    name: "misclassified-write",
+    input: {},
+  });
+  assert.equal(deniedResult.ok, false);
+  assert.equal(deniedResult.error.code, "permission_denied");
+  assert.equal(executed, false);
+}
+
+async function acceptsCapabilityGrantResources() {
+  const registry = new CodingToolRegistry();
+  registry.registerTool({
+    name: "resource-check",
+    description: "Try to consume a resource outside the issued grant.",
+    schema: {},
+    riskLevel: "read-only",
+    executionMode: "parallel",
+    parse: (input) => ({ ok: true, input }),
+    resolveCapabilities: () => ({
+      requirements: [{ capability: "filesystem.read", paths: ["allowed.txt"] }],
+    }),
+    execute: (_input, context) => {
+      assertToolCapability(context, "filesystem.read", "other.txt");
+      return {};
+    },
+  });
+  const executor = await createExecutor(registry);
+  const result = await executor.executeTool({
+    id: "resource-check-call",
+    name: "resource-check",
+    input: {},
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "permission_denied");
+  assert.match(result.error.message, /other\.txt/u);
+}
+
+async function acceptsCapabilityGrantReplayDenial() {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pibot-runtime-grant-replay-"));
+  const sandboxExecutor = createSandboxExecutor({ kind: "host", enabled: true });
+  const registry = new CodingToolRegistry();
+  let capturedGrant;
+  registry.registerTool({
+    name: "capture-grant",
+    description: "Capture a grant so replay can be attempted after the call.",
+    schema: {},
+    riskLevel: "mutating",
+    executionMode: "sequential",
+    parse: (input) => ({ ok: true, input }),
+    resolveCapabilities: () => ({
+      requirements: [
+        { capability: "process.exec", commands: ["printf replayed"] },
+        { capability: "filesystem.read", paths: ["."] },
+      ],
+    }),
+    execute: (_input, context) => {
+      capturedGrant = context.authorization.grant;
+      return {};
+    },
+  });
+  const executor = createCodingToolExecutor({
+    workspaceRoot,
+    registry,
+    sandboxExecutor,
+    approvalGate: createToolApprovalGate("full-access"),
+  });
+  const result = await executor.executeTool({
+    id: "capture-grant-call",
+    name: "capture-grant",
+    input: {},
+  });
+  assert.equal(result.ok, true);
+  assert.throws(
+    () => sandboxExecutor.execute({
+      command: "printf replayed",
+      workspaceRoot,
+      cwd: workspaceRoot,
+      timeoutMs: 1000,
+      maxOutputChars: 1000,
+      authorization: capturedGrant,
+    }),
+    /not active/u,
+  );
+}
+
+async function acceptsCapabilityGrantCommandBinding() {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pibot-runtime-command-bind-"));
+  const registry = new CodingToolRegistry();
+  registry.registerTool({
+    name: "command-swap",
+    description: "Try to execute a command other than the approved one.",
+    schema: {},
+    riskLevel: "mutating",
+    executionMode: "sequential",
+    parse: (input) => ({ ok: true, input }),
+    resolveCapabilities: () => ({
+      requirements: [
+        { capability: "process.exec", commands: ["printf approved"] },
+        { capability: "filesystem.read", paths: ["."] },
+      ],
+    }),
+    execute: (_input, context) => context.sandboxExecutor.execute({
+      command: "printf swapped",
+      workspaceRoot,
+      cwd: workspaceRoot,
+      timeoutMs: 1000,
+      maxOutputChars: 1000,
+      authorization: context.authorization.grant,
+    }),
+  });
+  const executor = createCodingToolExecutor({
+    workspaceRoot,
+    registry,
+    sandboxExecutor: createSandboxExecutor({ kind: "host", enabled: true }),
+    approvalGate: createToolApprovalGate("full-access"),
+  });
+  const result = await executor.executeTool({
+    id: "command-swap-call",
+    name: "command-swap",
+    input: {},
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error.message, /lacks process\.exec for this command/u);
+}
+
+async function acceptsRunScopedApprovalRules() {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pibot-runtime-run-rule-"));
+  const prompts = [];
+  const rules = toolApprovalRulesForRun(createAgentRuntimeState());
+  const gateOptions = {
+    context: {
+      conversation: { teamId: "T-run-rule", channelId: "D-run-rule" },
+      requestedByUserId: "U-run-rule",
+    },
+    rules,
+    prompter: {
+      async requestToolApproval(request) {
+        prompts.push(request);
+        return prompts.length === 1
+          ? { approved: true, scope: "run" }
+          : { approved: false, scope: "run", reason: "deny other path" };
+      },
+    },
+  };
+  const firstExecutor = createCodingToolExecutor({
+    workspaceRoot,
+    approvalGate: createToolApprovalGate("approval-required", gateOptions),
+  });
+  const nextTurnExecutor = createCodingToolExecutor({
+    workspaceRoot,
+    approvalGate: createToolApprovalGate("approval-required", gateOptions),
+  });
+  const first = await firstExecutor.executeTool({
+    id: "run-rule-first",
+    name: "write",
+    input: { path: "same.txt", content: "first", overwrite: true },
+  });
+  const second = await nextTurnExecutor.executeTool({
+    id: "run-rule-second",
+    name: "write",
+    input: { path: "same.txt", content: "second", overwrite: true },
+  });
+  const denied = await nextTurnExecutor.executeTool({
+    id: "run-rule-denied",
+    name: "write",
+    input: { path: "other.txt", content: "other", overwrite: true },
+  });
+  const deniedAgain = await nextTurnExecutor.executeTool({
+    id: "run-rule-denied-again",
+    name: "write",
+    input: { path: "other.txt", content: "other", overwrite: true },
+  });
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(denied.ok, false);
+  assert.equal(deniedAgain.ok, false);
+  assert.equal(prompts.length, 2);
+  assert.deepEqual(prompts[0].escalation.requirements, [
+    { capability: "filesystem.write", paths: ["same.txt"] },
+  ]);
+  assert.equal(prompts[0].runScopeAllowed, true);
+  assert.match(deniedAgain.error.message, /run-scoped approval rule/u);
+}
+
+async function acceptsBashPathScopedApprovalRules() {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pibot-runtime-bash-path-rule-"));
+  await writeFile(join(workspaceRoot, "a.txt"), "a", "utf8");
+  await writeFile(join(workspaceRoot, "b.txt"), "b", "utf8");
+  const prompts = [];
+  const gate = createToolApprovalGate("approval-required", {
+    context: {
+      conversation: { teamId: "T-bash-path", channelId: "D-bash-path" },
+      requestedByUserId: "U-bash-path",
+    },
+    prompter: {
+      async requestToolApproval(request) {
+        prompts.push(request);
+        return { approved: true, scope: "run" };
+      },
+    },
+  });
+  const executor = createCodingToolExecutor({
+    workspaceRoot,
+    sandboxExecutor: {
+      policy: defaultSandboxPolicy,
+      enforcement: {
+        backend: "linux-native",
+        filesystem: "path-scoped",
+        network: "per-call",
+      },
+      assertWorkspaceAccess() {},
+      async execute() {
+        return {
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+          timedOut: false,
+          aborted: false,
+          stdoutTruncated: false,
+          stderrTruncated: false,
+        };
+      },
+    },
+    approvalGate: gate,
+  });
+  const call = (id, scopedPath) => executor.executeTool({
+    id,
+    name: "bash",
+    input: {
+      command: "true",
+      permissions: {
+        filesystem: { read: [scopedPath], write: [] },
+        network: false,
+        externalSideEffect: false,
+        destructive: false,
+      },
+    },
+  });
+
+  assert.equal((await call("bash-path-a-first", "a.txt")).ok, true);
+  assert.equal((await call("bash-path-a-second", "a.txt")).ok, true);
+  assert.equal((await call("bash-path-b", "b.txt")).ok, true);
+  assert.equal(prompts.length, 2);
+  assert.deepEqual(prompts[0].capabilities.requirements, [
+    { capability: "process.exec", commands: ["true"] },
+    { capability: "filesystem.read", paths: ["a.txt"] },
+  ]);
+  assert.deepEqual(prompts[1].capabilities.requirements, [
+    { capability: "process.exec", commands: ["true"] },
+    { capability: "filesystem.read", paths: ["b.txt"] },
+  ]);
+}
+
+async function acceptsDirectFileToolSandboxPolicy() {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pibot-runtime-custom-policy-"));
+  await writeFile(join(workspaceRoot, "ordinary.txt"), "ordinary", "utf8");
+  await writeFile(join(workspaceRoot, "custom-secret.txt"), "secret", "utf8");
+  const customPolicy = {
+    ...defaultSandboxPolicy,
+    version: "sandbox-policy-custom-test",
+    filesystem: {
+      ...defaultSandboxPolicy.filesystem,
+      protectedFileNames: [
+        ...defaultSandboxPolicy.filesystem.protectedFileNames,
+        "custom-secret.txt",
+      ],
+    },
+  };
+  const executor = createCodingToolExecutor({
+    workspaceRoot,
+    approvalGate: createToolApprovalGate("full-access"),
+    sandboxExecutor: {
+      policy: customPolicy,
+      enforcement: {
+        backend: "linux-native",
+        filesystem: "path-scoped",
+        network: "per-call",
+      },
+      assertWorkspaceAccess() {},
+      async execute() {
+        throw new Error("sandbox execution is not expected");
+      },
+    },
+  });
+  const ordinary = await executor.executeTool({
+    id: "custom-policy-ordinary",
+    name: "read",
+    input: { path: "ordinary.txt" },
+  });
+  const protectedResult = await executor.executeTool({
+    id: "custom-policy-protected",
+    name: "read",
+    input: { path: "custom-secret.txt" },
+  });
+
+  assert.equal(ordinary.ok, true);
+  assert.equal(protectedResult.ok, false);
+  assert.match(protectedResult.error.message, /Path is protected/u);
+}
+
+async function acceptsApprovalModeTightening() {
+  const state = createAgentRuntimeState();
+  const registry = new CodingToolRegistry();
+  let executed = false;
+  registry.registerTool({
+    name: "approval-race-write",
+    description: "Wait for approval before writing.",
+    schema: {},
+    riskLevel: "mutating",
+    executionMode: "sequential",
+    parse: (input) => ({ ok: true, input }),
+    resolveCapabilities: () => ({
+      requirements: [{ capability: "filesystem.write", paths: ["race.txt"] }],
+    }),
+    execute: () => {
+      executed = true;
+      return {};
+    },
+  });
+  const executor = createCodingToolExecutor({
+    workspaceRoot: await mkdtemp(join(tmpdir(), "pibot-runtime-approval-race-")),
+    registry,
+    runtime: state,
+    approvalGate: {
+      async reviewToolCall() {
+        enterPlanMode(state);
+        exitPlanMode(state, "Mode changed while approval was pending");
+        return { approved: true };
+      },
+    },
+  });
+  const result = await executor.executeTool({
+    id: "approval-race",
+    name: "approval-race-write",
+    input: {},
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "permission_denied");
+  assert.match(result.error.message, /approval became stale.*AgentMode=plan/u);
+  assert.equal(state.mode, "execute");
+  assert.equal(executed, false);
+}
+
+async function acceptsStaleStepAuthoritySnapshot() {
+  let executed = false;
+  const registry = new CodingToolRegistry();
+  registry.registerTool({
+    name: "snapshot-read",
+    description: "Read under a captured authority snapshot.",
+    schema: {},
+    riskLevel: "read-only",
+    executionMode: "parallel",
+    parse: (input) => ({ ok: true, input }),
+    execute() {
+      executed = true;
+      return {};
+    },
+  });
+  const executor = await createExecutor(registry);
+  const snapshot = executor.captureExecutionSnapshot();
+  const result = await executor.executeTool(
+    { id: "stale-snapshot", name: "snapshot-read", input: {} },
+    undefined,
+    { ...snapshot, authorityVersion: `${snapshot.authorityVersion}:stale` },
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "permission_denied");
+  assert.match(result.error.message, /authority changed/u);
+  assert.equal(executed, false);
 }
 
 async function acceptsExecutionModes() {
@@ -302,6 +843,10 @@ async function acceptsBoundedParallelTools() {
   let maxActive = 0;
   let executed = 0;
   let modelCalls = 0;
+  const transitions = [];
+  const runContext = createAgentRunContext({
+    onTransition: (transition) => transitions.push(transition),
+  });
   const tools = {
     listTools: () => ["read"],
     describeTool: () => ({
@@ -340,17 +885,25 @@ async function acceptsBoundedParallelTools() {
     tools: [{ name: "read", description: "read", inputSchemaJson: "{}" }],
     maxSteps: 2,
     maxParallelToolCalls: 2,
+    runContext,
   });
 
   assert.equal(result.reason, "completed");
   assert.equal(executed, 7);
   assert.equal(maxActive, 2);
+  assert.equal(transitions.filter((item) => item.type === "queue_tool_call").length, 7);
+  assert.equal(transitions.filter((item) => item.type === "dispatch_tool_call").length, 7);
+  assert.equal(transitions.filter((item) => item.type === "complete_tool_call").length, 7);
 }
 
 async function acceptsAbortPairing() {
   const controller = new AbortController();
   const events = [];
   let executions = 0;
+  const transitions = [];
+  const runContext = createAgentRunContext({
+    onTransition: (transition) => transitions.push(transition),
+  });
   const tools = {
     listTools: () => ["read"],
     describeTool: () => ({
@@ -382,6 +935,7 @@ async function acceptsAbortPairing() {
     tools: [{ name: "read", description: "read", inputSchemaJson: "{}" }],
     maxSteps: 2,
     maxParallelToolCalls: 1,
+    runContext,
     onEvent: (event) => events.push(event),
   }, controller.signal);
   const toolMessages = result.messages.filter((message) => message.role === "tool");
@@ -393,6 +947,8 @@ async function acceptsAbortPairing() {
   assert.equal(payloads.filter((payload) => payload.error?.code === "aborted").length, 2);
   assert.equal(events.filter((event) => event.type === "tool_start").length, 1);
   assert.equal(events.filter((event) => event.type === "tool_end").length, 3);
+  assert.equal(transitions.filter((item) => item.type === "queue_tool_call").length, 3);
+  assert.equal(transitions.filter((item) => item.type === "abort_tool_call").length, 2);
 }
 
 async function acceptsAbortAfterModel() {
@@ -504,7 +1060,16 @@ async function acceptsStepContextSnapshot() {
   assert.deepEqual(requests[1].tools.map((tool) => tool.name), ["edit"]);
   assert.equal(stepStarts[0].mode, "execute");
   assert.equal(Object.isFrozen(stepStarts[0]), true);
+  assert.equal(Object.isFrozen(stepStarts[0].snapshot), true);
+  assert.equal(Object.isFrozen(stepStarts[0].snapshot.worldState), true);
   assert.deepEqual(toolContexts[0].advertisedTools, ["edit"]);
+  assert.equal(
+    toolContexts[0].snapshot.worldState,
+    stepStarts[0].snapshot.worldState,
+  );
+  assert.deepEqual(toolContexts[0].snapshot.execution.availableTools, ["edit"]);
+  assert.equal(stepStarts[0].snapshot.runtime.mode, "execute");
+  assert.equal(stepStarts[0].snapshot.execution.runtimeStateVersion, 0);
   assert.equal(toolContexts[0].stateVersion < state.version, true);
   assert.equal(denied.error.code, "permission_denied");
 }
@@ -595,6 +1160,13 @@ async function acceptsControlMailboxes() {
     userTurnId: context.userTurnId,
     text: "e",
   }).reason, "next_turn_queue_full");
+  assert.equal(queue.enqueue("runtime-reserved", {
+    id: "turn-runtime",
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "e",
+    source: "runtime",
+  }, { reserveCapacity: true }).position, 3);
   assert.equal(queue.dequeue().payload, "first");
   queue.close("run_completed", "expired");
   assert.equal(queue.size, 0);
@@ -617,6 +1189,12 @@ async function acceptsControlMailboxes() {
     userTurnId: context.userTurnId,
     text: "二",
   }).reason, "next_turn_queue_bytes_exceeded");
+  assert.equal(byteQueue.enqueue("runtime-too-large", {
+    runId: context.runId,
+    userTurnId: context.userTurnId,
+    text: "二",
+    source: "runtime",
+  }, { reserveCapacity: true }).reason, "next_turn_queue_bytes_exceeded");
 }
 
 async function acceptsRunController() {
@@ -756,6 +1334,66 @@ async function acceptsRunController() {
   assert.equal(cancelled.cancelled, true);
   assert.equal(cancelled.queuedFollowUps, 0);
   assert.equal(cancelled.transitions.at(-1).type, "cancel_requested");
+}
+
+async function acceptsDeferredRunCompletion() {
+  const controller = new AgentRunController({
+    runContext: createAgentRunContext(),
+    maxFollowUps: 2,
+  });
+  const originalRunId = controller.runId;
+  const hold = controller.deferRunCompletion("task_graph:v1:digest");
+  assert.notEqual(hold, undefined);
+  assert.equal(controller.pendingCompletionHolds, 1);
+  const turns = [];
+  let firstTurnCompleted;
+  const firstTurnTerminal = new Promise((resolve) => {
+    firstTurnCompleted = resolve;
+  });
+  const running = controller.runUserTurns({
+    initial: "initial",
+    async execute(input, context) {
+      turns.push({ input, userTurnId: context.userTurnId });
+      const result = await controller.run({
+        execute: async () => ({
+          reason: "completed",
+          messages: [],
+          steps: 1,
+        }),
+      });
+      if (input === "initial") firstTurnCompleted();
+      return result;
+    },
+  });
+  await firstTurnTerminal;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controller.awaitingFollowUp, true);
+  assert.equal(controller.transitions.some((event) =>
+    event.type === "complete_run"), false);
+
+  const receipt = controller.enqueueFollowUp("task graph completed", {
+    source: "runtime",
+  });
+  assert.equal(receipt.accepted, true);
+  hold.release();
+  hold.release();
+  const result = await running;
+
+  assert.equal(result.reason, "completed");
+  assert.equal(controller.runId, originalRunId);
+  assert.equal(controller.pendingCompletionHolds, 0);
+  assert.equal(controller.awaitingFollowUp, false);
+  assert.deepEqual(turns.map((turn) => turn.input), [
+    "initial",
+    "task graph completed",
+  ]);
+  assert.equal(new Set(turns.map((turn) => turn.userTurnId)).size, 2);
+  assert.equal(controller.transitions.filter((event) =>
+    event.type === "defer_run_completion").length, 1);
+  assert.equal(controller.transitions.filter((event) =>
+    event.type === "release_run_completion").length, 1);
+  assert.equal(controller.transitions.filter((event) =>
+    event.type === "start_followup_turn").length, 1);
 }
 
 async function acceptsCancellationRace() {
@@ -1021,6 +1659,42 @@ async function acceptsToolHookFailurePairing() {
   assert.equal(metadataFailure[0].callId, "metadata-call");
   assert.equal(metadataFailure[0].ok, false);
   assert.match(metadataFailure[0].error.message, /metadata unavailable/u);
+}
+
+async function acceptsAgentRuntimeOwnership() {
+  const runtime = new AgentRuntime();
+  const context = createAgentRunContext();
+  const controller = runtime.createRun({
+    scope: "web:conversation-1",
+    runContext: context,
+    maxFollowUps: 2,
+  });
+
+  assert.equal(runtime.activeRuns().length, 1);
+  assert.equal(runtime.runForScope("web:conversation-1"), controller);
+  assert.equal(runtime.steer(context.runId, "next-step correction").accepted, true);
+  assert.throws(
+    () => runtime.createRun({
+      scope: "web:conversation-1",
+      runContext: createAgentRunContext(),
+      maxFollowUps: 0,
+    }),
+    /already has an active Run/u,
+  );
+
+  const result = await runtime.runUserTurns(controller, {
+    initial: "initial",
+    async execute(value) {
+      return value;
+    },
+  });
+  assert.equal(result, "initial");
+  assert.equal(runtime.activeRuns().length, 0);
+  assert.equal(runtime.runForScope("web:conversation-1"), undefined);
+  assert.equal(
+    controller.transitions.some((transition) => transition.type === "complete_run"),
+    true,
+  );
 }
 
 async function acceptsSteeringTransition() {
@@ -1402,6 +2076,13 @@ async function acceptsTraceReplay() {
   assert.equal(modelCompleted.authorityDegraded, false);
   assert.equal(modelCompleted.usage.totalTokens, 13);
   assert.equal(modelCompleted.cost, 0.01);
+  const approvalDecided = records.find(
+    (record) => record.type === "approval.decided",
+  );
+  assert.deepEqual(approvalDecided.capabilities.requirements, [
+    { capability: "filesystem.read", paths: ["trace.txt"] },
+    { capability: "filesystem.write", paths: ["trace.txt"] },
+  ]);
 }
 
 async function createExecutor(registry, requestedWorkspaceRoot) {

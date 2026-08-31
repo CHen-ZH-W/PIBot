@@ -24,6 +24,12 @@ export const lspTool: CodingToolDefinition<"lsp", LspToolInput, unknown> = {
   name: "lsp",
   riskLevel: "read-only",
   executionMode: "parallel",
+  resolveCapabilities: (input) => ({
+    requirements: [{
+      capability: "filesystem.read",
+      paths: [input.path ?? "."],
+    }],
+  }),
   description:
     "Use TypeScript language-service features for definition lookup, reference search, and diagnostics in the workspace.",
   schema: {
@@ -135,6 +141,7 @@ async function diagnostics(
       ? service.getProgram()?.getRootFileNames() ?? []
       : [(await resolveWorkspacePath(context.workspaceRoot, input.path, {
           access: "read",
+          policy: context.sandboxExecutor.policy,
         }))];
   const max = maxResults(input);
   const output = [];
@@ -178,6 +185,7 @@ async function sourcePosition(
   }
   const fileName = await resolveWorkspacePath(context.workspaceRoot, input.path, {
     access: "read",
+    policy: context.sandboxExecutor.policy,
   });
   const source = ts.createSourceFile(
     fileName,

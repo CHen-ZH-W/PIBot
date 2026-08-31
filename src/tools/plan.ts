@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, relative } from "node:path";
 import type { ToolError } from "../core/tools";
 import {
   enterPlanMode,
@@ -10,7 +11,7 @@ import {
   assertContentSize,
   resolveWorkspacePath,
 } from "../workspace/path-boundary";
-import type { NewPlanTask } from "../workspace/tasks";
+import type { NewPlanTask, TaskExecutionSpec } from "../workspace/tasks";
 import type { CodingToolDefinition, ToolInputParseResult, ToolRunContext } from "./index";
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
@@ -37,6 +38,12 @@ export const enterPlanModeTool: CodingToolDefinition<
   name: "enter_plan_mode",
   riskLevel: "read-only",
   executionMode: "sequential",
+  resolveCapabilities: () => ({
+    requirements: [{
+      capability: "runtime.control",
+      resources: ["agent-mode:plan"],
+    }],
+  }),
   description:
     "Switch the current run into Plan Mode before making changes. Plan Mode permits read-only exploration plus plan/task control tools.",
   schema: {
@@ -92,6 +99,18 @@ export const updatePlanTool: CodingToolDefinition<
   name: "update_plan",
   riskLevel: "mutating",
   executionMode: "sequential",
+  resolveCapabilities: (_input, context) => ({
+    requirements: [
+      {
+        capability: "filesystem.write",
+        paths: [
+          context.runtime?.plan.planPath ?? "PLAN.md",
+          taskStoreCapabilityPath(context),
+        ],
+      },
+      { capability: "runtime.control", resources: ["plan", "tasks"] },
+    ],
+  }),
   description:
     "Save or replace the workspace PLAN.md during Plan Mode. Optionally writes the structured tasks.json task list for Plan-and-Execute.",
   schema: {
@@ -117,10 +136,7 @@ export const updatePlanTool: CodingToolDefinition<
               type: "array",
               items: { type: "string" },
             },
-            status: {
-              type: "string",
-              enum: ["pending", "in_progress", "completed", "failed", "blocked"],
-            },
+            execution: taskExecutionSchema(),
           },
           required: ["id", "title"],
         },
@@ -160,6 +176,9 @@ export const updatePlanTool: CodingToolDefinition<
         : {
             tasksPath: context.tasks?.filePath,
             taskCount: tasks.tasks.length,
+            graphVersion: tasks.graphVersion,
+            graphState: tasks.graphState,
+            tasksDigest: tasks.tasksDigest,
           }),
     };
   },
@@ -173,6 +192,23 @@ export const exitPlanModeTool: CodingToolDefinition<
   name: "exit_plan_mode",
   riskLevel: "mutating",
   executionMode: "sequential",
+  resolveCapabilities: (_input, context) => ({
+    requirements: [
+      {
+        capability: "filesystem.read",
+        paths: [
+          context.runtime?.plan.planPath ?? "PLAN.md",
+          taskStoreCapabilityPath(context),
+        ],
+      },
+      { capability: "process.exec", commands: ["child-agent"] },
+      {
+        capability: "runtime.control",
+        resources: ["agent-mode:plan", "task-graph:scheduler"],
+      },
+      { capability: "external.side_effect", resources: ["child-agent-runtime"] },
+    ],
+  }),
   description:
     "Request user approval to leave Plan Mode. Execution can continue only after the saved PLAN.md is approved.",
   schema: {
@@ -206,6 +242,8 @@ export const exitPlanModeTool: CodingToolDefinition<
       context,
       runtime.plan.planPath,
     );
+    const taskStore = requireTaskStore(context);
+    const graph = await taskStore.inspectGraph();
     const approval = runtime.plan.approval;
     if (approval === undefined) {
       throw toolError(
@@ -219,6 +257,13 @@ export const exitPlanModeTool: CodingToolDefinition<
         planPath: runtime.plan.planPath,
         ...optionalString("summary", input.summary),
         ...optionalString("planMarkdown", planMarkdown),
+        taskGraph: {
+          path: taskStore.filePath,
+          graphVersion: graph.graphVersion,
+          tasksDigest: graph.tasksDigest,
+          taskCount: graph.taskCount,
+          writeTaskCount: graph.writeTaskCount,
+        },
       },
       signal,
     );
@@ -229,12 +274,23 @@ export const exitPlanModeTool: CodingToolDefinition<
       );
     }
 
+    const frozen = await taskStore.freezeGraph({
+      planDigest: fingerprintText(planMarkdown ?? ""),
+      expectedTasksDigest: graph.tasksDigest,
+    });
     exitPlanMode(runtime, input.summary);
+    const scheduler = context.taskScheduler;
+    const scheduling = scheduler === undefined || frozen.tasks.length === 0
+      ? undefined
+      : await scheduler.startFrozenGraph(frozen);
     return {
       mode: runtime.mode,
       approved: true,
       approvedAt: runtime.plan.approvedAt,
       planPath: runtime.plan.planPath,
+      graphVersion: frozen.graphVersion,
+      tasksDigest: frozen.tasksDigest,
+      ...(scheduling === undefined ? {} : { scheduling }),
     };
   },
 };
@@ -271,6 +327,7 @@ async function writePlanMarkdown(
   const filePath = await resolveWorkspacePath(context.workspaceRoot, planPath, {
     access: "mutate",
     allowMissing: true,
+    policy: context.sandboxExecutor.policy,
   });
   await mkdir(dirname(filePath), { recursive: true });
   await writeFile(filePath, content, "utf8");
@@ -284,6 +341,7 @@ async function readPlanMarkdown(
   try {
     const filePath = await resolveWorkspacePath(context.workspaceRoot, planPath, {
       access: "read",
+      policy: context.sandboxExecutor.policy,
     });
     return await readFile(filePath, "utf8");
   } catch (error: unknown) {
@@ -328,29 +386,86 @@ function readOptionalTasks(
     if (id === undefined || title === undefined) {
       return null;
     }
-    const status = readString(item, "status");
     tasks.push({
       id,
       title,
       ...optionalString("description", readString(item, "description")),
       dependencies: readStringArray(item, "dependencies"),
-      ...(isTaskStatus(status) ? { status } : {}),
+      ...optionalExecution("execution", readTaskExecution(item, "execution")),
     });
   }
   return tasks;
 }
 
-function isTaskStatus(status: string | undefined): status is NonNullable<NewPlanTask["status"]> {
-  return status === "pending" ||
-    status === "in_progress" ||
-    status === "completed" ||
-    status === "failed" ||
-    status === "blocked";
+function fingerprintText(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function taskExecutionSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      kind: { type: "string", enum: ["child_agent"] },
+      role: {
+        type: "string",
+        enum: ["explore", "review", "test", "implement"],
+      },
+      readOnly: { type: "boolean" },
+      timeoutMs: { type: "integer", minimum: 1 },
+      maxToolCalls: { type: "integer", minimum: 1 },
+      maxTokens: { type: "integer", minimum: 1 },
+    },
+  };
+}
+
+function readTaskExecution(
+  record: UnknownRecord,
+  key: string,
+): Partial<TaskExecutionSpec> | undefined {
+  const value = record[key];
+  if (!isRecord(value)) return undefined;
+  const role = readString(value, "role");
+  return {
+    ...(value.kind === "child_agent" ? { kind: value.kind } : {}),
+    ...(role === "explore" || role === "review" || role === "test" ||
+        role === "implement" ? { role } : {}),
+    ...(typeof value.readOnly === "boolean" ? { readOnly: value.readOnly } : {}),
+    ...optionalNumber("timeoutMs", readPositiveInteger(value, "timeoutMs")),
+    ...optionalNumber(
+      "maxToolCalls",
+      readPositiveInteger(value, "maxToolCalls"),
+    ),
+    ...optionalNumber("maxTokens", readPositiveInteger(value, "maxTokens")),
+  };
+}
+
+function readPositiveInteger(record: UnknownRecord, key: string): number | undefined {
+  const value = record[key];
+  return typeof value === "number" && Number.isInteger(value) && value >= 1
+    ? value
+    : undefined;
+}
+
+function optionalExecution<Key extends string>(
+  key: Key,
+  value: Partial<TaskExecutionSpec> | undefined,
+): { readonly [Property in Key]: Partial<TaskExecutionSpec> } | object {
+  return value === undefined ? {} : { [key]: value } as {
+    readonly [Property in Key]: Partial<TaskExecutionSpec>;
+  };
 }
 
 function readString(record: UnknownRecord, key: string): string | undefined {
   const value = record[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function taskStoreCapabilityPath(context: ToolRunContext): string {
+  const filePath = context.tasks?.filePath;
+  if (filePath === undefined) return "tasks.json";
+  const localPath = relative(context.workspaceRoot, filePath).replace(/\\/gu, "/");
+  return localPath.length === 0 ? "tasks.json" : localPath;
 }
 
 function readStringArray(record: UnknownRecord, key: string): readonly string[] {
@@ -370,6 +485,15 @@ function optionalString<Key extends string>(
 ): { readonly [Property in Key]: string } | object {
   return value === undefined ? {} : { [key]: value } as {
     readonly [Property in Key]: string;
+  };
+}
+
+function optionalNumber<Key extends string>(
+  key: Key,
+  value: number | undefined,
+): { readonly [Property in Key]: number } | object {
+  return value === undefined ? {} : { [key]: value } as {
+    readonly [Property in Key]: number;
   };
 }
 

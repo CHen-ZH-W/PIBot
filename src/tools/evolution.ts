@@ -20,8 +20,16 @@ export const createEvolutionTaskTool: CodingToolDefinition<
   unknown
 > = {
   name: "create_evolution_task",
+  // Kept visible in restricted modes; call-time resource policy separately
+  // grants only reviewable ticket submission, not evolution implementation.
   riskLevel: "read-only",
   executionMode: "sequential",
+  resolveCapabilities: () => ({
+    requirements: [{
+      capability: "runtime.control",
+      resources: ["self-evolution:ticket"],
+    }],
+  }),
   description:
     "Create a self-evolution ticket when the user proposes improving pibot itself. This files a reviewable task in the self-evolution lane; runtime_code tickets can later be approved, implemented in an isolated pibot checkout, validated, and published. Do not use this as a substitute for directly editing ordinary user workspace code.",
   schema: {

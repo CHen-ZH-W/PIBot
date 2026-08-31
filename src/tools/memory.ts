@@ -15,8 +15,14 @@ export const memoryReadTool: CodingToolDefinition<
   name: "memory_read",
   riskLevel: "read-only",
   executionMode: "parallel",
+  resolveCapabilities: (input) => ({
+    requirements: [{
+      capability: "runtime.read",
+      resources: [`memory:${input.document}:${input.topic ?? "*"}`],
+    }],
+  }),
   description:
-    "Read controlled persistent memory. Memory is a single Codex-like global store; use document=summary for the compact memory_summary.md, document=index for the MEMORY.md registry, document=topic for durable reusable knowledge, document=rollout_summary for completed task summaries, document=extension_note for pending memory updates, document=instructions for user-managed instructions, or document=audit for the mutation audit log.",
+    "Read controlled persistent memory. Memory is a single Codex-like global store; use document=summary for the compact memory_summary.md, document=index for the MEMORY.md registry, document=topic for accepted reusable knowledge, document=rollout_summary for completed task recaps, document=extension_note for staged candidates, document=instructions for user-managed instructions, document=audit for mutation/curation decisions, or document=usage for retrieval and evidence-gated outcome feedback.",
   schema: memoryReadSchema(),
   parse: parseMemoryReadInput,
   async execute(input, context) {
@@ -33,6 +39,12 @@ export const memoryWriteTool: CodingToolDefinition<
   name: "memory_write",
   riskLevel: "mutating",
   executionMode: "sequential",
+  resolveCapabilities: (input) => ({
+    requirements: [{
+      capability: "runtime.control",
+      resources: [`memory:${input.document}:${input.topic ?? "*"}`],
+    }],
+  }),
   description:
     "Write controlled persistent memory with an audit reason. Memory is global and Codex-like; express applicability in the content instead of creating per-channel memory. Use summary/index for compact runtime routing, topic for durable reusable knowledge, rollout_summary for completed task recaps, and extension_note for candidate memory updates that need later curation. Summarize reusable triggers and guidance instead of raw transcripts. User-managed instructions cannot be modified with this tool.",
   schema: {
@@ -71,6 +83,13 @@ export const memoryDeleteTool: CodingToolDefinition<
   name: "memory_delete",
   riskLevel: "mutating",
   executionMode: "sequential",
+  resolveCapabilities: (input) => ({
+    requirements: [{
+      capability: "runtime.control",
+      resources: [`memory:${input.document}:${input.topic ?? "*"}`],
+    }],
+    effects: { destructive: true },
+  }),
   description:
     "Delete a controlled MEMORY.md index or detailed memory topic with an audit reason. The append-only audit log remains available through memory_read.",
   schema: {
@@ -113,6 +132,7 @@ function memoryReadSchema(): Readonly<Record<string, unknown>> {
           "rollout_summary",
           "extension_note",
           "audit",
+          "usage",
         ],
         description: "Memory document to read.",
       },
@@ -236,11 +256,14 @@ function parseMemoryRef(
     document === "rollout_summary" ||
     document === "extension_note";
   const readableDocument =
-    writableDocument || document === "instructions" || document === "audit";
+    writableDocument ||
+    document === "instructions" ||
+    document === "audit" ||
+    document === "usage";
   if (!readableDocument || (!readable && !writableDocument)) {
     return invalidInput(
       readable
-        ? "memory_read.document must be instructions, summary, index, topic, rollout_summary, extension_note, or audit"
+        ? "memory_read.document must be instructions, summary, index, topic, rollout_summary, extension_note, audit, or usage"
         : "memory mutation document must be summary, index, topic, rollout_summary, or extension_note",
     );
   }

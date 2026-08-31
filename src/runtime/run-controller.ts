@@ -61,6 +61,11 @@ export interface AgentUserTurnDriverOptions<FollowUp, Result> {
   ) => Promise<void> | void;
 }
 
+export interface AgentRunCompletionHold {
+  readonly reason: string;
+  release(): void;
+}
+
 type UserTurnTerminalTransition = Extract<RuntimeTransition, {
   readonly type:
     | "complete_user_turn"
@@ -91,6 +96,8 @@ export class AgentRunController<FollowUp> {
       }>
     | undefined;
   private transitionWork: Promise<void> = Promise.resolve();
+  private readonly completionHolds = new Map<symbol, string>();
+  private runDecisionSignal = createRunDecisionSignal();
 
   constructor(private readonly options: AgentRunControllerOptions<FollowUp>) {
     if (!Number.isInteger(options.maxFollowUps) || options.maxFollowUps < 0) {
@@ -141,6 +148,17 @@ export class AgentRunController<FollowUp> {
     return this.nextTurnQueue.size;
   }
 
+  get pendingCompletionHolds(): number {
+    return this.completionHolds.size;
+  }
+
+  get awaitingFollowUp(): boolean {
+    return this.runTerminal === undefined &&
+      !this.cancelled &&
+      this.completionHolds.size > 0 &&
+      this.terminalUserTurns.has(this.currentRunContext.userTurnId);
+  }
+
   get transitions(): readonly RuntimeTransition[] {
     return [...this.transitionHistory];
   }
@@ -178,13 +196,54 @@ export class AgentRunController<FollowUp> {
     options: {
       readonly text?: string;
       readonly source?: RuntimeControlSource;
+      readonly reserveCapacity?: boolean;
     } = {},
   ): RuntimeControlReceipt<"follow_up"> {
-    return this.nextTurnQueue.enqueue(followUp, {
+    const receipt = this.nextTurnQueue.enqueue(followUp, {
       runId: this.currentRunContext.runId,
       userTurnId: this.currentRunContext.userTurnId,
       text: options.text ?? describeFollowUp(followUp),
       source: options.source ?? "runtime",
+    }, {
+      reserveCapacity: options.reserveCapacity === true,
+    });
+    if (receipt.accepted) {
+      this.wakeRunDecision();
+    }
+    return receipt;
+  }
+
+  /** Keeps a successful Run open while a runtime-owned async source may enqueue a follow-up. */
+  deferRunCompletion(reason: string): AgentRunCompletionHold | undefined {
+    const normalizedReason = reason.trim();
+    if (
+      normalizedReason.length === 0 ||
+      this.cancelled ||
+      this.runTerminal !== undefined
+    ) {
+      return undefined;
+    }
+    const id = Symbol(normalizedReason);
+    this.completionHolds.set(id, normalizedReason);
+    this.recordTransition({
+      type: "defer_run_completion",
+      reason: normalizedReason,
+      holds: this.completionHolds.size,
+    });
+    let released = false;
+    return Object.freeze({
+      reason: normalizedReason,
+      release: () => {
+        if (released) return;
+        released = true;
+        if (!this.completionHolds.delete(id)) return;
+        this.recordTransition({
+          type: "release_run_completion",
+          reason: normalizedReason,
+          holds: this.completionHolds.size,
+        });
+        this.wakeRunDecision();
+      },
     });
   }
 
@@ -194,6 +253,7 @@ export class AgentRunController<FollowUp> {
     options: {
       readonly text?: string;
       readonly source?: RuntimeControlSource;
+      readonly reserveCapacity?: boolean;
     } = {},
   ): number | undefined {
     if (this.cancelled) {
@@ -224,11 +284,22 @@ export class AgentRunController<FollowUp> {
         this.currentRunContext.nextStepInbox.closeUserTurn(
           this.currentRunContext.userTurnId,
         );
-        const runDecision = decideAfterUserTurn({
+        let runDecision = decideAfterUserTurn({
           cancelled: this.cancelled,
           hasQueuedFollowUp: this.nextTurnQueue.size > 0,
           ...optionalUserTurnError(this.lastUserTurnTerminal),
         });
+        if (
+          runDecision.type === "complete_run" &&
+          this.completionHolds.size > 0
+        ) {
+          await this.waitForRunDecisionOpportunity();
+          runDecision = decideAfterUserTurn({
+            cancelled: this.cancelled,
+            hasQueuedFollowUp: this.nextTurnQueue.size > 0,
+            ...optionalUserTurnError(this.lastUserTurnTerminal),
+          });
+        }
         if (runDecision.type === "abort_run") {
           this.recordRunTerminal({
             type: "abort_run",
@@ -416,6 +487,7 @@ export class AgentRunController<FollowUp> {
     const cancellation = this.cancellationState.request(input);
     this.currentRunContext.nextStepInbox.close("run_cancelled");
     this.nextTurnQueue.close("run_cancelled");
+    this.wakeRunDecision();
     this.recordTransition({ type: "cancel_requested", cancellation });
     return { accepted: true, cancellation };
   }
@@ -470,7 +542,33 @@ export class AgentRunController<FollowUp> {
       reason,
       transition.type === "abort_run" ? "cancelled" : "expired",
     );
+    this.completionHolds.clear();
+    this.wakeRunDecision();
     this.recordTransition(transition);
+  }
+
+  private async waitForRunDecisionOpportunity(): Promise<void> {
+    while (
+      !this.cancelled &&
+      this.nextTurnQueue.size === 0 &&
+      this.completionHolds.size > 0
+    ) {
+      const signal = this.runDecisionSignal.promise;
+      if (
+        this.cancelled ||
+        this.nextTurnQueue.size > 0 ||
+        this.completionHolds.size === 0
+      ) {
+        continue;
+      }
+      await signal;
+    }
+  }
+
+  private wakeRunDecision(): void {
+    const current = this.runDecisionSignal;
+    this.runDecisionSignal = createRunDecisionSignal();
+    current.resolve();
   }
 
   private recordUserTurnTerminal(
@@ -574,4 +672,15 @@ function optionalUserTurnError(
   return transition?.type === "fail_user_turn"
     ? { error: transition.error }
     : {};
+}
+
+function createRunDecisionSignal(): {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+} {
+  let resolve = () => {};
+  const promise = new Promise<void>((accept) => {
+    resolve = accept;
+  });
+  return { promise, resolve };
 }

@@ -6,6 +6,7 @@ import type {
   LlmToolSchema,
 } from "../core/agent";
 import type { SlackEventId } from "../core/ids";
+import type { ToolResult } from "../core/tools";
 import { repairToolCallMessageOrder } from "../core/llm-history";
 import type { RuntimeHook, RuntimeModelCallHookContext } from "../runtime/hooks";
 import {
@@ -13,6 +14,10 @@ import {
   type MicrocompactPolicyOptions,
   type MicrocompactResult,
 } from "./microcompact";
+import {
+  ToolResultPruner,
+  type ToolResultPrunerOptions,
+} from "./tool-result-pruner";
 
 const CONTEXT_LANE_PREFIX = "[pibot-context:";
 const AUTHORITY_MARKER_PREFIX = "[pibot-context-authority:";
@@ -68,6 +73,7 @@ export interface ContextLane {
 
 export interface ContextManagerOptions {
   readonly microcompact?: MicrocompactPolicyOptions;
+  readonly toolResultAdmission?: ToolResultPrunerOptions;
 }
 
 export interface ContextHistorySurfaceRequest {
@@ -114,7 +120,16 @@ export interface ModelRequestBudget extends ModelRequestTokenEstimate {
  * remain separate policies and can be added without changing the durable log.
  */
 export class ContextManager {
-  constructor(private readonly options: ContextManagerOptions = {}) {}
+  private readonly toolResultPruner: ToolResultPruner;
+
+  constructor(private readonly options: ContextManagerOptions = {}) {
+    this.toolResultPruner = new ToolResultPruner(options.toolResultAdmission);
+  }
+
+  /** Final model-context admission, after the complete executor result is archived. */
+  admitToolResult(result: ToolResult): ToolResult {
+    return this.toolResultPruner.prune(result);
+  }
 
   selectActiveItems<Item extends DurableContextItem>(
     entries: readonly Item[],
@@ -243,7 +258,7 @@ export class ContextManager {
     if (lane.placement === "dynamic_tail") {
       return {
         ...request,
-        messages: [...messages, laneMessage],
+        messages: insertDynamicTail(messages, laneMessage),
       };
     }
     if (lane.placement === "before_current_user") {
@@ -272,10 +287,16 @@ export class ContextManager {
     const beforeCurrentUserLanes = request.messages.filter(
       isBeforeCurrentUserLaneMessage,
     );
-    const dynamicLanes = dynamicTailMessages(request.messages);
-    let messages = [...stablePrefix, ...history, ...dynamicLanes];
+    const dynamicLanes = dynamicTailLaneMessages(request.messages);
+    const steeringTail = steeringTailMessages(request.messages).filter(
+      (message) => !history.some((item) => sameMessage(item, message)),
+    );
+    let messages = [...stablePrefix, ...history, ...steeringTail];
     for (const lane of beforeCurrentUserLanes) {
       messages = insertBeforeCurrentUser(messages, lane);
+    }
+    for (const lane of dynamicLanes) {
+      messages = insertDynamicTail(messages, lane);
     }
     return {
       ...request,
@@ -510,7 +531,7 @@ function insertBeforeCurrentUser(
   }
   const boundary = currentUserIndex >= 0
     ? currentUserIndex
-    : dynamicTailStartIndex(messages);
+    : firstDynamicTailLaneIndex(messages);
   return [
     ...messages.slice(0, boundary),
     lane,
@@ -527,18 +548,62 @@ function isDynamicTailMessage(message: LlmMessage): boolean {
   );
 }
 
-function dynamicTailMessages(
+function dynamicTailLaneMessages(
   messages: readonly LlmMessage[],
 ): readonly LlmMessage[] {
-  return messages.slice(dynamicTailStartIndex(messages));
+  return messages.filter(
+    (message) => message.contextLane?.placement === "dynamic_tail",
+  );
 }
 
-function dynamicTailStartIndex(messages: readonly LlmMessage[]): number {
-  let startIndex = messages.length;
-  while (startIndex > 0 && isDynamicTailMessage(messages[startIndex - 1]!)) {
-    startIndex -= 1;
+function firstDynamicTailLaneIndex(messages: readonly LlmMessage[]): number {
+  const index = messages.findIndex(
+    (message) => message.contextLane?.placement === "dynamic_tail",
+  );
+  return index < 0 ? messages.length : index;
+}
+
+function steeringTailMessages(
+  messages: readonly LlmMessage[],
+): readonly LlmMessage[] {
+  return messages.filter(
+    (message) =>
+      message.role === "user" &&
+      typeof message.content === "string" &&
+      message.content.startsWith(STEERING_MESSAGE_PREFIX),
+  );
+}
+
+function insertDynamicTail(
+  messages: readonly LlmMessage[],
+  lane: LlmMessage,
+): LlmMessage[] {
+  let lastNonLaneIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (!isModelContextLaneMessage(messages[index]!)) {
+      lastNonLaneIndex = index;
+      break;
+    }
   }
-  return startIndex;
+  if (
+    lastNonLaneIndex >= 0 &&
+    messages[lastNonLaneIndex]?.role === "user"
+  ) {
+    return [
+      ...messages.slice(0, lastNonLaneIndex),
+      lane,
+      ...messages.slice(lastNonLaneIndex),
+    ];
+  }
+  return [...messages, lane];
+}
+
+function sameMessage(left: LlmMessage, right: LlmMessage): boolean {
+  return left === right || (
+    left.role === right.role &&
+    left.content === right.content &&
+    left.toolCallId === right.toolCallId
+  );
 }
 
 function stablePrefixBoundary(messages: readonly LlmMessage[]): number {

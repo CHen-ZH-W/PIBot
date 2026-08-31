@@ -12,13 +12,19 @@ import {
   assertFileSize,
   resolveWorkspacePath,
 } from "../workspace/path-boundary";
-import type { CodingToolDefinition } from "./index";
+import { assertToolCapability, type CodingToolDefinition } from "./index";
 import { parseEditInput } from "./parsers";
 
 export const editTool: CodingToolDefinition<"edit", EditToolInput, FileMutationOutput> = {
   name: "edit",
   riskLevel: "mutating",
   executionMode: "sequential",
+  resolveCapabilities: (input) => ({
+    requirements: [
+      { capability: "filesystem.read", paths: [input.path] },
+      { capability: "filesystem.write", paths: [input.path] },
+    ],
+  }),
   parse: parseEditInput,
   concurrencyKey: (input) => `file:${input.path}`,
   description:
@@ -58,8 +64,11 @@ export const editTool: CodingToolDefinition<"edit", EditToolInput, FileMutationO
     required: ["path", "replacements"],
   },
   async execute(input, context) {
+    assertToolCapability(context, "filesystem.read", input.path);
+    assertToolCapability(context, "filesystem.write", input.path);
     const filePath = await resolveWorkspacePath(context.workspaceRoot, input.path, {
       access: "mutate",
+      policy: context.sandboxExecutor.policy,
     });
     await assertFileSize(filePath, context.maxFileBytes, "edit file");
     const before = await readFile(filePath, "utf8");
@@ -75,6 +84,7 @@ export const editTool: CodingToolDefinition<"edit", EditToolInput, FileMutationO
     assertContentSize(editResult.content, context.maxFileBytes, "edited content");
     await resolveWorkspacePath(context.workspaceRoot, input.path, {
       access: "mutate",
+      policy: context.sandboxExecutor.policy,
     });
     await writeFile(filePath, editResult.content, "utf8");
 

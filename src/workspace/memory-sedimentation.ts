@@ -21,13 +21,19 @@ export interface RunRolloutSummaryRequest {
   readonly createdAt?: Date;
 }
 
+export interface RecordedRunRolloutSummary {
+  readonly topic: string;
+  readonly content: string;
+  readonly mutation: MemoryMutationResult;
+}
+
 export async function recordRunRolloutSummary(
   store: ChannelWorkspaceStore,
   request: RunRolloutSummaryRequest,
-): Promise<MemoryMutationResult | undefined> {
+): Promise<RecordedRunRolloutSummary> {
   const topic = rolloutSummaryTopic(request.createdAt ?? new Date(), request.runId);
   const content = formatRunRolloutSummary(request);
-  return store.writeMemoryDocument(request.key, {
+  const mutation = await store.writeMemoryDocument(request.key, {
     scope: "global",
     document: "rollout_summary",
     topic,
@@ -35,6 +41,7 @@ export async function recordRunRolloutSummary(
     reason: "Automatically record a completed agent run summary",
     source: request.source,
   });
+  return { topic, content, mutation };
 }
 
 function rolloutSummaryTopic(createdAt: Date, runId: AgentRunId): string {

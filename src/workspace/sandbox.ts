@@ -3,9 +3,24 @@ import {
   type ChildProcess,
   type SpawnOptions,
 } from "node:child_process";
+import { realpathSync, statSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  grantAllowsCapability,
+  validateToolCapabilityGrant,
+  type ToolCapabilityGrant,
+} from "../core/capabilities";
+import {
+  defaultSandboxPolicy,
+  sandboxPolicyWithResourceLimits,
+  sandboxProtectedNames,
+  type SandboxPolicy,
+} from "./sandbox-policy";
+import { isProtectedWorkspacePath } from "./path-boundary";
+
+const maxScopedFilesystemPaths = 128;
 
 export interface SandboxCommandRequest {
   readonly command: string;
@@ -13,6 +28,8 @@ export interface SandboxCommandRequest {
   readonly cwd: string;
   readonly timeoutMs: number;
   readonly maxOutputChars: number;
+  /** One-shot grant consumed by capability-aware executors. */
+  readonly authorization: ToolCapabilityGrant;
 }
 
 export interface SandboxCommandOutput {
@@ -30,6 +47,8 @@ export interface SandboxCommandOutput {
  * 不应承担：决定 agent 是否应该调用命令、解释命令输出、读写文件工具的路径规则。
  */
 export interface SandboxExecutor {
+  readonly policy: SandboxPolicy;
+  readonly enforcement: SandboxBackendEnforcement;
   /**
    * File tools run in the pibot host process. Docker executors use this hook
    * to ensure that host-side file access stays inside the mounted workspace.
@@ -39,6 +58,29 @@ export interface SandboxExecutor {
     request: SandboxCommandRequest,
     signal?: AbortSignal,
   ): Promise<SandboxCommandOutput>;
+}
+
+export interface SandboxBackendEnforcement {
+  readonly backend: "disabled" | "host" | "docker" | "linux-native";
+  readonly filesystem: "none" | "workspace" | "path-scoped";
+  readonly network: "none" | "static" | "per-call";
+}
+
+export interface EffectiveSandboxCallPolicy {
+  readonly policyVersion: string;
+  readonly enforcement: SandboxBackendEnforcement;
+  readonly filesystem: {
+    readonly readPaths: readonly string[];
+    readonly writePaths: readonly string[];
+  };
+  readonly network: {
+    readonly enabled: boolean;
+    readonly granularity: SandboxPolicy["network"]["granularity"];
+  };
+  readonly process: {
+    readonly command: string;
+  };
+  readonly resourceLimits: SandboxPolicy["resourceLimits"];
 }
 
 export type SandboxExecutorConfig =
@@ -60,6 +102,7 @@ export type SandboxExecutorConfig =
   | {
       readonly kind: "linux-native";
       readonly launcherPath?: string;
+      readonly policy?: SandboxPolicy;
       readonly maxProcesses?: number;
       readonly maxOpenFiles?: number;
       readonly maxFileSizeBytes?: number;
@@ -67,6 +110,13 @@ export type SandboxExecutorConfig =
     };
 
 export class DisabledSandboxExecutor implements SandboxExecutor {
+  readonly policy = defaultSandboxPolicy;
+  readonly enforcement: SandboxBackendEnforcement = Object.freeze({
+    backend: "disabled",
+    filesystem: "none",
+    network: "none",
+  });
+
   assertWorkspaceAccess(): void {}
 
   execute(): Promise<SandboxCommandOutput> {
@@ -78,6 +128,12 @@ export class DisabledSandboxExecutor implements SandboxExecutor {
 }
 
 export class HostSandboxExecutor implements SandboxExecutor {
+  readonly policy = defaultSandboxPolicy;
+  readonly enforcement: SandboxBackendEnforcement = Object.freeze({
+    backend: "host",
+    filesystem: "none",
+    network: "none",
+  });
   private readonly enabled: boolean;
   private readonly shell: boolean | string;
 
@@ -99,7 +155,11 @@ export class HostSandboxExecutor implements SandboxExecutor {
       );
     }
 
-    const normalized = normalizeSandboxRequest(request);
+    const normalized = normalizeSandboxRequest(
+      request,
+      this.policy,
+      this.enforcement,
+    );
     return runProcess(
       {
         command: normalized.command,
@@ -115,6 +175,12 @@ export class HostSandboxExecutor implements SandboxExecutor {
 }
 
 export class DockerSandboxExecutor implements SandboxExecutor {
+  readonly policy = defaultSandboxPolicy;
+  readonly enforcement: SandboxBackendEnforcement = Object.freeze({
+    backend: "docker",
+    filesystem: "workspace",
+    network: "static",
+  });
   private readonly containerName: string;
   private readonly hostWorkspaceRoot: string;
   private readonly containerWorkspaceRoot: string;
@@ -149,7 +215,11 @@ export class DockerSandboxExecutor implements SandboxExecutor {
     request: SandboxCommandRequest,
     signal?: AbortSignal,
   ): Promise<SandboxCommandOutput> {
-    const normalized = normalizeSandboxRequest(request);
+    const normalized = normalizeSandboxRequest(
+      request,
+      this.policy,
+      this.enforcement,
+    );
     const containerCwd = this.toContainerPath(normalized.cwd);
 
     return runProcess(
@@ -204,6 +274,12 @@ export class DockerSandboxExecutor implements SandboxExecutor {
 }
 
 export class LinuxNativeSandboxExecutor implements SandboxExecutor {
+  readonly policy: SandboxPolicy;
+  readonly enforcement: SandboxBackendEnforcement = Object.freeze({
+    backend: "linux-native",
+    filesystem: "path-scoped",
+    network: "per-call",
+  });
   private readonly launcherPath: string;
   private readonly maxProcesses: number;
   private readonly maxOpenFiles: number;
@@ -216,6 +292,7 @@ export class LinuxNativeSandboxExecutor implements SandboxExecutor {
     readonly maxOpenFiles?: number;
     readonly maxFileSizeBytes?: number;
     readonly maxMemoryBytes?: number;
+    readonly policy?: SandboxPolicy;
   } = {}) {
     if (process.platform !== "linux") {
       throw sandboxError(
@@ -224,22 +301,37 @@ export class LinuxNativeSandboxExecutor implements SandboxExecutor {
       );
     }
 
+    const basePolicy = options.policy ?? defaultSandboxPolicy;
     this.launcherPath = resolve(
       options.launcherPath ??
         join(__dirname, "..", "..", "native", "bin", "pibot-linux-sandbox"),
     );
-    this.maxProcesses = positiveInteger(options.maxProcesses, 256, "maxProcesses");
-    this.maxOpenFiles = positiveInteger(options.maxOpenFiles, 256, "maxOpenFiles");
+    this.maxProcesses = positiveInteger(
+      options.maxProcesses,
+      basePolicy.resourceLimits.maxProcesses,
+      "maxProcesses",
+    );
+    this.maxOpenFiles = positiveInteger(
+      options.maxOpenFiles,
+      basePolicy.resourceLimits.maxOpenFiles,
+      "maxOpenFiles",
+    );
     this.maxFileSizeBytes = positiveInteger(
       options.maxFileSizeBytes,
-      64_000_000,
+      basePolicy.resourceLimits.maxFileSizeBytes,
       "maxFileSizeBytes",
     );
     this.maxMemoryBytes = positiveInteger(
       options.maxMemoryBytes,
-      17_179_869_184,
+      basePolicy.resourceLimits.maxMemoryBytes,
       "maxMemoryBytes",
     );
+    this.policy = sandboxPolicyWithResourceLimits(basePolicy, {
+      maxProcesses: this.maxProcesses,
+      maxOpenFiles: this.maxOpenFiles,
+      maxFileSizeBytes: this.maxFileSizeBytes,
+      maxMemoryBytes: this.maxMemoryBytes,
+    });
   }
 
   assertWorkspaceAccess(): void {}
@@ -248,7 +340,11 @@ export class LinuxNativeSandboxExecutor implements SandboxExecutor {
     request: SandboxCommandRequest,
     signal?: AbortSignal,
   ): Promise<SandboxCommandOutput> {
-    const normalized = normalizeSandboxRequest(request);
+    const normalized = normalizeSandboxRequest(
+      request,
+      this.policy,
+      this.enforcement,
+    );
     const temporaryDirectory = await mkdtemp(
       join(tmpdir(), "pibot-linux-sandbox-"),
     );
@@ -260,6 +356,17 @@ export class LinuxNativeSandboxExecutor implements SandboxExecutor {
           args: [
             "--workspace",
             normalized.workspaceRoot,
+            ...normalized.readPaths.flatMap((scopedPath) => [
+              "--read-path",
+              scopedPath,
+            ]),
+            ...normalized.writePaths.flatMap((scopedPath) => [
+              "--write-path",
+              scopedPath,
+            ]),
+            "--network",
+            normalized.networkEnabled ? "enabled" : "disabled",
+            ...sandboxPolicyArguments(this.policy),
             "--cwd",
             normalized.cwd,
             "--tmp",
@@ -322,6 +429,9 @@ interface NormalizedSandboxRequest {
   readonly cwd: string;
   readonly timeoutMs: number;
   readonly maxOutputChars: number;
+  readonly readPaths: readonly string[];
+  readonly writePaths: readonly string[];
+  readonly networkEnabled: boolean;
 }
 
 interface ProcessRequest {
@@ -336,6 +446,8 @@ interface ProcessRequest {
 
 function normalizeSandboxRequest(
   request: SandboxCommandRequest,
+  policy: SandboxPolicy,
+  enforcement: SandboxBackendEnforcement,
 ): NormalizedSandboxRequest {
   if (request.command.trim().length === 0) {
     throw sandboxError("invalid_input", "bash.command must not be empty");
@@ -366,13 +478,167 @@ function normalizeSandboxRequest(
     throw sandboxError("permission_denied", `cwd is outside workspace: ${request.cwd}`);
   }
 
+  const effectivePolicy = resolveEffectiveSandboxCallPolicy(
+    request.authorization,
+    request.command,
+    policy,
+    enforcement,
+    workspaceRoot,
+  );
+
   return {
     command: request.command,
     workspaceRoot,
     cwd,
     timeoutMs: request.timeoutMs,
     maxOutputChars: request.maxOutputChars,
+    readPaths: effectivePolicy.filesystem.readPaths,
+    writePaths: effectivePolicy.filesystem.writePaths,
+    networkEnabled: effectivePolicy.network.enabled,
   };
+}
+
+export function resolveEffectiveSandboxCallPolicy(
+  grant: ToolCapabilityGrant,
+  command: string,
+  policy: SandboxPolicy,
+  enforcement: SandboxBackendEnforcement,
+  workspaceRoot: string,
+): EffectiveSandboxCallPolicy {
+  validateToolCapabilityGrant(grant, { policyVersion: policy.version });
+  if (!grantAllowsCapability(grant, "process.exec", command)) {
+    throw sandboxError(
+      "permission_denied",
+      "Sandbox grant lacks process.exec for this command",
+    );
+  }
+  const readPaths = capabilityFilesystemPaths(grant, "filesystem.read");
+  const writePaths = capabilityFilesystemPaths(grant, "filesystem.write");
+  assertScopedFilesystemPaths(readPaths, "read", workspaceRoot, policy);
+  assertScopedFilesystemPaths(writePaths, "write", workspaceRoot, policy);
+  assertBackendScopeEnforcement(enforcement, readPaths, writePaths);
+  return Object.freeze({
+    policyVersion: policy.version,
+    enforcement,
+    filesystem: Object.freeze({ readPaths, writePaths }),
+    network: Object.freeze({
+      enabled: grantAllowsCapability(grant, "network.connect"),
+      granularity: policy.network.granularity,
+    }),
+    process: Object.freeze({ command }),
+    resourceLimits: Object.freeze({ ...policy.resourceLimits }),
+  });
+}
+
+function assertBackendScopeEnforcement(
+  enforcement: SandboxBackendEnforcement,
+  readPaths: readonly string[],
+  writePaths: readonly string[],
+): void {
+  const hasScopedRead = readPaths.length > 0 && !readPaths.includes(".");
+  const hasScopedWrite = writePaths.length > 0 && !writePaths.includes(".");
+  const hasNoFilesystemAccess = readPaths.length === 0 && writePaths.length === 0;
+  if (
+    enforcement.filesystem !== "path-scoped" &&
+    (hasScopedRead || hasScopedWrite || hasNoFilesystemAccess)
+  ) {
+    throw sandboxError(
+      "permission_denied",
+      `Sandbox backend ${enforcement.backend} cannot enforce per-call path scopes`,
+    );
+  }
+}
+
+function capabilityFilesystemPaths(
+  grant: ToolCapabilityGrant,
+  capability: "filesystem.read" | "filesystem.write",
+): readonly string[] {
+  return Object.freeze([...new Set(grant.request.requirements.flatMap((requirement) =>
+    requirement.capability === capability ? requirement.paths : []
+  ))]);
+}
+
+function assertScopedFilesystemPaths(
+  paths: readonly string[],
+  access: "read" | "write",
+  workspaceRoot: string,
+  policy: SandboxPolicy,
+): void {
+  if (paths.length > maxScopedFilesystemPaths) {
+    throw sandboxError(
+      "invalid_input",
+      `Sandbox ${access} scope exceeds ${maxScopedFilesystemPaths} paths`,
+    );
+  }
+  const protectedPath = paths.find((scopedPath) =>
+    isProtectedWorkspacePath(scopedPath, policy)
+  );
+  if (protectedPath !== undefined) {
+    throw sandboxError(
+      "permission_denied",
+      `Sandbox ${access} scope includes protected path: ${protectedPath}`,
+    );
+  }
+  const canonicalRoot = realpathSync(workspaceRoot);
+  for (const scopedPath of paths) {
+    const expectedPath = resolve(canonicalRoot, scopedPath);
+    let canonicalPath: string;
+    try {
+      canonicalPath = realpathSync(resolve(workspaceRoot, scopedPath));
+    } catch (error: unknown) {
+      if (isNodeErrorWithCode(error, "ENOENT")) {
+        throw sandboxError(
+          "permission_denied",
+          `Sandbox ${access} scope must already exist; authorize an existing parent directory to create descendants: ${scopedPath}`,
+        );
+      }
+      throw error;
+    }
+    const pathFromRoot = relative(canonicalRoot, canonicalPath);
+    if (
+      pathFromRoot === ".." ||
+      pathFromRoot.startsWith(`..${sep}`) ||
+      isAbsolute(pathFromRoot)
+    ) {
+      throw sandboxError(
+        "permission_denied",
+        `Sandbox ${access} scope resolves outside workspace: ${scopedPath}`,
+      );
+    }
+    if (canonicalPath !== expectedPath) {
+      throw sandboxError(
+        "permission_denied",
+        `Symbolic links are not allowed in sandbox ${access} scopes: ${scopedPath}`,
+      );
+    }
+    if (isProtectedWorkspacePath(pathFromRoot, policy)) {
+      throw sandboxError(
+        "permission_denied",
+        `Sandbox ${access} scope resolves to protected path: ${scopedPath}`,
+      );
+    }
+    const scopedStat = statSync(canonicalPath);
+    if (!scopedStat.isFile() && !scopedStat.isDirectory()) {
+      throw sandboxError(
+        "permission_denied",
+        `Sandbox ${access} scope must be a regular file or directory: ${scopedPath}`,
+      );
+    }
+  }
+}
+
+function sandboxPolicyArguments(policy: SandboxPolicy): readonly string[] {
+  return [
+    ...sandboxProtectedNames(policy).flatMap((name) => ["--protect-name", name]),
+    ...policy.filesystem.protectedFilePrefixes.flatMap((prefix) => [
+      "--protect-prefix",
+      prefix,
+    ]),
+    ...policy.filesystem.protectedNameExceptions.flatMap((name) => [
+      "--allow-protected-name",
+      name,
+    ]),
+  ];
 }
 
 function runProcess(
@@ -521,6 +787,12 @@ function sandboxError(name: string, message: string): Error {
   const error = new Error(message);
   error.name = name;
   return error;
+}
+
+function isNodeErrorWithCode(error: unknown, code: string): boolean {
+  return error instanceof Error &&
+    "code" in error &&
+    (error as { readonly code?: unknown }).code === code;
 }
 
 function positiveInteger(

@@ -12,7 +12,12 @@ const EXACT_USER_INTENT_HEADER_ESTIMATED_TOKENS = 64;
 export interface CompactableContextEntry {
   readonly lineNumber: number;
   readonly message: LlmMessage;
-  readonly source: "slack_log" | "webui" | "agent" | "compaction";
+  readonly source:
+    | "slack_log"
+    | "webui"
+    | "runtime"
+    | "agent"
+    | "compaction";
   readonly eventId?: SlackEventId;
   readonly isCompactionSummary: boolean;
   readonly coveredThroughLineNumber?: number;
@@ -194,7 +199,6 @@ export class LlmSessionCompactor implements SessionCompactor {
         this.llmOptions.modelName,
         this.maxOutputTokens,
         plan.oldEntries,
-        this.options.compactionTriggerTokens * 4,
         request.signal,
       );
       return buildCompactionResult(
@@ -505,10 +509,9 @@ async function generateLlmSummary(
   modelName: string | undefined,
   maxOutputTokens: number,
   entries: readonly CompactableContextEntry[],
-  maxSourceChars: number,
   signal: AbortSignal | undefined,
 ): Promise<{ readonly facts: SessionSummaryFacts; readonly usage?: ModelUsage }> {
-  const transcript = renderCompactionTranscript(entries, maxSourceChars);
+  const transcript = renderCompactionTranscript(entries);
   let content = "";
   let usage: ModelUsage | undefined;
   for await (const event of model.stream(
@@ -522,6 +525,7 @@ async function generateLlmSummary(
           content: [
             "Summarize an agent transcript as strict JSON only.",
             "Preserve durable facts and unresolved work. Do not invent facts.",
+            "The transcript contains every selected source region in order. Do not discard middle work.",
             "Previous checkpoint summaries are parent nodes. Recursively merge their durable facts with newer source regions instead of expanding old transcripts.",
             "Treat exactUserConstraints as verbatim user wording; do not paraphrase it.",
             "Keep failed attempts, current work and verification state distinct from completed progress.",
@@ -555,51 +559,10 @@ async function generateLlmSummary(
 
 function renderCompactionTranscript(
   entries: readonly CompactableContextEntry[],
-  maxChars: number,
 ): string {
-  const regions = groupCompactionRegions(entries);
-  const rendered = regions.map((region) => renderCompactionRegion(region));
-  const complete = rendered.join("\n\n");
-  if (complete.length <= maxChars) {
-    return complete;
-  }
-
-  const markerBudget = 120;
-  const firstBudget = Math.max(256, Math.floor((maxChars - markerBudget) * 0.4));
-  const selected = new Map<number, string>();
-  const first = rendered[0];
-  if (first !== undefined) {
-    selected.set(0, fitCompactionRegion(regions[0] ?? [], first, firstBudget));
-  }
-
-  let usedChars = [...selected.values()].reduce(
-    (total, value) => total + value.length,
-    0,
-  );
-  for (let index = regions.length - 1; index > 0; index -= 1) {
-    const region = regions[index] ?? [];
-    const value = rendered[index] ?? "";
-    const remaining = maxChars - markerBudget - usedChars;
-    if (remaining < 128) {
-      break;
-    }
-    if (value.length <= remaining) {
-      selected.set(index, value);
-      usedChars += value.length;
-      continue;
-    }
-    if (![...selected.keys()].some((selectedIndex) => selectedIndex > 0)) {
-      const fitted = fitCompactionRegion(region, value, remaining);
-      selected.set(index, fitted);
-      usedChars += fitted.length;
-    }
-    break;
-  }
-
-  const projected = renderSelectedCompactionRegions(regions, selected);
-  return projected.length <= maxChars
-    ? projected
-    : renderCompactionRegionLocator(entries, maxChars);
+  return groupCompactionRegions(entries)
+    .map((region) => renderCompactionRegion(region))
+    .join("\n\n");
 }
 
 function groupCompactionRegions(
@@ -655,97 +618,23 @@ function groupCompactionRegions(
 
 function renderCompactionRegion(
   entries: readonly CompactableContextEntry[],
-  maxContentChars?: number,
 ): string {
-  const contentBudget = maxContentChars ?? Number.POSITIVE_INFINITY;
-  return entries.map((entry) => renderCompactionEntry(entry, contentBudget)).join("\n\n");
+  return entries.map((entry) => renderCompactionEntry(entry)).join("\n\n");
 }
 
 function renderCompactionEntry(
   entry: CompactableContextEntry,
-  maxContentChars: number,
 ): string {
   const toolCalls = entry.message.toolCalls === undefined
     ? ""
-    : `\ntoolCalls=${truncateStructuredField(
-      JSON.stringify(entry.message.toolCalls),
-      maxContentChars,
-      "tool call arguments",
-    )}`;
+    : `\ntoolCalls=${JSON.stringify(entry.message.toolCalls)}`;
   return [
     `[line=${entry.lineNumber} role=${entry.message.role}` +
       `${entry.isCompactionSummary
         ? ` checkpointLevel=${entry.summaryHierarchy?.level ?? 1}`
         : ""}]`,
-    truncateStructuredField(
-      entry.message.content,
-      maxContentChars,
-      entry.message.role === "tool" ? "tool result" : "message",
-    ),
+    entry.message.content,
   ].join("\n") + toolCalls;
-}
-
-function fitCompactionRegion(
-  entries: readonly CompactableContextEntry[],
-  rendered: string,
-  maxChars: number,
-): string {
-  if (rendered.length <= maxChars) {
-    return rendered;
-  }
-  const perEntryBudget = Math.max(
-    64,
-    Math.floor((maxChars - entries.length * 48) / Math.max(1, entries.length * 2)),
-  );
-  const fitted = renderCompactionRegion(entries, perEntryBudget);
-  return fitted.length <= maxChars
-    ? fitted
-    : renderCompactionRegionLocator(entries, maxChars);
-}
-
-function renderCompactionRegionLocator(
-  entries: readonly CompactableContextEntry[],
-  maxChars: number,
-): string {
-  const firstLine = entries[0]?.lineNumber;
-  const lastLine = entries[entries.length - 1]?.lineNumber;
-  const roles = uniqueList(entries.map((entry) => entry.message.role)).join(",");
-  const locator =
-    `[complete context region omitted from summary input; durable lines ` +
-    `${firstLine ?? "unknown"}-${lastLine ?? "unknown"}; roles=${roles || "unknown"}]`;
-  return locator.slice(0, Math.max(0, maxChars));
-}
-
-function renderSelectedCompactionRegions(
-  regions: readonly (readonly CompactableContextEntry[])[],
-  selected: ReadonlyMap<number, string>,
-): string {
-  const output: string[] = [];
-  let previousIndex = -1;
-  for (const [index, value] of [...selected.entries()].sort((left, right) =>
-    left[0] - right[0])) {
-    if (index > previousIndex + 1) {
-      const omitted = regions.slice(previousIndex + 1, index).flat();
-      const firstLine = omitted[0]?.lineNumber;
-      const lastLine = omitted[omitted.length - 1]?.lineNumber;
-      output.push(
-        `[${index - previousIndex - 1} complete context region(s) omitted` +
-        `${firstLine === undefined ? "" : `; durable lines ${firstLine}-${lastLine}`}]`,
-      );
-    }
-    output.push(value);
-    previousIndex = index;
-  }
-  if (previousIndex < regions.length - 1) {
-    const omitted = regions.slice(previousIndex + 1).flat();
-    output.push(
-      `[${regions.length - previousIndex - 1} complete context region(s) omitted` +
-      `${omitted[0] === undefined
-        ? ""
-        : `; durable lines ${omitted[0].lineNumber}-${omitted[omitted.length - 1]?.lineNumber}`}]`,
-    );
-  }
-  return output.join("\n\n");
 }
 
 function truncateStructuredField(

@@ -20,6 +20,8 @@ import type {
   EvolutionTarget,
 } from "../evolution/types";
 import type { RuntimeCodeActivationController } from "../evolution/runtime-activation";
+import type { ModelRuntime } from "../models/runtime";
+import { formatModelRef } from "../models/types";
 import type { WorkflowOrchestrator } from "../workflow/orchestrator";
 import type { WorkflowEventRecord, WorkflowRunRecord } from "../workflow/types";
 import {
@@ -48,6 +50,7 @@ export interface WebUiServerOptions {
   readonly runtimeActivation?: RuntimeCodeActivationController | undefined;
   readonly conversations: FileWebConversationStore;
   readonly agent?: WebAgentRunner;
+  readonly models?: ModelRuntime;
   readonly workflows?: WorkflowOrchestrator;
   readonly logger?: AppLogger;
   readonly pibotSkillsRoot?: string;
@@ -132,6 +135,39 @@ function browserUrlFor(host: string, port: number): string {
     return `http://127.0.0.1:${port}`;
   }
   return `http://${host}:${port}`;
+}
+
+function webModelState(runtime: ModelRuntime): Readonly<Record<string, unknown>> {
+  return {
+    active: formatModelRef(runtime.activeModelRef()),
+    configPath: runtime.config.configPath,
+    storePath: runtime.config.storePath,
+    providers: runtime.providers().map((provider) => ({
+      id: provider.id,
+      api: provider.api,
+      credential: runtime.credentialRequirement({
+        provider: provider.id,
+        model: provider.defaultModel,
+      }),
+      catalogEnabled:
+        provider.catalog !== undefined && provider.catalog.enabled !== false,
+    })),
+    models: runtime.listModels().map((model) => ({
+      ref: `${model.provider}/${model.id}`,
+      provider: model.provider,
+      id: model.id,
+      name: model.name,
+      status: model.status,
+      source: model.source,
+      contextWindow: model.contextWindow,
+      maxOutputTokens: model.maxOutputTokens,
+      input: model.input,
+      reasoning: model.reasoning,
+      tools: model.tools,
+      checkedAt: model.checkedAt,
+      fetchedAt: model.fetchedAt,
+    })),
+  };
 }
 
 function sendDetachedRunAccepted(
@@ -292,6 +328,47 @@ async function routeRequest(
     sendJson(response, 200, { ok: true, runtime: runtimeState });
     return;
   }
+  if (method === "GET" && url.pathname === "/api/models") {
+    if (options.models === undefined) {
+      sendJson(response, 400, { error: "Model runtime is not configured" });
+      return;
+    }
+    sendJson(response, 200, webModelState(options.models));
+    return;
+  }
+  if (method === "POST" && url.pathname === "/api/models/select") {
+    if (options.models === undefined) {
+      sendJson(response, 400, { error: "Model runtime is not configured" });
+      return;
+    }
+    const body = await readJsonBody(request);
+    options.models.selectModel(stringField(body, "model"));
+    sendJson(response, 200, webModelState(options.models));
+    return;
+  }
+  if (
+    method === "POST" &&
+    (url.pathname === "/api/models/check" || url.pathname === "/api/models/sync")
+  ) {
+    if (options.models === undefined) {
+      sendJson(response, 400, { error: "Model runtime is not configured" });
+      return;
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const catalog = url.pathname.endsWith("/sync")
+        ? await options.models.syncCatalogs(controller.signal)
+        : await options.models.checkCatalogs(controller.signal);
+      sendJson(response, 200, {
+        ...webModelState(options.models),
+        catalog,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+    return;
+  }
   if (method === "POST" && url.pathname === "/api/runs") {
     if (detachedRuns === undefined) {
       sendJson(response, 400, { error: "Detached runs are not configured" });
@@ -371,6 +448,9 @@ async function routeRequest(
         runtimeActivation: runtimeActivationState(options),
       },
       runtime: runtimeState,
+      ...(options.models === undefined
+        ? {}
+        : { models: webModelState(options.models) }),
       conversations,
       skills,
     });
@@ -790,9 +870,14 @@ async function routeRequest(
       return;
     }
     const body = await readJsonBody(request);
+    const approvalScope = optionalStringValue(body, "scope") ?? "once";
+    if (approvalScope !== "once" && approvalScope !== "run") {
+      throw new Error("scope must be once or run");
+    }
     const result = await options.agent.decideApproval(
       approvalMatch,
       booleanField(body, "approved"),
+      approvalScope,
     );
     sendJson(response, result.ok ? 200 : 404, result);
     return;

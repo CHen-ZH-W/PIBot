@@ -3,13 +3,13 @@
 This is the detailed reference that previously lived in the root README. The
 concise project entry now lives in [`../README.md`](../README.md).
 
-`pibot` is a coding-agent runtime with an OpenAI-compatible model client,
+`pibot` is a coding-agent runtime with a multi-provider model client,
 workspace tools, append-only session storage, controlled persistent memory,
 workspace Skills, Plan/Reflection workflows, transport adapters and
 Linux-native or Docker command sandboxes.
 
 The current application supports WebUI sessions, Slack app mentions and DMs,
-streaming ReAct tool use, one-shot approvals, file upload/download,
+streaming ReAct tool use, one-shot and run-scoped approvals, file upload/download,
 multimodal image attachments, TypeScript LSP lookup, repo checks, context
 compaction, structured trace/usage logs and tmux-backed child agents.
 
@@ -37,11 +37,12 @@ npm run webui
 
 The standalone WebUI reads the same model, sandbox, tool-limit, Skill and
 workspace variables used by the Slack runtime. Ordinary WebUI sessions call the
-same OpenAI-compatible model client and coding tools; missing `OPENAI_API_KEY`
-or provider settings surface as agent errors in the WebUI conversation. Tool
+same multi-provider model client and coding tools; missing credentials or
+provider settings surface as agent errors in the WebUI conversation. Tool
 approval still follows `TOOL_APPROVAL_MODE`. When a WebUI tool call requires
-one-shot approval, the live run displays an approval card and pauses until the
-user approves, rejects or the request times out.
+approval, the live run displays the exact escalation delta and pauses until the
+user allows it once, retains an exact rule for the current Run, rejects it or
+the request times out.
 
 WebUI session titles and ordering are indexed in
 `.pibot/webui/conversations.json`, but model history is stored per session in
@@ -173,9 +174,10 @@ Shell commands and repo check commands use `SandboxExecutor`. On Linux,
 `linux-native` mode is recommended. Its native launcher:
 
 - clears inherited environment variables before executing the Shell
-- applies a Landlock allowlist for workspace files, read-only runtime files and
-  a private temporary directory
-- blocks network sockets and dangerous syscalls with seccomp
+- applies a Landlock allowlist using the call's granted workspace-relative
+  read/write paths, plus read-only runtime files and a private temporary directory
+- blocks network sockets unless that single call has `network.connect`, and
+  always blocks the remaining dangerous syscalls with seccomp
 - limits CPU time, memory, process count, open files and generated file sizes
 
 Landlock rules are additive. Without an overlay filesystem, a workspace
@@ -199,23 +201,82 @@ SANDBOX_EXECUTOR=host
 SANDBOX_HOST_ENABLED=1
 ```
 
-Tool execution is policy-gated:
+Tool execution is capability-gated. A Tool keeps its static `riskLevel` as
+compatibility metadata for schema exposure, but each parsed call resolves a
+`ToolCapabilityRequest`. The request can contain scoped `filesystem.read` and
+`filesystem.write` paths plus `process.exec`, `network.connect`,
+`external.side_effect`, `runtime.read`, and `runtime.control`. Approval creates
+an immutable `ToolCapabilityGrant` bound to the call/request digests, sandbox
+policy version, expiry and current runtime-state version. Grants are active only
+while their owning call executes; file tools and the Linux-native Shell sandbox
+reject inactive, replayed, stale or command-mismatched grants. Runtime-owned
+repo checks use an explicit short-lived RuntimeGrant instead of an unauthorised
+compatibility fallback.
+All built-in tools declare capabilities explicitly. A custom registered tool
+without `resolveCapabilities` receives a legacy request derived from its static
+`riskLevel` during migration.
 
-| `TOOL_APPROVAL_MODE` | Allowed tools |
+The four existing modes remain named policy profiles:
+
+| `TOOL_APPROVAL_MODE` | Capability policy |
 |---|---|
-| `read-only` | Automatically allow read-only tools; deny mutating and external tools |
-| `workspace-write` | Automatically allow read-only and mutating workspace tools; ask in Slack before external tools such as `bash`, `attach` and child-agent control |
-| `approval-required` | Automatically allow read-only tools; ask in Slack before mutating and external tools |
-| `full-access` | Automatically allow all tools |
+| `read-only` | Allow `filesystem.read`, `runtime.read`, and submission of a reviewable `self-evolution:ticket`; deny other capabilities |
+| `workspace-write` | Also allow workspace writes, local process execution and runtime control; ask before network, external side effects, or destructive effects |
+| `approval-required` | Allow reads; ask before every other capability |
+| `full-access` | Allow all requested capabilities |
 
-The default is `read-only`. When approval is required, pibot posts `Allow once`
-and `Reject` buttons. Only the Slack user who started the run can decide, and
-the decision applies only to that tool call. Approval does not change the
-global mode. The wait expires after `TOOL_APPROVAL_TIMEOUT_MS`.
+The default is `read-only`. When approval is required, pibot posts `Allow once`,
+`Allow for run`, `Reject once`, and `Deny for run` actions. Run-scoped rules use
+an exact key over the approval mode, Tool name and canonical full capability
+request; changed paths, commands, hosts or effects require a new decision. Rules
+are bound to the current Runtime State, survive its follow-up UserTurns, and are
+not inherited by child agents. Only the Slack user who started the run can
+decide. Approval does not change the global mode. The wait expires after
+`TOOL_APPROVAL_TIMEOUT_MS`. PIBot checks the current Agent Mode again after the
+wait, so entering Plan or Coordinator Mode while a prompt is pending revokes a
+now-incompatible approval.
 
-`full-access` should only be used with a tested `linux-native` or Docker
-sandbox. Shell network access remains blocked by the Linux-native launcher even
-after a tool call is approved.
+`bash.permissions` lets a call declare its least authority. The compatible
+`filesystem: "read" | "write"` form covers the whole workspace. A scoped call
+can instead use `filesystem: { read: ["src"], write: ["tmp/output.txt"] }`;
+directories cover descendants. Exact file scopes must already exist, while an
+existing authorized directory can create new descendants. Protected paths and
+symbolic-link scopes fail closed. Pure process commands may use empty read and
+write arrays, which gives Linux-native zero workspace authority. The remaining
+fields are `network`, `externalSideEffect`, and the `destructive` effect hint.
+Omitting permissions selects the conservative legacy profile (workspace write,
+no network, external side effect), preserving the old approval behavior.
+Read-only child agents additionally have a hard `filesystem.write` ceiling
+independent of approval mode. Without an approval bridge, enabling read-only
+child Bash uses the `workspace-write` baseline, so network and external side
+effects remain denied unless explicitly configured.
+A write-capable child defaults to `approval-required` when a parent approval
+bridge is available and to `workspace-write` otherwise; it no longer defaults
+to `full-access`.
+
+Destructive effect hints prompt in both `workspace-write` and
+`approval-required`; they are denied by `read-only` and automatically accepted
+only by `full-access`. This keeps an ordinary test command distinct from a
+declared destructive cleanup even when both need workspace write access.
+
+`full-access` should only be used with the tested `linux-native` sandbox. The
+Linux-native launcher enables Shell network access only when the
+specific call requested and received `network.connect`. Host mode remains an
+explicit development escape hatch and cannot enforce per-call filesystem or
+network isolation. The current Docker executor keeps its container-level mount
+and network policy. Host and Docker reject path-scoped Bash Grants instead of
+pretending to enforce them; their compatible Bash profile remains the explicit
+whole-workspace form. They do not yet enforce per-call network changes.
+
+Direct file tools, repo path resolution and the native launcher consume the
+same executor-owned, versioned `SandboxPolicy` protected-name lists. The policy
+also owns the Linux-native resource-limit defaults and records that outbound
+network enforcement currently has `all-or-none` granularity; hostname-specific
+enforcement is not claimed.
+Each executor also declares its filesystem/network enforcement level. The
+runtime resolves these declarations, the call Grant and `SandboxPolicy` into an
+`EffectiveSandboxCallPolicy`, and publishes the backend/policy version in the
+refreshable World State lane.
 
 ## Coding Agent Features
 
@@ -234,6 +295,11 @@ level and execution mode. Read-only tools may run in parallel; file mutations
 are serialized per target file. Parallel-safe batches use a bounded rolling
 pool (`AGENT_MAX_PARALLEL_TOOL_CALLS`, default `8`) and stop dispatching queued
 calls after cancellation while preserving one tool result per model tool call.
+The scheduler also accepts complete calls incrementally. In particular,
+Anthropic `tool_use` blocks can start execution at `content_block_stop` while
+the remainder of the model stream is still arriving. Sequential calls remain
+strict barriers, and results are committed to the next model Step in original
+call order.
 
 Current built-in tools:
 
@@ -268,22 +334,32 @@ Slack runtime behavior:
   this diff` or `进入 coordinator 模式`.
 - Long-running tasks update the main Slack message periodically.
 
-The runtime boundary is `Run -> UserTurn -> Step`. `MinimalAgentLoop` owns only
-model calls and repetition. `ToolScheduler` owns serial barriers, bounded
-parallel dispatch, cancellation backpressure, result ordering, and the rule
-that every model tool call receives exactly one tool result. Context recovery
-and reflection are lifecycle policies; tracing and UI transition consumers are
+The runtime boundary is `Run -> UserTurn -> Step`. `AgentRuntime` owns the
+process-local active-Run registry and transport-neutral control routing;
+`AgentRunController` owns one Run's UserTurns, queues, cancellation and terminal
+state. `MinimalAgentLoop` owns model/tool repetition. Each Step captures one
+immutable `AgentStepSnapshot` containing runtime state, model-visible World
+State, available tools, workspace and execution-authority version. Permission
+tightening may still deny a pending call immediately; expansion waits for the
+next Step, and a changed executor authority cannot reuse an old snapshot.
+`ToolScheduler` owns incremental intake, serial barriers, bounded parallel
+dispatch, cancellation backpressure, result ordering, and the rule that every
+complete model tool call receives exactly one tool result. Context recovery and
+reflection are lifecycle policies; tracing and UI transition consumers are
 fail-open observers and cannot change runtime decisions.
 
 ## Configuration
 
-Required variables:
+Required Slack transport variables:
 
 | Variable | Description |
 |---|---|
 | `SLACK_APP_TOKEN` | Slack Socket Mode app token |
 | `SLACK_BOT_TOKEN` | Slack bot OAuth token |
-| `OPENAI_API_KEY` | Model provider API key |
+
+The active model's credential is also required. In legacy mode this is
+`OPENAI_API_KEY`; multi-provider profiles declare `apiKeyEnv` or secret header
+environment references such as `ANTHROPIC_API_KEY`.
 
 Common variables:
 
@@ -293,10 +369,15 @@ Common variables:
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model name; `kimi-k2.6` enables Kimi pricing |
 | `OPENAI_DEVELOPER_ROLE_MODE` | `native` | `native` sends PIBot application instructions as `developer`; `system-fallback` explicitly maps them to `system` for endpoints that reject `developer` and records an authority downgrade |
 | `OPENAI_FALLBACK_MODELS` | empty | Comma-separated fallback models |
+| `PIBOT_MODELS_CONFIG` | `.pibot/models.json` | Multi-provider model configuration; absent means the legacy `OPENAI_*` profile is synthesized |
+| `PIBOT_MODELS_STORE` | `.pibot/models-store.json` | Last-known-good provider model catalog cache |
+| `PIBOT_MODEL` | configured default | Active `provider/model` override; a bare model id uses the configured default provider |
+| `PIBOT_MODEL_PROVIDER` | first configured provider | Default provider when `PIBOT_MODEL` is a bare model id |
+| `PIBOT_FALLBACK_MODELS` | configured fallbacks or `OPENAI_FALLBACK_MODELS` | Comma-separated `provider/model` fallbacks; each fallback carries its own endpoint, auth and protocol configuration |
 | `MODEL_MAX_RETRIES` | `2` | Retries per model before fallback |
 | `MODEL_RETRY_BASE_DELAY_MS` | `500` | Initial model retry delay |
 | `MODEL_RETRY_MAX_DELAY_MS` | `8000` | Maximum model retry delay |
-| `MODEL_CONTEXT_WINDOW_TOKENS` | `262144` | Active model context window; set this to the smallest configured fallback window when overriding |
+| `MODEL_CONTEXT_WINDOW_TOKENS` | smallest known configured/catalog window, otherwise `262144` | Context budget shared by selectable models; an explicit value overrides automatic selection |
 | `AGENT_MAX_STEPS` | `80` | Maximum Model -> ToolBatch steps for one user turn (`AGENT_MAX_TURNS` remains a legacy fallback) |
 | `AGENT_MAX_PARALLEL_TOOL_CALLS` | `8` | Maximum concurrently dispatched parallel-safe tool calls in one step |
 | `LONG_TASK_STATUS_UPDATE_MS` | `30000` | Slack status refresh interval for long-running tasks |
@@ -308,6 +389,9 @@ Common variables:
 | `SESSION_MICROCOMPACT_MIN_RECLAIM_TOKENS` | `512` | Minimum estimated saving for one Microcompact candidate |
 | `SESSION_MICROCOMPACT_MAX_ITEMS` | `12` | Maximum Tool Results replaced in one model projection |
 | `SESSION_MICROCOMPACT_WARM_CACHE_TTL_MS` | `300000` | Local TTL for treating an observed provider cache hit as warm |
+| `TOOL_RESULT_CONTEXT_THRESHOLD_CHARS` | `8192` | Serialized-character threshold for pruning one model-facing Tool Result after the complete raw result is archived |
+| `TOOL_RESULT_CONTEXT_HEAD_CHARS` | `4096` | Leading payload characters retained after Tool Result admission pruning |
+| `TOOL_RESULT_CONTEXT_TAIL_CHARS` | `1024` | Trailing payload characters retained after Tool Result admission pruning |
 | `WORKSPACE_ROOT` | current directory | pibot workspace boundary |
 | `PIBOT_STORE_ROOT` | `.pibot` in workspace | Session and attachment storage |
 | `PIBOT_TRACE_MAX_FILE_BYTES` | `20000000` | Maximum structured trace JSONL size |
@@ -323,7 +407,7 @@ Common variables:
 | `SLACK_BACKFILL_CHANNEL_TYPES` | `public_channel,private_channel,im` | Slack channel types for startup backfill |
 | `SANDBOX_EXECUTOR` | disabled | `linux-native`, `docker` or `host` |
 | `TOOL_APPROVAL_MODE` | `read-only` | Tool permission policy |
-| `TOOL_APPROVAL_TIMEOUT_MS` | `300000` | Slack one-shot tool approval timeout |
+| `TOOL_APPROVAL_TIMEOUT_MS` | `300000` | Slack tool approval prompt timeout |
 | `SLACK_MAX_ATTACHMENT_BYTES` | `5000000` | Maximum downloaded attachment size |
 | `SLACK_ATTACHMENT_DOWNLOAD_TIMEOUT_MS` | `30000` | Attachment download timeout |
 | `ATTACH_MAX_FILE_BYTES` | `TOOL_MAX_FILE_BYTES` | Maximum generated file size the `attach` tool may upload |
@@ -339,6 +423,14 @@ Common variables:
 | `SESSION_MAX_MEMORY_INDEX_FILE_BYTES` | `8000` | Concise `MEMORY.md` index limit |
 | `SESSION_MAX_MEMORY_FILE_BYTES` | `64000` | Instructions and detailed memory-topic limit |
 | `SESSION_MAX_MEMORY_AUDIT_FILE_BYTES` | `2000000` | Append-only memory mutation audit limit |
+| `SESSION_MAX_MEMORY_USAGE_FILE_BYTES` | `2000000` | Append-only memory-read usage feedback limit |
+| `SESSION_MAX_MEMORY_CURATION_JOB_FILE_BYTES` | `256000` | Per-run durable curation job limit |
+| `MEMORY_CURATION_ENABLED` | `true` | Enable best-effort run-end candidate extraction and consolidation |
+| `MEMORY_CURATION_MAX_OUTPUT_TOKENS` | `5000` | Output cap for each curation model pass |
+| `MEMORY_CURATION_MAX_EVIDENCE_CHARS` | `30000` | Bounded full-run evidence supplied to candidate extraction |
+| `MEMORY_CURATION_TIMEOUT_MS` | `60000` | Hard deadline for each extraction or consolidation model request |
+| `MEMORY_BACKFILL_TEAM_ID` | `memory-maintenance` | Audit/session team key for manual historical rollout curation |
+| `MEMORY_BACKFILL_CHANNEL_ID` | `historical-backfill` | Audit/session channel key for manual historical rollout curation |
 | `SKILLS_DISABLED` | empty | Comma-separated workspace Skill names to exclude |
 | `SKILLS_MAX_COUNT` | `100` | Maximum Skill entries injected into the prompt index |
 | `SKILLS_MAX_FILE_BYTES` | `64000` | Maximum size of each `SKILL.md` file |
@@ -360,6 +452,61 @@ Common variables:
 | `CHILD_AGENT_TOOL_APPROVAL_MODE` | inherited | Optional approval mode override for built-in child agents |
 | `CHILD_AGENT_TOOL_APPROVAL_TIMEOUT_MS` | `TOOL_APPROVAL_TIMEOUT_MS` | Child-agent tool approval timeout |
 | `CHILD_AGENT_ALLOW_BASH` | `false` | Allow bash for read-only child agents when no approval bridge is available |
+
+### Multi-provider model runtime
+
+When `.pibot/models.json` (or `PIBOT_MODELS_CONFIG`) is absent, PIBot creates a
+backward-compatible `openai` profile from the existing `OPENAI_*` variables.
+For multiple providers, start from `docs/models.example.json`. Provider config
+owns protocol, endpoint, credential environment variable, headers, default
+model, catalog discovery, and request compatibility. A model entry may override
+the protocol, endpoint, headers, developer-role mode, context window, output
+limit, pricing, and request fields such as usage streaming, temperature support,
+the max-token field, and extra JSON body values. Header secrets use
+`{ "env": "VARIABLE_NAME" }`; resolved secrets are never persisted in the
+catalog store or returned by the WebUI API.
+
+Supported protocol adapters:
+
+- `openai-chat-completions`: OpenAI-compatible streaming chat, tools, image URL
+  input, reasoning deltas, and usage.
+- `anthropic-messages`: native Anthropic message/tool content blocks and
+  streaming text, thinking, tool-use, and usage events. Anthropic has no
+  `developer` message role, so its profile must explicitly select
+  `developerRoleMode: "system-fallback"`; model-start events and traces record
+  this authority downgrade. Thinking deltas are displayed but are not replayed
+  as assistant thinking blocks because Anthropic requires provider-issued
+  signatures that PIBot does not persist. A completed `tool_use` block is handed
+  to the bounded scheduler immediately instead of waiting for `message_stop`.
+
+The WebUI model selector changes the process-wide default without restarting.
+Each Run captures its complete `provider/model` at the start, so a later UI
+selection cannot change the model halfway through that Run. Fallback entries
+are also complete references and may cross providers or protocols.
+
+Model discovery is opt-in per provider through `catalog.type = "models-api"`
+(`"openai-models"` remains a compatibility alias). It accepts common `data[]`,
+`models[]`, or array responses and
+deliberately treats discovery as identity/name data. Capability, context, and
+pricing metadata remain curated model overrides. A discovered ID therefore has
+`unknown` status until configuration supplies the compatibility metadata; its
+presence in `/models` alone does not prove that it supports PIBot's chat/tool
+request shape.
+
+The checked-in example is a dated configuration starting point, not an account
+availability guarantee. It was refreshed on 2026-08-29; use `models:check` for
+the credentials and endpoint used by the running PIBot.
+
+```bash
+npm run models:list
+npm run models:check       # read-only; exits 2 when live data differs
+npm run models:diff        # read-only live-vs-local differences
+npm run models:sync        # atomically activates the checked cache
+```
+
+Checks use ETag and Last-Modified when available. Provider failures are isolated.
+Sync records the failure while preserving that provider's previous models, so a
+timeout cannot erase the other providers or make startup depend on the network.
 
 Session compaction runs before model steps when the estimated full request exceeds
 `MODEL_CONTEXT_WINDOW_TOKENS - SESSION_COMPACTION_RESERVE_TOKENS`. The lightweight
@@ -560,7 +707,9 @@ Persistent memory uses controlled tools instead of ordinary workspace file tools
 │   ├── topics/<topic>.md
 │   ├── rollout_summaries/<summary>.md
 │   ├── extensions/ad_hoc/notes/<note>.md
-│   └── audit.jsonl
+│   ├── curation_jobs/<run>.json
+│   ├── audit.jsonl
+│   └── usage.jsonl
 └── channels/<team>/<channel>/
     └── instructions.md
 ```
@@ -570,15 +719,54 @@ Persistent memory uses controlled tools instead of ordinary workspace file tools
 prompt. Detailed topics, rollout summaries, and extension notes are loaded only
 when needed with `memory_read`. Before a final answer on non-trivial work, the
 shared system prompt asks the model to review whether the run produced durable
-memory candidates.
+memory candidates. After the rollout summary is persisted, an asynchronous,
+best-effort curation pipeline examines fuller run messages and tool evidence:
+
+```text
+run evidence -> typed extension_note candidate -> consolidation
+                                         |-- no-op / needs review
+                                         `-- accepted semantic Task Group
+                                                   -> MEMORY.md + memory_summary.md
+
+memory_read -> run-scoped outcome feedback -> lifecycle decision
+                                            |-- weak evidence -> review note
+                                            `-- active / stale / superseded
+                                                      -> rebuild compact routing
+```
+
+Run completion first persists a bounded job under `curation_jobs/`, then starts
+curation without making the user-facing run wait for model extraction. Each
+model pass has a hard deadline. A timeout, provider error, or process restart
+leaves the job durable; Slack and WebUI startup recover pending jobs. A
+successful terminal no-op, review, rejection, or consolidation records
+`run_completed` in the audit before deleting the job.
+
+The extractor cannot mutate accepted topics directly. Low-risk candidates go
+through a separate consolidation model pass that compares existing accepted
+knowledge, merges duplicates, preserves provenance, and refuses unresolved
+conflicts. Preferences, uncertain claims, sensitive content, and risky merges
+remain `needs_review` extension notes. Evidence, candidates, and accepted
+knowledge are separate runtime states. One run may stage up to five candidates
+when its evidence genuinely spans separate semantic Task Groups; candidates are
+not split merely to create one note per task or crammed into a project-wide
+catch-all topic.
 
 Memory is meant to be reusable operational knowledge, not a transcript archive.
 Good candidates include stable user preferences, repo-specific source-of-truth
 paths, runtime entrypoints, validated workflows or commands, recurring failure
 modes, architectural decisions, and completed-task outcome summaries that make a
-future run cheaper or safer. A useful topic should read like a triggerable note:
-scope/applicability, keywords, what to inspect, what worked, and what failed or
-should be done differently.
+future run cheaper or safer. A useful accepted topic is a semantic Task Group
+rather than a per-run note. It stores scope/applicability, keywords, reuse rules,
+conditional preferences, reusable claims, negative failure lessons,
+verification boundaries, historical state, and claim-level source runs.
+Verification is dimensional: source review, focused tests, builds, real browser
+use, live Provider behavior, deployment, and production observation are not
+interchangeable. Evidence-bearing claims also retain a source-derived last
+validation timestamp instead of trusting a model-invented date.
+Historical state, preferences, and verification metadata are supporting
+context; a newly accepted Task Group must still contain reusable knowledge or a
+negative failure lesson. This prevents a checkout/config snapshot from becoming
+the body of always-routed long-term memory.
 
 At runtime the injected `MEMORY.md` file is a compact routing index, not
 complete truth. The model should use them to decide when a topic may matter, call
@@ -598,9 +786,41 @@ leave one-off details, secrets, raw transcripts, speculative claims, and risky
 merges out of persistent memory.
 `memory_delete` handles explicit forget requests. Every mutation records its
 source, timestamp and reason in an
-append-only audit log. The legacy `.pibot/MEMORY.md` and `.pibot/memory/` layout
+append-only audit log. Successful explicit `memory_read` calls append run,
+user-turn, step, tool-call, topic and timestamp data to `usage.jsonl`. That
+feedback reorders compact routing toward important and frequently used topics.
+Run-end extraction can additionally classify a topic read during that same run
+as `helpful`, `validated`, `not_applicable`, `contradicted`, or `superseded`.
+Outcome feedback records an `observed`, `accepted`, or `needs_review`
+disposition; accepted/helpful outcomes influence routing ahead of raw read
+counts.
+
+Retrieval is not validation. `contradicted`, `superseded`, and reactivation
+proposals require a separate lifecycle model pass plus a concrete current-run
+dimension such as source inspection, focused/integration testing, runtime,
+browser, Provider, deployment, or production observation. Accepted transitions
+are stored in the Task Group lifecycle as `active`, `stale`, `superseded`, or
+`archived`. Only active groups enter `MEMORY.md` and `memory_summary.md`; other
+groups remain readable with their evidence and provenance. Weak evidence becomes
+a `needs_review` extension note. Low usage alone never deletes or marks a topic
+stale. The legacy `.pibot/MEMORY.md` and `.pibot/memory/` layout
 is still readable as a compatibility fallback, but new writes use
 `.pibot/memories/`.
+
+Historical rollout summaries can be curated explicitly in bounded batches:
+
+```bash
+npm run memory:backfill -- --limit 10
+```
+
+The command recovers pending jobs first, scans newest summaries first, and uses
+the audit log to skip completed runs on later invocations. `--limit` counts only
+newly enqueued runs and accepts `1` through `100`; add `--json` for structured
+counts. Backfilled summaries are labelled
+`historical_rollout_recap_only`: they provide provenance and routing context,
+not raw trace, diff, tool, browser, Provider, deployment, or production proof.
+Use `MEMORY_BACKFILL_TEAM_ID` and `MEMORY_BACKFILL_CHANNEL_ID` only when a
+distinct maintenance session key is needed.
 
 ## Pibot Skills
 
@@ -667,11 +887,39 @@ pibot has three runtime modes:
 Plan Mode is enforced by runtime hooks. While in Plan Mode, mutating tools are
 hidden or denied except for plan/task control tools. `update_plan` writes
 `PLAN.md` and can also write structured tasks to `tasks.json`. `exit_plan_mode`
-requests Slack approval before returning to Execute Mode.
+validates the task DAG and asks the user to approve the plan path, graph version,
+task digest, task count and write-capable task count. Approval freezes both the
+plan digest and `tasks.json` specification before returning to Execute Mode.
+Agent Mode remains a separate dynamic capability ceiling: call-time requirements
+are checked before approval and again immediately before a grant is issued.
 
-The Plan-and-Execute task store keeps task ids, dependencies, status, attempts,
-notes and bounded replan counts in `tasks.json`. The agent can use `tasks_read`
-and `task_update` to execute approved work item by item.
+The Plan-and-Execute task store keeps a versioned graph specification plus its
+runtime projection in `tasks.json`. Each task declares stable ids, dependencies
+and a child execution policy (`role`, `readOnly`, and optional budgets). After
+freeze, `TaskGraphScheduler` maps tasks to durable Workflow Steps and each child
+run to a Workflow Attempt. Runtime code computes ready tasks, dispatches all
+available independent work up to the child concurrency limit, consumes terminal
+status-file events, persists results and attempts, then unlocks dependents. The
+model may inspect this state with `tasks_read`, but `task_update` cannot advance a
+frozen graph. Bounded completed results and blocked-task failure summaries are
+also projected into the next Parent model step through World State, so the
+Parent does not have to call `agent_collect`. While a frozen graph is active,
+the runtime places an explicit completion hold on the Parent Run. When the graph
+reaches `succeeded` or `blocked`, the scheduler queues one runtime-generated
+follow-up, releases the hold, and starts a new UserTurn under the same Run and
+runtime state. The follow-up is persisted with `runtime` provenance rather than
+being represented as a new human instruction. A failed Parent turn or explicit
+Run cancellation still wins over the hold. Parent Run resurrection after a
+whole pibot process restart is not provided; durable workflow recovery resumes
+the child graph, and the next transport Run observes its state.
+
+Failed child attempts pass through `WorkflowOrchestrator` attempt, edge and
+circuit budgets. Mechanically retryable failures reuse the frozen task strategy;
+when the graph itself must change, the coordinator re-enters Plan Mode and writes
+an explicitly reasoned version. Runtime-completed tasks whose specification is
+unchanged are carried into the new draft; model-supplied status fields cannot
+claim completion. Once a newer draft exists, the previous workflow is marked
+superseded and cannot dispatch newly unlocked children.
 
 When `REFLECTION_ENABLED=true`, a completed Execute Mode run starts a bounded
 verification pass. Reflection asks the model to verify, critique, fix when
@@ -683,6 +931,25 @@ needed, verify again, and end with a status marker. It stops after
 Coordinator Mode uses tmux windows and independent child-agent processes for
 transparent multi-agent work. The default child command is the built-in
 `node dist/child-agent.js`, and `PIBOT_CHILD_AGENT_COMMAND` can override it.
+
+Child completion is event-driven for both approved TaskGraphs and direct
+Coordinator `agent_spawn` calls. Each direct call becomes a detached Workflow
+with one child Step and one or more bounded Attempts. The runtime watches the
+durable child `status.json`, rechecks it after watcher registration to close the
+startup race, persists the terminal result in the Workflow event log, and queues
+a runtime-generated UserTurn in the same Parent Run. The Parent therefore does
+not poll `agent_collect`; that tool remains available for explicit diagnostics.
+Failed attempts pass through the shared attempt, edge and circuit budgets before
+the Parent receives a blocked event. `agent_stop` cancels the owning Workflow so
+an intentional stop cannot trigger a mechanical retry.
+
+The in-process Parent Run has one completion hold per scheduled direct child, so
+children may finish independently and each accepted completion event resumes the
+same Run with its existing context and runtime state. Runtime follow-ups reserve
+queue entry capacity from ordinary user follow-ups, while still honoring the
+mailbox byte limit. On process restart, the attempt-to-child binding and status
+file remain sufficient to recover durable Workflow/child state, but the previous
+process-local Parent Run itself is not resurrected automatically.
 
 Child tasks are chosen by the model in the `agent_spawn.task` text. Roles are
 coarse execution and permission labels rather than fixed objective templates:

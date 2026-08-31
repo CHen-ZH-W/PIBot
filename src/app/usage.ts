@@ -7,6 +7,8 @@ import type {
   SlackChannelId,
   SlackUserId,
 } from "../core/ids";
+import type { ResolvedModel } from "../models/types";
+import type { ModelRuntime } from "../models/runtime";
 
 export interface UsagePricing {
   readonly strategy: string;
@@ -43,6 +45,7 @@ export interface UsageRecord {
   readonly startedAt: string;
   readonly endedAt: string;
   readonly durationMs: number;
+  readonly provider?: string;
   readonly model?: string;
   readonly reason: string;
   readonly errorCode?: string;
@@ -188,6 +191,33 @@ export function defaultUsagePricingForModel(
     inputCostPerMillionTokens: 6.5,
     outputCostPerMillionTokens: 27,
   };
+}
+
+export function usagePricingForResolvedModel(model: ResolvedModel): UsagePricing {
+  const pricing = model.spec.pricing;
+  if (pricing === undefined) {
+    return defaultUsagePricingForModel(model.ref.model, model.baseUrl);
+  }
+  return {
+    strategy: `${model.ref.provider}/${model.ref.model}:model-catalog`,
+    currency: pricing.currency,
+    inputCostPerMillionTokens: pricing.inputPerMillionTokens,
+    cachedInputCostPerMillionTokens:
+      pricing.cachedInputPerMillionTokens ?? pricing.inputPerMillionTokens,
+    outputCostPerMillionTokens: pricing.outputPerMillionTokens,
+  };
+}
+
+export function usagePricingForRuntimeModel(
+  runtime: ModelRuntime,
+  provider?: string,
+  model?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): UsagePricing {
+  const resolved = provider === undefined || model === undefined
+    ? runtime.activeModel()
+    : runtime.resolveModel({ provider, model });
+  return usagePricingFromEnv(usagePricingForResolvedModel(resolved), env);
 }
 
 export function usagePricingFromEnv(

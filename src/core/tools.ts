@@ -1,7 +1,25 @@
 import type { SlackUserId, ToolCallId, WorkspacePath } from "./ids";
 import type { SlackConversationRef } from "./slack";
+import type {
+  ToolCapabilityDelta,
+  ToolCapabilityRequest,
+} from "./capabilities";
 
 export type ToolName = string;
+
+/**
+ * Immutable execution authority captured at the beginning of one model Step.
+ * The model-facing tool list and the eventual executor must refer to this same
+ * snapshot; mutable policy may only tighten authority while the Step is active.
+ */
+export interface ToolExecutionSnapshot {
+  readonly schemaVersion: 1;
+  readonly authorityVersion: string;
+  readonly availableTools: readonly ToolName[];
+  readonly workspaceRoot?: string;
+  readonly runtimeStateVersion?: number;
+  readonly mode?: string;
+}
 
 /**
  * 职责：描述 read 工具读取单个 workspace 文件的输入。
@@ -59,6 +77,25 @@ export interface BashToolInput {
   readonly command: string;
   readonly cwd?: WorkspacePath;
   readonly timeoutMs?: number;
+  readonly permissions?: {
+    /**
+     * Workspace access required by this command. The string form preserves
+     * the legacy whole-workspace profile. The object form is path-scoped.
+     */
+    readonly filesystem:
+      | "read"
+      | "write"
+      | {
+          readonly read: readonly WorkspacePath[];
+          readonly write: readonly WorkspacePath[];
+        };
+    /** Whether the command needs outbound network sockets. */
+    readonly network: boolean;
+    /** Whether the command publishes or mutates state outside the workspace. */
+    readonly externalSideEffect: boolean;
+    /** Hint for approval UX; enforcement still comes from concrete capabilities. */
+    readonly destructive: boolean;
+  };
 }
 
 /**
@@ -101,7 +138,8 @@ export interface MemoryReadToolInput {
     | "topic"
     | "rollout_summary"
     | "extension_note"
-    | "audit";
+    | "audit"
+    | "usage";
   readonly topic?: string;
 }
 
@@ -444,6 +482,12 @@ export interface ToolApprovalRequest {
   readonly call: ToolCall;
   readonly risk: ToolApprovalRisk;
   readonly explanation: string;
+  /** Present for capability-aware calls; absent only for legacy callers. */
+  readonly capabilities?: ToolCapabilityRequest;
+  /** Capabilities/effects not covered by the baseline policy. */
+  readonly escalation?: ToolCapabilityDelta;
+  /** Whether the current approval gate can retain an exact rule for this Run. */
+  readonly runScopeAllowed?: boolean;
 }
 
 export interface ToolApprovalContext {
@@ -459,8 +503,10 @@ export interface ToolApprovalPromptRequest extends ToolApprovalRequest {
 export type ToolApprovalDecision =
   | {
       readonly approved: true;
+      readonly scope?: "once" | "run";
     }
   | {
       readonly approved: false;
       readonly reason: string;
+      readonly scope?: "once" | "run";
     };
