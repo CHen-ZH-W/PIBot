@@ -338,6 +338,15 @@ async function testWebUiBrowserScriptParses() {
   assert.match(WEBUI_SCRIPT, /data-approval-scope="run"/u);
   assert.match(WEBUI_SCRIPT, /Allow for run/u);
   assert.match(WEBUI_SCRIPT, /Deny for run/u);
+  assert.match(WEBUI_SCRIPT, /data-approval-scope="session"/u);
+  assert.match(WEBUI_SCRIPT, /Allow for session/u);
+  assert.match(WEBUI_SCRIPT, /Deny for session/u);
+  assert.match(WEBUI_SCRIPT, /data-approval-scope="repo"/u);
+  assert.match(WEBUI_SCRIPT, /Allow for repo/u);
+  assert.match(WEBUI_SCRIPT, /Deny for repo/u);
+  assert.match(serverSource, /\/api\/approval-rules/u);
+  assert.match(serverSource, /listApprovalRules/u);
+  assert.match(serverSource, /revokeApprovalRule/u);
   assert.match(WEBUI_SCRIPT, /event\.type === "approval_requested"/u);
   assert.match(WEBUI_SCRIPT, /approve-web-approval/u);
   assert.match(WEBUI_SCRIPT, /function timelineMessageForDisplay\(event\)/u);
@@ -3584,7 +3593,7 @@ async function testSlackInteractiveToolApproval() {
     context,
     timeoutMs: 1000,
   });
-  const decisionPromise = gate.reviewToolCall({
+  const approvalRequest = {
     call: {
       id: "bash-approval",
       name: "bash",
@@ -3594,7 +3603,8 @@ async function testSlackInteractiveToolApproval() {
     },
     risk: "high",
     explanation: "test approval",
-  });
+  };
+  const decisionPromise = gate.reviewToolCall(approvalRequest);
   await waitFor(() => slack.events.length === 1);
 
   const approvalId = readApprovalId(slack.events[0]);
@@ -3612,7 +3622,9 @@ async function testSlackInteractiveToolApproval() {
     ),
     true,
   );
-  assert.deepEqual(await decisionPromise, { approved: true, scope: "run" });
+  const approvedDecision = await decisionPromise;
+  assert.deepEqual(approvedDecision, { approved: true, scope: "run" });
+  await gate.commitToolApproval(approvalRequest, approvedDecision);
   assert.equal(slack.events.length, 2);
   assert.equal(slack.events[1].type, "message.update");
   assert.equal(

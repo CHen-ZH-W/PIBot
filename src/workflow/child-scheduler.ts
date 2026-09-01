@@ -80,6 +80,7 @@ export class ChildWorkflowScheduler {
         runId: run.runId,
         stepId: CHILD_STEP_ID,
         strategy: childStrategy(request),
+        recoveryPolicy: "resumable",
         circuitKey: childCircuitKey(this.options.externalKeyPrefix, request),
       });
       if (!admission.allowed || admission.attempt === undefined) {
@@ -134,19 +135,25 @@ export class ChildWorkflowScheduler {
   ): Promise<ChildAgentRunRecord | undefined> {
     const attempts = await this.options.workflows.store.readAttempts(run.runId);
     const latest = attempts.at(-1);
-    if (latest?.execution !== undefined) {
+    const activeAttempt = latest?.status === "interrupted"
+      ? await this.options.workflows.resumeAttempt({
+          runId: run.runId,
+          attemptId: latest.attemptId,
+        })
+      : latest;
+    if (activeAttempt?.execution !== undefined) {
       const collected = await this.options.childAgents.collectAgent(
-        latest.execution.childRunId as AgentRunId,
+        activeAttempt.execution.childRunId as AgentRunId,
       );
       if (isTerminalChildStatus(collected.run.status)) {
-        await this.handleTerminal(run, request, latest, collected.run);
+        await this.handleTerminal(run, request, activeAttempt, collected.run);
       } else {
-        this.observeTerminal(run, request, latest);
+        this.observeTerminal(run, request, activeAttempt);
       }
       return collected.run;
     }
-    if (latest?.status === "running" || latest?.status === "interrupted") {
-      return this.spawnForAttempt(run, request, latest);
+    if (activeAttempt?.status === "running") {
+      return this.spawnForAttempt(run, request, activeAttempt);
     }
     if (run.status === "succeeded" || run.status === "blocked") {
       this.releaseParentHold(run.runId);
@@ -360,6 +367,7 @@ export class ChildWorkflowScheduler {
       runId: run.runId,
       stepId: CHILD_STEP_ID,
       strategy: childStrategy(request),
+      recoveryPolicy: "resumable",
       triggerErrorFingerprint,
       edgeKey: "child.mechanical_retry",
       circuitKey: childCircuitKey(this.options.externalKeyPrefix, request),

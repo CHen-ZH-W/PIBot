@@ -39,6 +39,11 @@ export interface ToolApprovalGate {
     request: ToolApprovalRequest,
     signal?: AbortSignal,
   ): Promise<ToolApprovalDecision>;
+  /** Commits a newly approved scoped rule after mutable authority is rechecked. */
+  commitToolApproval?(
+    request: ToolApprovalRequest,
+    decision: ToolApprovalDecision,
+  ): Promise<void>;
 }
 
 /**

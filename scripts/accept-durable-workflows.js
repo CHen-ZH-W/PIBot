@@ -210,6 +210,9 @@ async function acceptsFrozenTaskGraphScheduling() {
 
     childRuntime.complete("b", "B evidence");
     await waitFor(() => childRuntime.startedTaskIds().includes("c"));
+    await waitFor(async () =>
+      (await taskStore.read()).tasks.find((task) => task.id === "c").status ===
+        "in_progress");
     projected = await taskStore.read();
     assert.equal(projected.tasks.find((task) => task.id === "c").status, "in_progress");
 
@@ -579,6 +582,7 @@ async function acceptsCoordinatorChildSameRunResume() {
         });
       },
     });
+    await scheduler.waitForIdle();
 
     assert.equal(result.reason, "completed");
     assert.equal(controller.runId, originalRunId);
@@ -894,12 +898,103 @@ async function acceptsPersistentDuplicateGuard() {
       checkpoint: { completedToolCallFingerprints: ["completed-before-restart"] },
     });
     assert.equal(await workflows.recoverInterruptedRuns(), 1);
-    assert.equal((await store.readRun(orphanedRun.runId)).status, "interrupted");
+    const interruptedRun = await store.readRun(orphanedRun.runId);
+    assert.equal(interruptedRun.status, "interrupted");
+    assert.equal(interruptedRun.recoveryDisposition, "resumable");
+    const interruptedStep = (await store.readSteps(orphanedRun.runId))[0];
+    assert.equal(interruptedStep.status, "interrupted");
+    assert.equal(interruptedStep.recoveryDisposition, "resumable");
     const interruptedAttempt = (await store.readAttempts(orphanedRun.runId))
       .find((attempt) => attempt.attemptId === orphanedAttempt.attempt.attemptId);
     assert.equal(interruptedAttempt.status, "interrupted");
+    assert.equal(interruptedAttempt.recoveryDisposition, "resumable");
     assert.equal(typeof interruptedAttempt.resultErrorFingerprint, "string");
-    assert.equal((await store.readFailureExperiences()).length, 3);
+    assert.equal((await store.readFailureExperiences()).length, 2);
+
+    const duplicateResume = await workflows.beginAttempt({
+      runId: orphanedRun.runId,
+      stepId: "agent_run",
+      strategy: { type: "resume_from_checkpoint" },
+      recoveryPolicy: "resumable",
+    });
+    assert.equal(duplicateResume.allowed, false);
+    assert.equal(duplicateResume.reason, "interrupted_step_requires_resume");
+    const resumedCheckpoint = await workflows.resumeAttempt({
+      runId: orphanedRun.runId,
+      attemptId: orphanedAttempt.attempt.attemptId,
+    });
+    assert.equal(resumedCheckpoint.status, "running");
+    assert.equal(
+      resumedCheckpoint.idempotencyPrefix,
+      orphanedAttempt.attempt.idempotencyPrefix,
+    );
+    await workflows.finishAttempt({
+      runId: orphanedRun.runId,
+      attemptId: resumedCheckpoint.attemptId,
+      success: true,
+      summary: "resumed from durable checkpoint",
+    });
+
+    const policies = [
+      { name: "safe", policy: "retry-safe" },
+      { name: "reconcile", policy: "needs-reconciliation" },
+      { name: "terminal", policy: "terminal-failed" },
+    ];
+    for (const item of policies) {
+      const policyRun = await workflows.ensureRun({
+        kind: `restart_${item.name}`,
+        lifecycle: "detached",
+      });
+      await workflows.ensureStep({
+        runId: policyRun.runId,
+        stepId: "work",
+        kind: "test",
+      });
+      await workflows.beginAttempt({
+        runId: policyRun.runId,
+        stepId: "work",
+        strategy: { type: item.name },
+        recoveryPolicy: item.policy,
+      });
+      item.runId = policyRun.runId;
+    }
+    assert.equal(await workflows.recoverInterruptedRuns(), 3);
+    for (const item of policies) {
+      const [policyStep] = await store.readSteps(item.runId);
+      assert.equal(policyStep.status, "interrupted");
+      assert.equal(policyStep.recoveryDisposition, item.policy);
+    }
+    const safeRetry = await workflows.beginAttempt({
+      runId: policies[0].runId,
+      stepId: "work",
+      strategy: { type: "safe-retry" },
+      recoveryPolicy: "retry-safe",
+    });
+    assert.equal(safeRetry.allowed, true);
+    const deniedReconciliation = await workflows.beginAttempt({
+      runId: policies[1].runId,
+      stepId: "work",
+      strategy: { type: "unsafe-auto-retry" },
+    });
+    assert.equal(deniedReconciliation.allowed, false);
+    assert.equal(
+      deniedReconciliation.reason,
+      "interrupted_step_needs_reconciliation",
+    );
+    const reconciled = await workflows.beginAttempt({
+      runId: policies[1].runId,
+      stepId: "work",
+      strategy: { type: "operator-reconciled" },
+      reconcileInterrupted: true,
+    });
+    assert.equal(reconciled.allowed, true);
+    const terminalRetry = await workflows.beginAttempt({
+      runId: policies[2].runId,
+      stepId: "work",
+      strategy: { type: "must-not-retry" },
+    });
+    assert.equal(terminalRetry.allowed, false);
+    assert.equal(terminalRetry.reason, "interrupted_step_terminal_failed");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

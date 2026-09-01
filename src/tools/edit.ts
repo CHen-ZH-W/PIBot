@@ -25,6 +25,18 @@ export const editTool: CodingToolDefinition<"edit", EditToolInput, FileMutationO
       { capability: "filesystem.write", paths: [input.path] },
     ],
   }),
+  async preflightAuthorization(input, context) {
+    const filePath = await resolveWorkspacePath(
+      context.workspaceRoot,
+      input.path,
+      {
+        access: "mutate",
+        policy: context.sandboxExecutor.policy,
+      },
+    );
+    await assertFileSize(filePath, context.maxFileBytes, "edit file");
+    return undefined;
+  },
   parse: parseEditInput,
   concurrencyKey: (input) => `file:${input.path}`,
   description:

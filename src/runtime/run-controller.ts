@@ -268,6 +268,7 @@ export class AgentRunController<FollowUp> {
     options: AgentUserTurnDriverOptions<FollowUp, Result>,
   ): Promise<Result> {
     try {
+      await this.openDurableExecution();
       let input = options.initial;
       while (true) {
         this.lastUserTurnTerminal = undefined;
@@ -284,6 +285,7 @@ export class AgentRunController<FollowUp> {
         this.currentRunContext.nextStepInbox.closeUserTurn(
           this.currentRunContext.userTurnId,
         );
+        await this.finishDurableUserTurn(this.lastUserTurnTerminal);
         let runDecision = decideAfterUserTurn({
           cancelled: this.cancelled,
           hasQueuedFollowUp: this.nextTurnQueue.size > 0,
@@ -301,34 +303,49 @@ export class AgentRunController<FollowUp> {
           });
         }
         if (runDecision.type === "abort_run") {
-          this.recordRunTerminal({
+          const terminal: Extract<RuntimeTransition, { type: "abort_run" }> = {
             type: "abort_run",
             runId: this.runId,
             cancellation: this.ensureCancellation(),
-          });
+          };
+          this.recordRunTerminal(terminal);
+          await this.finishDurableRun(terminal);
           await this.flushTransitions();
           return result;
         }
         if (runDecision.type === "complete_run") {
-          this.recordRunTerminal({ type: "complete_run", runId: this.runId });
+          const terminal: Extract<RuntimeTransition, { type: "complete_run" }> = {
+            type: "complete_run",
+            runId: this.runId,
+          };
+          this.recordRunTerminal(terminal);
+          await this.finishDurableRun(terminal);
           await this.flushTransitions();
           return result;
         }
         if (runDecision.type === "fail_run") {
-          this.recordRunTerminal({
+          const terminal: Extract<RuntimeTransition, { type: "fail_run" }> = {
             type: "fail_run",
             runId: this.runId,
             error: runDecision.error,
-          });
+          };
+          this.recordRunTerminal(terminal);
+          await this.finishDurableRun(terminal);
           await this.flushTransitions();
           return result;
         }
         const next = this.startNextFollowUp();
         if (next === undefined) {
-          this.recordRunTerminal({ type: "complete_run", runId: this.runId });
+          const terminal: Extract<RuntimeTransition, { type: "complete_run" }> = {
+            type: "complete_run",
+            runId: this.runId,
+          };
+          this.recordRunTerminal(terminal);
+          await this.finishDurableRun(terminal);
           await this.flushTransitions();
           return result;
         }
+        await this.openDurableUserTurn();
         await this.flushTransitions();
         await options.onFollowUpStart?.(next, this.currentRunContext);
         input = next;
@@ -348,11 +365,14 @@ export class AgentRunController<FollowUp> {
           "user_turn_failed",
         );
       }
-      this.recordRunTerminal({
+      await this.finishDurableUserTurn(this.lastUserTurnTerminal);
+      const runTerminal: Extract<RuntimeTransition, { type: "fail_run" }> = {
         type: "fail_run",
         runId: this.runId,
         error: unknownRunError(error),
-      });
+      };
+      this.recordRunTerminal(runTerminal);
+      await this.finishDurableRun(runTerminal);
       await this.flushTransitions();
       throw error;
     }
@@ -371,6 +391,7 @@ export class AgentRunController<FollowUp> {
     }
     this.activeUserTurnExecution = executionUserTurnId;
     try {
+      await this.openDurableExecution();
       let attemptedSteps = 0;
       const recovery = options.lifecycle?.contextRecovery;
       let result = await driveWithContextRecovery(this, {
@@ -412,6 +433,7 @@ export class AgentRunController<FollowUp> {
       this.currentRunContext.nextStepInbox.closeUserTurn(
         this.currentRunContext.userTurnId,
       );
+      await this.finishDurableUserTurn(terminal);
       await this.flushTransitions();
       return result;
     } catch (error: unknown) {
@@ -425,6 +447,7 @@ export class AgentRunController<FollowUp> {
         this.currentRunContext.userTurnId,
         "user_turn_failed",
       );
+      await this.finishDurableUserTurn(terminal);
       await this.flushTransitions();
       throw error;
     } finally {
@@ -454,6 +477,12 @@ export class AgentRunController<FollowUp> {
         agentId: this.currentRunContext.agentId,
         state: this.currentRunContext.state,
         nextStepInbox: this.currentRunContext.nextStepInbox,
+        ...(this.currentRunContext.durability === undefined
+          ? {}
+          : { durability: this.currentRunContext.durability }),
+        ...(this.currentRunContext.durableScope === undefined
+          ? {}
+          : { durableScope: this.currentRunContext.durableScope }),
       }),
     );
     this.lastUserTurnTerminal = undefined;
@@ -511,6 +540,68 @@ export class AgentRunController<FollowUp> {
         this.recordTransition(transition);
       },
     };
+  }
+
+  private async openDurableExecution(): Promise<void> {
+    const durability = this.currentRunContext.durability;
+    if (durability === undefined) return;
+    await durability.openRun({
+      runId: this.currentRunContext.runId,
+      scope: this.currentRunContext.durableScope ??
+        `run:${this.currentRunContext.runId}`,
+      agentId: this.currentRunContext.agentId,
+      ...(this.currentRunContext.parentRunId === undefined
+        ? {}
+        : { parentRunId: this.currentRunContext.parentRunId }),
+    });
+    await this.openDurableUserTurn();
+  }
+
+  private async openDurableUserTurn(): Promise<void> {
+    await this.currentRunContext.durability?.openUserTurn({
+      runId: this.currentRunContext.runId,
+      userTurnId: this.currentRunContext.userTurnId,
+    });
+  }
+
+  private async finishDurableUserTurn(
+    transition: UserTurnTerminalTransition | undefined,
+  ): Promise<void> {
+    if (transition === undefined) return;
+    await this.currentRunContext.durability?.finishUserTurn({
+      runId: this.currentRunContext.runId,
+      userTurnId: transition.userTurnId,
+      status: transition.type === "complete_user_turn"
+        ? "completed"
+        : transition.type === "abort_user_turn"
+          ? "cancelled"
+          : "failed",
+      ...(transition.type === "fail_user_turn"
+        ? { reason: transition.error.message }
+        : transition.type === "abort_user_turn"
+          ? { reason: transition.cancellation?.reason ?? "user_turn_aborted" }
+          : {}),
+    });
+  }
+
+  private async finishDurableRun(
+    transition: Extract<RuntimeTransition, {
+      readonly type: "complete_run" | "abort_run" | "fail_run";
+    }>,
+  ): Promise<void> {
+    await this.currentRunContext.durability?.finishRun({
+      runId: this.currentRunContext.runId,
+      status: transition.type === "complete_run"
+        ? "completed"
+        : transition.type === "abort_run"
+          ? "cancelled"
+          : "failed",
+      ...(transition.type === "fail_run"
+        ? { reason: transition.error.message }
+        : transition.type === "abort_run"
+          ? { reason: transition.cancellation.reason }
+          : {}),
+    });
   }
 
   private ensureCancellation(): RuntimeCancellation {

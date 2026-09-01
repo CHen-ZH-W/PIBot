@@ -9,7 +9,7 @@ workspace Skills, Plan/Reflection workflows, transport adapters and
 Linux-native or Docker command sandboxes.
 
 The current application supports WebUI sessions, Slack app mentions and DMs,
-streaming ReAct tool use, one-shot and run-scoped approvals, file upload/download,
+streaming ReAct tool use, one-shot/run/session/repo approvals, file upload/download,
 multimodal image attachments, TypeScript LSP lookup, repo checks, context
 compaction, structured trace/usage logs and tmux-backed child agents.
 
@@ -166,7 +166,7 @@ the configured sandbox container workspace. File tools reject:
 - paths outside the workspace
 - symbolic links in requested paths
 - protected runtime and secret paths such as `.git/`, `.pibot/`, `.env*`,
-  `.npmrc`, `.netrc`, `context.jsonl`, `log.jsonl`, `MEMORY.md`, `repo.json`,
+  `.npmrc`, `.netrc`, `approval-rules.jsonl`, `context.jsonl`, `log.jsonl`, `MEMORY.md`, `repo.json`,
   `trace.jsonl` and `usage.jsonl`
 - files larger than `TOOL_MAX_FILE_BYTES`
 
@@ -225,16 +225,35 @@ The four existing modes remain named policy profiles:
 | `approval-required` | Allow reads; ask before every other capability |
 | `full-access` | Allow all requested capabilities |
 
-The default is `read-only`. When approval is required, pibot posts `Allow once`,
-`Allow for run`, `Reject once`, and `Deny for run` actions. Run-scoped rules use
-an exact key over the approval mode, Tool name and canonical full capability
-request; changed paths, commands, hosts or effects require a new decision. Rules
-are bound to the current Runtime State, survive its follow-up UserTurns, and are
-not inherited by child agents. Only the Slack user who started the run can
-decide. Approval does not change the global mode. The wait expires after
-`TOOL_APPROVAL_TIMEOUT_MS`. PIBot checks the current Agent Mode again after the
-wait, so entering Plan or Coordinator Mode while a prompt is pending revokes a
-now-incompatible approval.
+The default is `read-only`. When approval is required, pibot offers allow/deny
+actions for one call, the current Run, the current session, or the current
+repo/workspace. Every reusable rule uses an exact key over the approval mode,
+Tool name and canonical full capability request; changed paths, commands, hosts
+or effects require a new decision. Run rules live on the current Runtime State
+and survive its follow-up UserTurns. Session and repo rules are append-only in
+`.pibot/approval-rules.jsonl`, survive restarts, and bind the approving user plus
+an exact session/repo fingerprint. A session rule also binds the current
+repo/workspace so switching a conversation to another repo cannot carry its
+authority across. Child agents use the same persistent store when approval is
+bridged to the parent, but never inherit a parent's Run-only rules.
+
+Only the Slack user who started the run can decide. Approval does not change the
+global mode. The wait expires after `TOOL_APPROVAL_TIMEOUT_MS`. PIBot checks the
+current Agent Mode, call digest and SandboxPolicy version again after the wait;
+a reusable allow rule is committed only after these checks pass, so a stale
+approval neither executes nor leaves authority behind. Persistent denies can be
+listed with `GET /api/approval-rules` and revoked by id with
+`DELETE /api/approval-rules/<id>` in the WebUI API.
+
+Before an approval prompt is emitted, Bash resolves the requested capabilities,
+the executor-owned `SandboxPolicy`, workspace paths and declared backend
+enforcement into an `EffectiveSandboxCallPolicy`. Protected, missing or symlink
+scopes and backend/path combinations that cannot be enforced fail before the
+user is asked. The prompt includes the preflighted backend and policy version;
+the active Grant is checked against the same policy again inside the executor.
+Direct read/write/edit/attach tools likewise preflight their policy-owned path
+boundary (and applicable size/context checks) before prompting, then repeat the
+checks at execution to retain TOCTOU protection.
 
 `bash.permissions` lets a call declare its least authority. The compatible
 `filesystem: "read" | "write"` form covers the whole workspace. A scoped call

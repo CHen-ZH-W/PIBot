@@ -12,6 +12,10 @@ import type {
 } from "../core/capabilities";
 import { capabilityRequestDigest } from "../core/capabilities";
 import type { ToolApprovalGate, ToolApprovalPrompter } from "../ports/tools";
+import type {
+  PersistentToolApprovalRuleStore,
+  ToolApprovalRuleMatchRequest,
+} from "./approval-rules";
 
 export type ToolApprovalMode =
   | "read-only"
@@ -23,6 +27,8 @@ export interface ToolApprovalGateOptions {
   readonly prompter?: ToolApprovalPrompter;
   readonly context?: ToolApprovalContext;
   readonly rules?: ToolApprovalRuleStore;
+  readonly persistentRules?: PersistentToolApprovalRuleStore;
+  readonly workspaceRoot?: string;
   readonly timeoutMs?: number;
   readonly onDecision?: (event: {
     readonly request: ToolApprovalRequest;
@@ -38,6 +44,7 @@ export interface ToolApprovalGateOptions {
 export class PolicyToolApprovalGate implements ToolApprovalGate {
   private readonly timeoutMs: number;
   private readonly rules: ToolApprovalRuleStore;
+  private readonly pendingRetentions = new WeakSet<object>();
 
   constructor(
     private readonly mode: ToolApprovalMode = "read-only",
@@ -76,13 +83,32 @@ export class PolicyToolApprovalGate implements ToolApprovalGate {
           scope: "run",
         });
       }
+      const persistentMatch = await this.findPersistentRule(request, ruleKey);
+      if (persistentMatch !== undefined) {
+        return this.recordDecision(request, policy, persistentMatch.effect === "allow"
+          ? { approved: true, scope: persistentMatch.scope }
+          : {
+              approved: false,
+              scope: persistentMatch.scope,
+              reason:
+                `Tool "${request.call.name}" is denied by a ` +
+                `${persistentMatch.scope}-scoped approval rule`,
+            });
+      }
       if (this.options.prompter !== undefined && this.options.context !== undefined) {
+        const persistentScopeAllowed = this.persistentRuleRequest(
+          request,
+          ruleKey,
+        ) !== undefined;
         const promptRequest: ToolApprovalRequest = {
           ...request,
           ...(evaluation.escalation === undefined
             ? {}
             : { escalation: evaluation.escalation }),
           runScopeAllowed: true,
+          ...(persistentScopeAllowed
+            ? { sessionScopeAllowed: true, repoScopeAllowed: true }
+            : {}),
         };
         const decision = await this.options.prompter.requestToolApproval(
           {
@@ -92,16 +118,27 @@ export class PolicyToolApprovalGate implements ToolApprovalGate {
           },
           signal,
         );
-        if (decision.scope === "run") {
-          if (decision.approved) {
-            this.rules.allowed.add(ruleKey);
-            this.rules.denied.delete(ruleKey);
-          } else {
-            this.rules.denied.add(ruleKey);
-            this.rules.allowed.delete(ruleKey);
+        if (decision.scope === "session" || decision.scope === "repo") {
+          const persistentRequest = this.persistentRuleRequest(request, ruleKey);
+          if (persistentRequest === undefined) {
+            return this.recordDecision(promptRequest, policy, {
+              approved: false,
+              reason:
+                `Tool "${request.call.name}" requested unavailable ` +
+                `${decision.scope}-scoped approval persistence`,
+            });
           }
         }
-        return this.recordDecision(promptRequest, policy, decision);
+        const reviewedDecision: ToolApprovalDecision =
+          decision.scope === "run" ||
+            decision.scope === "session" ||
+            decision.scope === "repo"
+            ? { ...decision }
+            : decision;
+        if (reviewedDecision.scope !== undefined && reviewedDecision.scope !== "once") {
+          this.pendingRetentions.add(reviewedDecision);
+        }
+        return this.recordDecision(promptRequest, policy, reviewedDecision);
       }
 
       return this.recordDecision(request, policy, {
@@ -118,6 +155,73 @@ export class PolicyToolApprovalGate implements ToolApprovalGate {
         `Tool "${request.call.name}" is ${request.risk} risk and is denied ` +
         `by TOOL_APPROVAL_MODE=${this.mode}`,
     });
+  }
+
+  async commitToolApproval(
+    request: ToolApprovalRequest,
+    decision: ToolApprovalDecision,
+  ): Promise<void> {
+    if (!this.pendingRetentions.has(decision) || decision.scope === undefined) {
+      return;
+    }
+    this.pendingRetentions.delete(decision);
+    const ruleKey = approvalRuleKey(this.mode, request);
+    if (decision.scope === "run") {
+      if (decision.approved) {
+        this.rules.allowed.add(ruleKey);
+        this.rules.denied.delete(ruleKey);
+      } else {
+        this.rules.denied.add(ruleKey);
+        this.rules.allowed.delete(ruleKey);
+      }
+      return;
+    }
+    if (decision.scope === "session" || decision.scope === "repo") {
+      const persistentRequest = this.persistentRuleRequest(request, ruleKey);
+      if (persistentRequest === undefined) {
+        throw new Error(
+          `${decision.scope}-scoped approval persistence is unavailable`,
+        );
+      }
+      await this.options.persistentRules?.remember({
+        ...persistentRequest,
+        scope: decision.scope,
+        effect: decision.approved ? "allow" : "deny",
+      });
+    }
+  }
+
+  private persistentRuleRequest(
+    request: ToolApprovalRequest,
+    ruleKey: string,
+  ): ToolApprovalRuleMatchRequest | undefined {
+    if (
+      request.capabilities === undefined ||
+      this.options.persistentRules === undefined ||
+      this.options.context === undefined ||
+      this.options.workspaceRoot === undefined
+    ) {
+      return undefined;
+    }
+    return {
+      ruleKey,
+      mode: this.mode,
+      toolName: request.call.name,
+      identity: {
+        context: this.options.context,
+        workspaceRoot: this.options.workspaceRoot,
+      },
+    };
+  }
+
+  private async findPersistentRule(
+    request: ToolApprovalRequest,
+    ruleKey: string,
+  ) {
+    const persistentRequest = this.persistentRuleRequest(request, ruleKey);
+    return persistentRequest === undefined
+      ? undefined
+      : this.options.persistentRules?.find(persistentRequest);
   }
 
   private async recordDecision(

@@ -32,6 +32,7 @@ import { WorkflowOrchestrator } from "./workflow/orchestrator";
 import { FileWorkflowStore } from "./workflow/store";
 import { createConfiguredModelClient } from "./models/runtime";
 import { AgentRuntime } from "./runtime/agent-runtime";
+import { FileDurableLifecycleAuthority } from "./runtime/durable-lifecycle";
 
 async function main(): Promise<void> {
   const workspaceRoot = process.env.WORKSPACE_ROOT ?? process.cwd();
@@ -225,7 +226,19 @@ async function main(): Promise<void> {
     label: readOptionalEnv("PIBOT_EVOLUTION_RESTART_LABEL"),
     delayMs: readNonNegativeIntegerEnv("PIBOT_EVOLUTION_RESTART_DELAY_MS"),
   });
-  const agentRuntime = new AgentRuntime();
+  const durableLifecycle = new FileDurableLifecycleAuthority({
+    rootDir: path.join(storeRoot, "runtime-lifecycle"),
+  });
+  const lifecycleRecovery = await durableLifecycle.recoverInterrupted();
+  if (lifecycleRecovery.recoveredRuns > 0) {
+    logger.warn("runtime_lifecycle_recovered", {
+      recoveredRuns: lifecycleRecovery.recoveredRuns,
+      interruptedTurns: lifecycleRecovery.interruptedTurns,
+      interruptedSteps: lifecycleRecovery.interruptedSteps,
+      interruptedTools: lifecycleRecovery.interruptedTools,
+    });
+  }
+  const agentRuntime = new AgentRuntime({ durability: durableLifecycle });
   await startWebUiServer({
     host,
     port,

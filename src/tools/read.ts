@@ -22,6 +22,18 @@ export const readTool: CodingToolDefinition<"read", ReadToolInput, ReadToolOutpu
   resolveCapabilities: (input) => ({
     requirements: [{ capability: "filesystem.read", paths: [input.path] }],
   }),
+  async preflightAuthorization(input, context) {
+    const filePath = await resolveWorkspacePath(
+      context.workspaceRoot,
+      input.path,
+      {
+        access: "read",
+        policy: context.sandboxExecutor.policy,
+      },
+    );
+    await assertFileSize(filePath, context.maxFileBytes, "read file");
+    return undefined;
+  },
   parse: parseReadInput,
   description:
     "Read a UTF-8 text file inside the workspace. Supports zero-based line offset and line limit. Output is truncated when too long.",

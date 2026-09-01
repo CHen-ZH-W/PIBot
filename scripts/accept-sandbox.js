@@ -82,11 +82,25 @@ async function acceptsUnsupportedScopedBackendDenial() {
     externalSideEffect: false,
     destructive: false,
   };
+  let approvalPrompts = 0;
+  const approvalGate = createToolApprovalGate("approval-required", {
+    context: {
+      conversation: { teamId: "T-preflight", channelId: "D-preflight" },
+      requestedByUserId: "U-preflight",
+    },
+    prompter: {
+      async requestToolApproval() {
+        approvalPrompts += 1;
+        return { approved: true };
+      },
+    },
+  });
   const hostResult = await executeBash({
     workspaceRoot,
     sandboxExecutor: createSandboxExecutor({ kind: "host", enabled: true }),
     command: "cat input.txt",
     permissions,
+    approvalGate,
     timeoutMs: 1000,
   });
   assert.equal(hostResult.ok, false);
@@ -102,10 +116,12 @@ async function acceptsUnsupportedScopedBackendDenial() {
     }),
     command: "cat input.txt",
     permissions,
+    approvalGate,
     timeoutMs: 1000,
   });
   assert.equal(dockerResult.ok, false);
   assert.match(dockerResult.error.message, /cannot enforce per-call path scopes/u);
+  assert.equal(approvalPrompts, 0);
 }
 
 async function acceptsDockerFileBoundary() {
@@ -537,7 +553,8 @@ async function executeBash(options, signal) {
   const tools = createCodingToolExecutor({
     workspaceRoot,
     sandboxExecutor: options.sandboxExecutor,
-    approvalGate: createToolApprovalGate("full-access"),
+    approvalGate:
+      options.approvalGate ?? createToolApprovalGate("full-access"),
     maxCommandOutputChars: options.maxCommandOutputChars ?? 1000,
     defaultShellTimeoutMs: options.defaultShellTimeoutMs ?? 1000,
     maxShellTimeoutMs: options.maxShellTimeoutMs ?? 600000,

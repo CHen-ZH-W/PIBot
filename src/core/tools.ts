@@ -323,6 +323,8 @@ export interface ToolMetadata {
   readonly name: ToolName;
   readonly riskLevel: ToolRiskLevel;
   readonly executionMode: ToolExecutionMode;
+  /** Crash recovery contract; riskLevel remains authorization, not replay policy. */
+  readonly recoveryPolicy?: import("./recovery").RecoveryDisposition;
 }
 
 export type ToolCallParseResult =
@@ -488,6 +490,22 @@ export interface ToolApprovalRequest {
   readonly escalation?: ToolCapabilityDelta;
   /** Whether the current approval gate can retain an exact rule for this Run. */
   readonly runScopeAllowed?: boolean;
+  /** Whether an exact rule can be retained for this conversation/session. */
+  readonly sessionScopeAllowed?: boolean;
+  /** Whether an exact rule can be retained for this repo/workspace identity. */
+  readonly repoScopeAllowed?: boolean;
+  /** Effective backend policy checked before an interactive approval is requested. */
+  readonly sandbox?: ToolApprovalSandboxPolicy;
+}
+
+export interface ToolApprovalSandboxPolicy {
+  readonly policyVersion: string;
+  readonly backend: "disabled" | "host" | "docker" | "linux-native";
+  readonly filesystemEnforcement: "none" | "workspace" | "path-scoped";
+  readonly networkEnforcement: "none" | "static" | "per-call";
+  readonly readPaths: readonly string[];
+  readonly writePaths: readonly string[];
+  readonly networkEnabled: boolean;
 }
 
 export interface ToolApprovalContext {
@@ -503,10 +521,10 @@ export interface ToolApprovalPromptRequest extends ToolApprovalRequest {
 export type ToolApprovalDecision =
   | {
       readonly approved: true;
-      readonly scope?: "once" | "run";
+      readonly scope?: "once" | "run" | "session" | "repo";
     }
   | {
       readonly approved: false;
       readonly reason: string;
-      readonly scope?: "once" | "run";
+      readonly scope?: "once" | "run" | "session" | "repo";
     };

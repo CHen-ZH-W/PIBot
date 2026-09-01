@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import {
+  combineRecoveryDispositions,
+  isRecoveryDisposition,
+  type RecoveryDisposition,
+} from "../core/recovery";
 import { fingerprintCanonical, fingerprintError, fingerprintStrategy } from "./fingerprints";
 import { FileWorkflowStore } from "./store";
 import type {
@@ -183,6 +188,9 @@ export class WorkflowOrchestrator {
     readonly circuitKey?: string;
     readonly versions?: WorkflowVersionSnapshot;
     readonly allowDuplicateStrategy?: boolean;
+    readonly recoveryPolicy?: RecoveryDisposition;
+    /** Explicit operator/domain acknowledgement after external reconciliation. */
+    readonly reconcileInterrupted?: boolean;
   }): Promise<AttemptAdmission> {
     return this.enqueue(async () => {
       const run = await this.store.readRun(input.runId);
@@ -206,6 +214,29 @@ export class WorkflowOrchestrator {
       if (step.status === "running" || step.status === "succeeded" ||
           step.status === "skipped") {
         return this.denyAttempt(run, step, `step_is_${step.status}`);
+      }
+      if (step.status === "interrupted") {
+        const disposition = step.recoveryDisposition ?? "needs-reconciliation";
+        if (disposition === "terminal-failed") {
+          return this.rejectAttempt(run, step, "interrupted_step_terminal_failed");
+        }
+        if (disposition === "resumable") {
+          return this.denyAttempt(
+            run,
+            step,
+            "interrupted_step_requires_resume",
+          );
+        }
+        if (
+          disposition === "needs-reconciliation" &&
+          input.reconcileInterrupted !== true
+        ) {
+          return this.denyAttempt(
+            run,
+            step,
+            "interrupted_step_needs_reconciliation",
+          );
+        }
       }
 
       if (isTerminalWithoutRetry(run.status)) {
@@ -253,6 +284,7 @@ export class WorkflowOrchestrator {
           ? {}
           : { triggerErrorFingerprint: input.triggerErrorFingerprint }),
         idempotencyPrefix: `${run.runId}/${step.stepId}/${step.attemptsUsed + 1}`,
+        recoveryPolicy: input.recoveryPolicy ?? "needs-reconciliation",
         ...(input.circuitKey === undefined ? {} : { circuitKey: input.circuitKey }),
         versions: { ...run.versions, ...input.versions },
         createdAt: now,
@@ -260,8 +292,13 @@ export class WorkflowOrchestrator {
       };
       await this.store.writeAttempts(run.runId, (current) => [...current, attempt]);
       const updatedRun = await this.store.updateRun(run.runId, (current) => {
-        const { endedAt: _endedAt, terminalReason: _terminalReason, ...active } =
-          current;
+        const {
+          endedAt: _endedAt,
+          terminalReason: _terminalReason,
+          recoveryDisposition: _recoveryDisposition,
+          recoveryReason: _recoveryReason,
+          ...active
+        } = current;
         return {
           ...active,
           status: "running",
@@ -369,7 +406,13 @@ export class WorkflowOrchestrator {
       const runState = deriveRunState(updatedSteps, input.success ? "running" : "retrying");
       await this.store.updateRun(run.runId, (current) => {
         const terminal = runState.status === "succeeded" || runState.status === "blocked";
-        const { endedAt: _endedAt, terminalReason: _terminalReason, ...active } = current;
+        const {
+          endedAt: _endedAt,
+          terminalReason: _terminalReason,
+          recoveryDisposition: _recoveryDisposition,
+          recoveryReason: _recoveryReason,
+          ...active
+        } = current;
         return {
           ...active,
           status: runState.status,
@@ -429,6 +472,84 @@ export class WorkflowOrchestrator {
     });
   }
 
+  resumeAttempt(input: {
+    readonly runId: string;
+    readonly attemptId: string;
+  }): Promise<WorkflowAttemptRecord> {
+    return this.enqueue(async () => {
+      const attempts = await this.store.readAttempts(input.runId);
+      const attempt = requireAttempt(attempts, input.attemptId);
+      if (attempt.status === "running") return attempt;
+      if (attempt.status !== "interrupted") {
+        throw new Error(
+          `Workflow attempt ${input.attemptId} is not interrupted`,
+        );
+      }
+      const step = requireStep(
+        await this.store.readSteps(input.runId),
+        attempt.stepId,
+      );
+      const disposition = attempt.recoveryDisposition ??
+        step.recoveryDisposition ??
+        classifyInterruptedAttempt(attempt, step).disposition;
+      if (disposition !== "resumable") {
+        throw new Error(
+          `Workflow attempt ${input.attemptId} is ${disposition}, not resumable`,
+        );
+      }
+      const now = new Date().toISOString();
+      const {
+        endedAt: _endedAt,
+        summary: _summary,
+        resultErrorFingerprint: _resultErrorFingerprint,
+        recoveryDisposition: _recoveryDisposition,
+        recoveryReason: _recoveryReason,
+        ...activeAttempt
+      } = attempt;
+      const resumed: WorkflowAttemptRecord = {
+        ...activeAttempt,
+        status: "running",
+        updatedAt: now,
+      };
+      await this.store.writeAttempts(input.runId, (current) =>
+        current.map((candidate) =>
+          candidate.attemptId === input.attemptId ? resumed : candidate));
+      await this.store.writeSteps(input.runId, (current) =>
+        current.map((candidate) => {
+          if (candidate.stepId !== attempt.stepId) return candidate;
+          const {
+            terminalReason: _terminalReason,
+            recoveryDisposition: _stepRecoveryDisposition,
+            recoveryReason: _stepRecoveryReason,
+            ...activeStep
+          } = candidate;
+          return { ...activeStep, status: "running" as const, updatedAt: now };
+        }));
+      await this.store.updateRun(input.runId, (current) => {
+        const {
+          endedAt: _runEndedAt,
+          terminalReason: _runTerminalReason,
+          recoveryDisposition: _runRecoveryDisposition,
+          recoveryReason: _runRecoveryReason,
+          ...activeRun
+        } = current;
+        return { ...activeRun, status: "running", updatedAt: now };
+      });
+      await this.store.appendEvent({
+        runId: input.runId,
+        stepId: attempt.stepId,
+        attemptId: attempt.attemptId,
+        type: "attempt.resumed",
+        payload: {
+          ordinal: attempt.ordinal,
+          strategyFingerprint: attempt.strategyFingerprint,
+          idempotencyPrefix: attempt.idempotencyPrefix,
+        },
+      });
+      return resumed;
+    });
+  }
+
   refreshGraph(runId: string): Promise<WorkflowGraphState> {
     return this.enqueue(async () => {
       const existingRun = await this.store.readRun(runId);
@@ -447,7 +568,13 @@ export class WorkflowOrchestrator {
       const derived = deriveRunState(steps, "queued");
       const run = await this.store.updateRun(runId, (current) => {
         const terminal = derived.status === "succeeded" || derived.status === "blocked";
-        const { endedAt: _endedAt, terminalReason: _terminalReason, ...active } = current;
+        const {
+          endedAt: _endedAt,
+          terminalReason: _terminalReason,
+          recoveryDisposition: _recoveryDisposition,
+          recoveryReason: _recoveryReason,
+          ...active
+        } = current;
         return {
           ...active,
           status: derived.status,
@@ -563,7 +690,22 @@ export class WorkflowOrchestrator {
     return this.enqueue(async () => {
       let recovered = 0;
       for (const run of await this.store.listRuns()) {
-        if (run.status !== "running" && run.status !== "retrying") {
+        const attempts = await this.store.readAttempts(run.runId);
+        const interruptedAttempts = attempts.filter((attempt) =>
+          attempt.status === "running");
+        const existingSteps = await this.store.readSteps(run.runId);
+        const openStepIds = new Set([
+          ...existingSteps
+            .filter((step) => step.status === "running")
+            .map((step) => step.stepId),
+          ...interruptedAttempts.map((attempt) => attempt.stepId),
+        ]);
+        if (
+          run.status !== "running" &&
+          run.status !== "retrying" &&
+          openStepIds.size === 0 &&
+          interruptedAttempts.length === 0
+        ) {
           continue;
         }
         recovered += 1;
@@ -573,66 +715,91 @@ export class WorkflowOrchestrator {
           errorCode: "orchestrator_interrupted",
           message: reason,
         });
-        const attempts = await this.store.readAttempts(run.runId);
-        const interruptedAttempts = attempts.filter((attempt) =>
-          attempt.status === "running");
+        const attemptDecisions = new Map(
+          interruptedAttempts.map((attempt) => {
+            const step = requireStep(existingSteps, attempt.stepId);
+            return [attempt.attemptId, classifyInterruptedAttempt(attempt, step)] as const;
+          }),
+        );
+        const stepDecisions = new Map<string, WorkflowRecoveryDecision>();
+        for (const step of existingSteps.filter((candidate) =>
+          openStepIds.has(candidate.stepId))) {
+          const decisions = interruptedAttempts
+            .filter((attempt) => attempt.stepId === step.stepId)
+            .map((attempt) => attemptDecisions.get(attempt.attemptId))
+            .filter((decision): decision is WorkflowRecoveryDecision =>
+              decision !== undefined);
+          stepDecisions.set(step.stepId, {
+            disposition: combineRecoveryDispositions(
+              decisions.map((decision) => decision.disposition),
+            ),
+            reason: decisions.length === 0
+              ? "step_open_before_attempt_dispatch"
+              : decisions.map((decision) => decision.reason).join(","),
+          });
+        }
+        const runDisposition = combineRecoveryDispositions(
+          [...stepDecisions.values()].map((decision) => decision.disposition),
+        );
         await this.store.updateRun(run.runId, (current) => ({
           ...current,
           status: "interrupted",
           updatedAt: now,
           endedAt: now,
           terminalReason: reason,
+          recoveryDisposition: runDisposition,
+          recoveryReason: "open_workflow_state_detected_after_restart",
         }));
         await this.store.writeSteps(run.runId, (steps) =>
-          steps.map((step) =>
-            step.status === "running"
-              ? {
-                  ...step,
-                  status: "failed",
-                  updatedAt: now,
-                  terminalReason: reason,
-                }
-              : step));
+          steps.map((step) => {
+            if (!openStepIds.has(step.stepId)) return step;
+            const decision = stepDecisions.get(step.stepId) ?? {
+              disposition: "retry-safe" as const,
+              reason: "step_open_before_attempt_dispatch",
+            };
+            return {
+              ...step,
+              status: "interrupted" as const,
+              updatedAt: now,
+              terminalReason: reason,
+              recoveryDisposition: decision.disposition,
+              recoveryReason: decision.reason,
+            };
+          }));
         await this.store.writeAttempts(run.runId, (current) =>
-          current.map((attempt) =>
-            attempt.status === "running"
-              ? {
-                  ...attempt,
-                  status: "interrupted",
-                  resultErrorFingerprint: interruptionFingerprint,
-                  diffFingerprint: fingerprintCanonical({
-                    state: "diff_unavailable",
-                    reason,
-                  }),
-                  summary: reason,
-                  updatedAt: now,
-                  endedAt: now,
-                }
-              : attempt));
-        for (const attempt of interruptedAttempts) {
-          await this.store.appendFailureExperience({
-            schemaVersion: 1,
-            experienceId: randomUUID(),
-            runId: run.runId,
-            stepId: attempt.stepId,
-            attemptId: attempt.attemptId,
-            workflowKind: run.kind,
-            errorFingerprint: interruptionFingerprint,
-            strategyFingerprint: attempt.strategyFingerprint,
-            diffFingerprint: fingerprintCanonical({
-              state: "diff_unavailable",
-              reason,
-            }),
-            summary: reason,
-            versions: attempt.versions,
-            createdAt: now,
-            resolution: "unresolved",
-          });
-        }
+          current.map((attempt) => {
+            if (attempt.status !== "running") return attempt;
+            const decision = attemptDecisions.get(attempt.attemptId) ?? {
+              disposition: "needs-reconciliation" as const,
+              reason: "missing_recovery_contract",
+            };
+            return {
+              ...attempt,
+              status: "interrupted" as const,
+              resultErrorFingerprint: interruptionFingerprint,
+              recoveryDisposition: decision.disposition,
+              recoveryReason: decision.reason,
+              summary: reason,
+              updatedAt: now,
+              endedAt: now,
+            };
+          }));
         await this.store.appendEvent({
           runId: run.runId,
           type: "workflow.interrupted",
-          payload: { reason, interruptionFingerprint },
+          payload: {
+            reason,
+            interruptionFingerprint,
+            recoveryDisposition: runDisposition,
+            attempts: interruptedAttempts.map((attempt) => ({
+              attemptId: attempt.attemptId,
+              stepId: attempt.stepId,
+              ...(attemptDecisions.get(attempt.attemptId) ?? {
+                disposition: "needs-reconciliation",
+                reason: "missing_recovery_contract",
+              }),
+            })),
+          },
         });
       }
       return recovered;
@@ -654,6 +821,7 @@ export class WorkflowOrchestrator {
       await this.store.writeSteps(runId, (steps) =>
         steps.map((step) =>
           step.status === "running" ||
+              step.status === "interrupted" ||
               step.status === "ready" ||
               step.status === "pending"
             ? {
@@ -846,6 +1014,93 @@ function replaceCircuit(
     : [...circuits, next];
 }
 
+interface WorkflowRecoveryDecision {
+  readonly disposition: RecoveryDisposition;
+  readonly reason: string;
+}
+
+function classifyInterruptedAttempt(
+  attempt: WorkflowAttemptRecord,
+  step: WorkflowStepRecord,
+): WorkflowRecoveryDecision {
+  if (attempt.execution?.kind === "child_agent") {
+    return {
+      disposition: "resumable",
+      reason: "durable_child_execution_binding",
+    };
+  }
+  const checkpoint = step.checkpoint;
+  const checkpointDisposition = checkpoint?.["recoveryDisposition"];
+  if (isRecoveryDisposition(checkpointDisposition)) {
+    return {
+      disposition: checkpointDisposition,
+      reason: "checkpoint_declared_disposition",
+    };
+  }
+  if (checkpoint?.["terminalFailure"] === true) {
+    return {
+      disposition: "terminal-failed",
+      reason: "checkpoint_terminal_failure",
+    };
+  }
+  if (
+    hasNonEmptyCheckpointString(checkpoint, "resumeToken") ||
+    hasNonEmptyCheckpointString(checkpoint, "externalKey") ||
+    hasNonEmptyCheckpointString(checkpoint, "idempotencyKey") ||
+    hasNonEmptyCheckpointString(checkpoint, "childRunId")
+  ) {
+    return {
+      disposition: "resumable",
+      reason: "checkpoint_external_identity",
+    };
+  }
+  if (
+    checkpoint?.["executionPhase"] === "prepared" ||
+    checkpoint?.["safeToRetry"] === true
+  ) {
+    return {
+      disposition: "retry-safe",
+      reason: "checkpoint_before_external_dispatch",
+    };
+  }
+  if (
+    checkpoint?.["executionPhase"] === "dispatched" ||
+    checkpoint?.["executionPhase"] === "executing"
+  ) {
+    return {
+      disposition: "needs-reconciliation",
+      reason: "checkpoint_after_external_dispatch",
+    };
+  }
+  const completedToolCalls = checkpoint?.["completedToolCallFingerprints"];
+  if (Array.isArray(completedToolCalls) && completedToolCalls.length > 0) {
+    return {
+      disposition: "resumable",
+      reason: "completed_tool_checkpoint",
+    };
+  }
+  if (attempt.recoveryPolicy !== undefined) {
+    return {
+      disposition: attempt.recoveryPolicy,
+      reason: attempt.recoveryPolicy === "resumable"
+        ? `declared_resumable:${attempt.idempotencyPrefix}`
+        : "declared_attempt_recovery_policy",
+    };
+  }
+  return {
+    disposition: "needs-reconciliation",
+    reason: "missing_recovery_contract",
+  };
+}
+
+function hasNonEmptyCheckpointString(
+  checkpoint: Readonly<Record<string, unknown>> | undefined,
+  key: string,
+): boolean {
+  const value = checkpoint?.[key];
+  return typeof value === "string" && value.trim().length > 0;
+}
+
 function requireStep(
   steps: readonly WorkflowStepRecord[],
   stepId: string,
@@ -927,6 +1182,9 @@ function deriveRunState(
   }
   if (steps.some((step) => step.status === "running")) return { status: "running" };
   if (steps.some((step) => step.status === "failed")) return { status: "retrying" };
+  if (steps.some((step) => step.status === "interrupted")) {
+    return { status: "interrupted", terminalReason: "workflow_step_interrupted" };
+  }
   if (steps.some((step) => step.status === "ready" || step.status === "pending")) {
     return { status: activeFallback };
   }
@@ -942,7 +1200,12 @@ function activateStep(
   edgeKey: string | undefined,
   now: string,
 ): WorkflowStepRecord {
-  const { terminalReason: _terminalReason, ...active } = step;
+  const {
+    terminalReason: _terminalReason,
+    recoveryDisposition: _recoveryDisposition,
+    recoveryReason: _recoveryReason,
+    ...active
+  } = step;
   return {
     ...active,
     status: "running",

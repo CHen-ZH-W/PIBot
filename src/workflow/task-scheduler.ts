@@ -157,18 +157,31 @@ export class TaskGraphScheduler {
       if (attempt.status !== "running" && attempt.status !== "interrupted") continue;
       const task = tasks.get(attempt.stepId);
       if (task === undefined) continue;
-      if (attempt.execution === undefined) {
-        await this.spawnForAttempt(graph, run, task, attempt, runtime);
+      const activeAttempt = attempt.status === "interrupted"
+        ? await this.options.workflows.resumeAttempt({
+            runId: run.runId,
+            attemptId: attempt.attemptId,
+          })
+        : attempt;
+      if (activeAttempt.execution === undefined) {
+        await this.spawnForAttempt(graph, run, task, activeAttempt, runtime);
         observed.push(task.id);
         continue;
       }
       const collected = await runtime.collectAgent(
-        attempt.execution.childRunId as AgentRunId,
+        activeAttempt.execution.childRunId as AgentRunId,
       );
       if (isTerminalChildStatus(collected.run.status)) {
-        await this.handleTerminal(graph, run, task, attempt, runtime, collected.run);
+        await this.handleTerminal(
+          graph,
+          run,
+          task,
+          activeAttempt,
+          runtime,
+          collected.run,
+        );
       } else {
-        this.observeTerminal(graph, run, task, attempt, runtime);
+        this.observeTerminal(graph, run, task, activeAttempt, runtime);
       }
       observed.push(task.id);
     }
@@ -194,6 +207,7 @@ export class TaskGraphScheduler {
         runId: run.runId,
         stepId: step.stepId,
         strategy: taskStrategy(graph, task),
+        recoveryPolicy: "resumable",
         circuitKey: taskCircuitKey(this.options.externalKeyPrefix, task),
       });
       if (!admission.allowed || admission.attempt === undefined) continue;
@@ -371,6 +385,7 @@ export class TaskGraphScheduler {
       runId: run.runId,
       stepId: task.id,
       strategy: taskStrategy(graph, task),
+      recoveryPolicy: "resumable",
       triggerErrorFingerprint,
       edgeKey: `${task.id}.mechanical_retry`,
       circuitKey: taskCircuitKey(this.options.externalKeyPrefix, task),

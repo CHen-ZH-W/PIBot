@@ -25,6 +25,15 @@ export const writeTool: CodingToolDefinition<"write", WriteToolInput, FileMutati
       { capability: "filesystem.write", paths: [input.path] },
     ],
   }),
+  async preflightAuthorization(input, context) {
+    assertContentSize(input.content, context.maxFileBytes, "write content");
+    await resolveWorkspacePath(context.workspaceRoot, input.path, {
+      access: "mutate",
+      allowMissing: true,
+      policy: context.sandboxExecutor.policy,
+    });
+    return undefined;
+  },
   parse: parseWriteInput,
   concurrencyKey: (input) => `file:${input.path}`,
   description:

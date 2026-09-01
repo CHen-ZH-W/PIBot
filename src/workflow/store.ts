@@ -1,12 +1,11 @@
 import { randomUUID } from "node:crypto";
 import {
-  appendFile,
   mkdir,
+  open,
   readFile,
   readdir,
   rename,
   stat,
-  writeFile,
 } from "node:fs/promises";
 import * as path from "node:path";
 import type {
@@ -256,11 +255,53 @@ async function appendJsonl(
 ): Promise<void> {
   const line = `${JSON.stringify(value)}\n`;
   await mkdir(path.dirname(filePath), { recursive: true });
+  await repairJsonlTail(filePath);
   const currentBytes = await fileSizeIfExists(filePath);
   if (currentBytes + Buffer.byteLength(line, "utf8") > maxBytes) {
     throw new Error(`Workflow JSONL exceeds maximum size: ${filePath}`);
   }
-  await appendFile(filePath, line, "utf8");
+  const handle = await open(filePath, "a");
+  try {
+    await handle.writeFile(line, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await syncContainingDirectories(filePath);
+}
+
+async function repairJsonlTail(filePath: string): Promise<void> {
+  let content: Buffer;
+  try {
+    content = await readFile(filePath);
+  } catch (error: unknown) {
+    if (isNodeError(error) && error.code === "ENOENT") return;
+    throw error;
+  }
+  if (content.length === 0 || content.at(-1) === 0x0a) return;
+  const lastNewline = content.lastIndexOf(0x0a);
+  const tailStart = lastNewline + 1;
+  const tail = content.subarray(tailStart).toString("utf8").trim();
+  let complete = false;
+  if (tail.length > 0) {
+    try {
+      JSON.parse(tail);
+      complete = true;
+    } catch {
+      complete = false;
+    }
+  }
+  const handle = await open(filePath, "r+");
+  try {
+    if (complete) {
+      await handle.write(Buffer.from("\n"), 0, 1, content.length);
+    } else {
+      await handle.truncate(tailStart);
+    }
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 async function readJsonl<T>(filePath: string): Promise<readonly T[]> {
@@ -269,7 +310,8 @@ async function readJsonl<T>(filePath: string): Promise<readonly T[]> {
     return [];
   }
   const values: T[] = [];
-  for (const line of text.split("\n")) {
+  const lines = text.split("\n");
+  for (const [index, line] of lines.entries()) {
     const trimmed = line.trim();
     if (trimmed.length === 0) {
       continue;
@@ -277,6 +319,9 @@ async function readJsonl<T>(filePath: string): Promise<readonly T[]> {
     try {
       values.push(JSON.parse(trimmed) as T);
     } catch {
+      if (lines.slice(index + 1).some((candidate) => candidate.trim().length > 0)) {
+        throw new Error(`Workflow JSONL is corrupt before its tail: ${filePath}`);
+      }
       // A process crash may leave one truncated trailing record. Earlier events remain valid.
     }
   }
@@ -289,8 +334,43 @@ async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> 
     path.dirname(filePath),
     `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`,
   );
-  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const handle = await open(temporary, "wx");
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
   await rename(temporary, filePath);
+  await syncContainingDirectories(filePath);
+}
+
+async function syncContainingDirectories(filePath: string): Promise<void> {
+  const directory = path.dirname(filePath);
+  await syncDirectory(directory);
+  const parent = path.dirname(directory);
+  if (parent !== directory) {
+    await syncDirectory(parent);
+  }
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  let handle;
+  try {
+    handle = await open(directory, "r");
+    await handle.sync();
+  } catch (error: unknown) {
+    if (!isIgnorableDirectorySyncError(error)) throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+function isIgnorableDirectorySyncError(error: unknown): boolean {
+  return isNodeError(error) &&
+    (error.code === "EINVAL" ||
+      error.code === "ENOTSUP" ||
+      error.code === "EISDIR");
 }
 
 async function readRequiredJson<T>(filePath: string): Promise<T> {

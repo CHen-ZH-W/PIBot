@@ -79,24 +79,28 @@ export class BoundedToolScheduler implements ToolScheduler {
   ): Promise<ToolResult> {
     const startedAtMs = Date.now();
     let metadata: ReturnType<NonNullable<ToolExecutor["describeTool"]>>;
+    let durablePrepared = false;
     const abortedBeforeDispatch = isSignalAborted(input.signal);
-    if (!abortedBeforeDispatch) {
-      recordTransition(input.run, toolTransition(
-        "dispatch_tool_call",
-        input.stepContext,
-        originalCall,
-      ));
-      await safeEmit(input.onEvent, {
-        type: "tool_start",
-        step: input.stepContext.step,
-        call: originalCall,
-      });
-    }
 
     let call = originalCall;
     let result: ToolResult;
     try {
       metadata = this.options.tools.describeTool?.(originalCall.name);
+      if (input.run.durability !== undefined) {
+        await input.run.durability.prepareTool({
+          context: input.stepContext,
+          call: originalCall,
+          ...optionalMetadata(metadata),
+        });
+        durablePrepared = true;
+      }
+      if (!abortedBeforeDispatch) {
+        await safeEmit(input.onEvent, {
+          type: "tool_start",
+          step: input.stepContext.step,
+          call: originalCall,
+        });
+      }
       if (abortedBeforeDispatch || isSignalAborted(input.signal)) {
         result = abortedToolResult(call);
       } else {
@@ -112,19 +116,37 @@ export class BoundedToolScheduler implements ToolScheduler {
           result = deniedToolResult(call, decision.reason);
         } else {
           call = decision.call ?? call;
-          result = isSignalAborted(input.signal)
-            ? abortedToolResult(call)
-            : isInvalidToolCall(call)
-              ? invalidToolResult(call)
-              : await safelyExecuteTool(
-                  this.options.tools,
-                  call,
-                  input.signal,
-                  stepExecutionSnapshot(
-                    input.stepContext,
-                    this.options.tools,
-                  ),
-                );
+          if (isSignalAborted(input.signal)) {
+            result = abortedToolResult(call);
+          } else if (isInvalidToolCall(call)) {
+            result = invalidToolResult(call);
+          } else {
+            if (call !== originalCall && input.run.durability !== undefined) {
+              await input.run.durability.prepareTool({
+                context: input.stepContext,
+                call: { ...call, id: originalCall.id },
+                ...optionalMetadata(metadata),
+              });
+            }
+            await input.run.durability?.markToolDispatched({
+              context: input.stepContext,
+              call: originalCall,
+            });
+            recordTransition(input.run, toolTransition(
+              "dispatch_tool_call",
+              input.stepContext,
+              originalCall,
+            ));
+            result = await safelyExecuteTool(
+              this.options.tools,
+              call,
+              input.signal,
+              stepExecutionSnapshot(
+                input.stepContext,
+                this.options.tools,
+              ),
+            );
+          }
         }
       }
     } catch (error: unknown) {
@@ -152,6 +174,17 @@ export class BoundedToolScheduler implements ToolScheduler {
     result = result.callId === originalCall.id
       ? result
       : { ...result, callId: originalCall.id };
+    if (durablePrepared) {
+      try {
+        await input.run.durability?.finishTool({
+          context: input.stepContext,
+          call: originalCall,
+          result,
+        });
+      } catch (error: unknown) {
+        result = durabilityFailureToolResult(originalCall, error);
+      }
+    }
     await safeEmit(input.onEvent, {
       type: "tool_end",
       step: input.stepContext.step,
@@ -423,6 +456,24 @@ function failedToolResult(call: ToolCall, error: unknown): ToolResult {
     ok: false,
     callId: call.id,
     error: toToolError(error),
+  };
+}
+
+function durabilityFailureToolResult(
+  call: ToolCall,
+  error: unknown,
+): ToolResult {
+  return {
+    ok: false,
+    callId: call.id,
+    error: {
+      code: "execution_failed",
+      message:
+        `Tool lifecycle commit failed; do not retry before reconciliation: ${
+          error instanceof Error ? error.message : "unknown durability error"
+        }`,
+      retryable: false,
+    },
   };
 }
 

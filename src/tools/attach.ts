@@ -42,6 +42,21 @@ export const attachTool: CodingToolDefinition<
     ],
     effects: { openWorld: true },
   }),
+  async preflightAuthorization(input, context) {
+    if (context.attach === undefined) {
+      throw toolError("invalid_input", "Attachment context is not available");
+    }
+    const filePath = await resolveWorkspacePath(
+      context.workspaceRoot,
+      input.path,
+      {
+        access: "read",
+        policy: context.sandboxExecutor.policy,
+      },
+    );
+    await assertFileSize(filePath, context.attach.maxFileBytes, "attach file");
+    return undefined;
+  },
   description:
     "Upload a generated workspace file through the current attachment channel. Use for files the user should download or inspect directly.",
   schema: {

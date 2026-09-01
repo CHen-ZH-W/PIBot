@@ -1,6 +1,7 @@
 import type { WorkspacePath } from "../core/ids";
 import type { BashToolInput, BashToolOutput, ToolError } from "../core/tools";
 import { resolveWorkspacePath } from "../workspace/path-boundary";
+import { preflightEffectiveSandboxCallPolicy } from "../workspace/sandbox";
 import {
   assertToolCapability,
   type CodingToolDefinition,
@@ -44,6 +45,33 @@ export const bashTool: CodingToolDefinition<"bash", BashToolInput, BashToolOutpu
         openWorld: permissions.network || permissions.externalSideEffect,
       },
     };
+  },
+  async preflightAuthorization(input, context, capabilities) {
+    await resolveWorkspacePath(
+      context.workspaceRoot,
+      input.cwd ?? ("." as WorkspacePath),
+      {
+        access: "cwd",
+        allowWorkspaceRoot: true,
+        policy: context.sandboxExecutor.policy,
+      },
+    );
+    const effective = preflightEffectiveSandboxCallPolicy(
+      capabilities,
+      input.command,
+      context.sandboxExecutor.policy,
+      context.sandboxExecutor.enforcement,
+      context.workspaceRoot,
+    );
+    return Object.freeze({
+      policyVersion: effective.policyVersion,
+      backend: effective.enforcement.backend,
+      filesystemEnforcement: effective.enforcement.filesystem,
+      networkEnforcement: effective.enforcement.network,
+      readPaths: effective.filesystem.readPaths,
+      writePaths: effective.filesystem.writePaths,
+      networkEnabled: effective.network.enabled,
+    });
   },
   parse: parseBashInput,
   description:

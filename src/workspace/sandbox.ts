@@ -8,9 +8,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
-  grantAllowsCapability,
+  capabilityRequestAllows,
   validateToolCapabilityGrant,
   type ToolCapabilityGrant,
+  type ToolCapabilityRequest,
 } from "../core/capabilities";
 import {
   defaultSandboxPolicy,
@@ -506,14 +507,57 @@ export function resolveEffectiveSandboxCallPolicy(
   workspaceRoot: string,
 ): EffectiveSandboxCallPolicy {
   validateToolCapabilityGrant(grant, { policyVersion: policy.version });
-  if (!grantAllowsCapability(grant, "process.exec", command)) {
+  return resolveSandboxCallPolicy(
+    grant.request,
+    command,
+    policy,
+    enforcement,
+    workspaceRoot,
+  );
+}
+
+/**
+ * Resolves the exact policy a Bash call would receive without issuing authority.
+ * The Tool runtime calls this before prompting so an unenforceable request never
+ * asks the user for approval only to fail at execution time.
+ */
+export function preflightEffectiveSandboxCallPolicy(
+  request: ToolCapabilityRequest,
+  command: string,
+  policy: SandboxPolicy,
+  enforcement: SandboxBackendEnforcement,
+  workspaceRoot: string,
+): EffectiveSandboxCallPolicy {
+  return resolveSandboxCallPolicy(
+    request,
+    command,
+    policy,
+    enforcement,
+    workspaceRoot,
+  );
+}
+
+function resolveSandboxCallPolicy(
+  request: ToolCapabilityRequest,
+  command: string,
+  policy: SandboxPolicy,
+  enforcement: SandboxBackendEnforcement,
+  workspaceRoot: string,
+): EffectiveSandboxCallPolicy {
+  if (enforcement.backend === "disabled") {
+    throw sandboxError(
+      "permission_denied",
+      "Sandbox backend disabled cannot execute process calls",
+    );
+  }
+  if (!capabilityRequestAllows(request, "process.exec", command)) {
     throw sandboxError(
       "permission_denied",
       "Sandbox grant lacks process.exec for this command",
     );
   }
-  const readPaths = capabilityFilesystemPaths(grant, "filesystem.read");
-  const writePaths = capabilityFilesystemPaths(grant, "filesystem.write");
+  const readPaths = capabilityFilesystemPaths(request, "filesystem.read");
+  const writePaths = capabilityFilesystemPaths(request, "filesystem.write");
   assertScopedFilesystemPaths(readPaths, "read", workspaceRoot, policy);
   assertScopedFilesystemPaths(writePaths, "write", workspaceRoot, policy);
   assertBackendScopeEnforcement(enforcement, readPaths, writePaths);
@@ -522,7 +566,7 @@ export function resolveEffectiveSandboxCallPolicy(
     enforcement,
     filesystem: Object.freeze({ readPaths, writePaths }),
     network: Object.freeze({
-      enabled: grantAllowsCapability(grant, "network.connect"),
+      enabled: capabilityRequestAllows(request, "network.connect"),
       granularity: policy.network.granularity,
     }),
     process: Object.freeze({ command }),
@@ -550,10 +594,10 @@ function assertBackendScopeEnforcement(
 }
 
 function capabilityFilesystemPaths(
-  grant: ToolCapabilityGrant,
+  request: ToolCapabilityRequest,
   capability: "filesystem.read" | "filesystem.write",
 ): readonly string[] {
-  return Object.freeze([...new Set(grant.request.requirements.flatMap((requirement) =>
+  return Object.freeze([...new Set(request.requirements.flatMap((requirement) =>
     requirement.capability === capability ? requirement.paths : []
   ))]);
 }

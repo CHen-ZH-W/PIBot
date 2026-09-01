@@ -25,7 +25,7 @@ export interface SandboxPolicy {
 }
 
 export const defaultSandboxPolicy: SandboxPolicy = Object.freeze({
-  version: "sandbox-policy-v1",
+  version: "sandbox-policy-v2",
   filesystem: Object.freeze({
     protectedDirectoryNames: Object.freeze([
       ".git",
@@ -38,6 +38,7 @@ export const defaultSandboxPolicy: SandboxPolicy = Object.freeze({
       ".npmrc",
       ".pibotignore",
       ".env",
+      "approval-rules.jsonl",
       "instructions.md",
       "context.jsonl",
       "log.jsonl",

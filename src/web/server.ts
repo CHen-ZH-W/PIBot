@@ -860,6 +860,33 @@ async function routeRequest(
     sendJson(response, 200, { version });
     return;
   }
+  if (method === "GET" && url.pathname === "/api/approval-rules") {
+    if (options.agent === undefined) {
+      sendJson(response, 400, { error: "WebUI agent runner is not configured" });
+      return;
+    }
+    sendJson(response, 200, {
+      rules: await options.agent.listApprovalRules(),
+    });
+    return;
+  }
+  const approvalRuleMatch = matchRoute(
+    url.pathname,
+    /^\/api\/approval-rules\/([^/]+)$/u,
+  );
+  if (method === "DELETE" && approvalRuleMatch !== undefined) {
+    if (options.agent === undefined) {
+      sendJson(response, 400, { error: "WebUI agent runner is not configured" });
+      return;
+    }
+    const revoked = await options.agent.revokeApprovalRule(approvalRuleMatch);
+    sendJson(
+      response,
+      revoked ? 200 : 404,
+      revoked ? { ok: true } : { error: "Approval rule not found" },
+    );
+    return;
+  }
   const approvalMatch = matchRoute(
     url.pathname,
     /^\/api\/approvals\/([^/]+)$/u,
@@ -871,8 +898,13 @@ async function routeRequest(
     }
     const body = await readJsonBody(request);
     const approvalScope = optionalStringValue(body, "scope") ?? "once";
-    if (approvalScope !== "once" && approvalScope !== "run") {
-      throw new Error("scope must be once or run");
+    if (
+      approvalScope !== "once" &&
+      approvalScope !== "run" &&
+      approvalScope !== "session" &&
+      approvalScope !== "repo"
+    ) {
+      throw new Error("scope must be once, run, session, or repo");
     }
     const result = await options.agent.decideApproval(
       approvalMatch,

@@ -73,6 +73,8 @@ import {
   createToolApprovalGate,
   toolApprovalRulesForRun,
 } from "../tools/approval";
+import type { PersistentToolApprovalRuleStore } from "../tools/approval-rules";
+import type { ToolApprovalRuleRecord } from "../tools/approval-rules";
 import type { SandboxExecutor } from "../workspace/sandbox";
 import type {
   ChannelContextMessage,
@@ -146,6 +148,7 @@ export interface WebAgentRunnerOptions {
   readonly sandboxExecutor: SandboxExecutor;
   readonly sandboxLabel?: string;
   readonly toolApprovalMode: ToolApprovalMode;
+  readonly approvalRules?: PersistentToolApprovalRuleStore;
   readonly toolLimits: Required<Pick<
     CodingToolExecutorOptions,
     | "maxReadChars"
@@ -343,6 +346,8 @@ export interface WebApprovalView {
   readonly expiresAt: string;
   readonly resolvedMessage?: string;
   readonly runScopeAllowed: boolean;
+  readonly sessionScopeAllowed: boolean;
+  readonly repoScopeAllowed: boolean;
 }
 
 type ActiveWebRun = ActiveWebConversationRun | ActiveWebEvolutionRun;
@@ -427,6 +432,14 @@ export class WebAgentRunner {
     );
   }
 
+  async listApprovalRules(): Promise<readonly ToolApprovalRuleRecord[]> {
+    return this.options.approvalRules?.list() ?? [];
+  }
+
+  async revokeApprovalRule(ruleId: string): Promise<boolean> {
+    return this.options.approvalRules?.revoke(ruleId, "webui") ?? false;
+  }
+
   async getConversation(conversationId: string): Promise<WebConversation> {
     return this.conversationWithChannelContext(
       await this.options.conversations.get(conversationId),
@@ -436,7 +449,7 @@ export class WebAgentRunner {
   async decideApproval(
     approvalId: string,
     approved: boolean,
-    scope: "once" | "run" = "once",
+    scope: "once" | "run" | "session" | "repo" = "once",
   ): Promise<{ readonly ok: true; readonly approval: WebApprovalView } | {
     readonly ok: false;
     readonly error: string;
@@ -448,21 +461,21 @@ export class WebAgentRunner {
         error: "Unknown or completed approval request",
       };
     }
-    if (scope === "run" && pending.request.runScopeAllowed !== true) {
+    if (!webApprovalScopeAllowed(pending.request, scope)) {
       return {
         ok: false,
-        error: "Run-scoped approval is not available for this request",
+        error: `${scope}-scoped approval is not available for this request`,
       };
     }
 
     const decision = approved
-      ? (scope === "run"
-          ? { approved: true as const, scope: "run" as const }
+      ? (scope !== "once"
+          ? { approved: true as const, scope }
           : { approved: true as const })
-      : (scope === "run"
+      : (scope !== "once"
           ? {
               ...deniedApproval("Tool call was rejected in WebUI"),
-              scope: "run" as const,
+              scope,
             }
           : deniedApproval("Tool call was rejected in WebUI"));
     const status = approved ? "approved" : "rejected";
@@ -865,6 +878,12 @@ export class WebAgentRunner {
           prompter: approvalPrompter,
           context: approvalContext,
           rules: toolApprovalRulesForRun(runContext.state),
+          ...(this.options.approvalRules === undefined
+            ? {}
+            : {
+                persistentRules: this.options.approvalRules,
+                workspaceRoot: runWorkspaceRoot,
+              }),
           timeoutMs: this.approvalTimeoutMs,
         }),
         runtime: runContext.state,
@@ -2296,6 +2315,9 @@ export class WebAgentRunner {
     const admission = await workflows.beginAttempt({
       runId: run.runId,
       stepId: step.stepId,
+      recoveryPolicy: completedToolCallFingerprints.length > 0
+        ? "resumable"
+        : "needs-reconciliation",
       strategy,
       ...(triggerErrorFingerprint === undefined
         ? {}
@@ -2395,6 +2417,8 @@ function webApprovalView(
     expiresAt: pending.expiresAt,
     ...(resolvedMessage === undefined ? {} : { resolvedMessage }),
     runScopeAllowed: pending.request.runScopeAllowed === true,
+    sessionScopeAllowed: pending.request.sessionScopeAllowed === true,
+    repoScopeAllowed: pending.request.repoScopeAllowed === true,
   };
 }
 
@@ -2417,6 +2441,8 @@ function completedMissingApproval(
     expiresAt: new Date().toISOString(),
     resolvedMessage,
     runScopeAllowed: false,
+    sessionScopeAllowed: false,
+    repoScopeAllowed: false,
   };
 }
 
@@ -2459,6 +2485,11 @@ function approvalDetails(request: ToolApprovalPromptRequest): readonly string[] 
     }
     return `Escalation: ${requirement.capability}(${requirement.resources.join(", ")})`;
   }) ?? [];
+  if (request.sandbox !== undefined) {
+    capabilities.unshift(
+      `Sandbox: ${request.sandbox.backend}; filesystem=${request.sandbox.filesystemEnforcement}; network=${request.sandbox.networkEnforcement}; policy=${request.sandbox.policyVersion}`,
+    );
+  }
   if (requested?.effects?.destructive === true) {
     capabilities.push("Escalation effect: destructive");
   }
@@ -2531,7 +2562,7 @@ function approvalDetails(request: ToolApprovalPromptRequest): readonly string[] 
 function approvalDecisionStatus(
   request: ToolApprovalPromptRequest,
   approved: boolean,
-  scope: "once" | "run" = "once",
+  scope: "once" | "run" | "session" | "repo" = "once",
 ): string {
   if (request.call.name === "enter_plan_mode") {
     return approved
@@ -2543,8 +2574,30 @@ function approvalDecisionStatus(
       ? "Plan approved. Continuing execution."
       : "Plan rejected.";
   }
-  const suffix = scope === "run" ? " for this run." : " once.";
+  const suffix = scope === "run"
+    ? " for this run."
+    : scope === "session"
+      ? " for this session."
+      : scope === "repo"
+        ? " for this repo."
+        : " once.";
   return approved ? `Approved${suffix}` : `Rejected${suffix}`;
+}
+
+function webApprovalScopeAllowed(
+  request: ToolApprovalPromptRequest,
+  scope: "once" | "run" | "session" | "repo",
+): boolean {
+  if (scope === "once") {
+    return true;
+  }
+  if (scope === "run") {
+    return request.runScopeAllowed === true;
+  }
+  if (scope === "session") {
+    return request.sessionScopeAllowed === true;
+  }
+  return request.repoScopeAllowed === true;
 }
 
 function deniedApproval(reason: string): ToolApprovalDecision {

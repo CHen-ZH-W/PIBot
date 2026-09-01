@@ -17,11 +17,14 @@ import {
 import type {
   ToolCall,
   ToolCallParseResult,
+  ToolApprovalDecision,
+  ToolApprovalRequest,
   ToolError,
   ToolExecutionSnapshot,
   ToolExecutionMode,
   ToolMetadata,
   ToolName,
+  ToolApprovalSandboxPolicy,
   ToolResult,
   ToolRiskLevel,
   UnparsedToolCall,
@@ -161,10 +164,18 @@ export interface CodingToolDefinition<
   readonly schema: JsonSchema;
   readonly riskLevel: ToolRiskLevel;
   readonly executionMode: ToolExecutionMode;
+  readonly recoveryPolicy?: ToolMetadata["recoveryPolicy"];
   resolveCapabilities?(
     input: Input,
     context: ToolRunContext,
   ): ToolCapabilityRequest;
+  preflightAuthorization?(
+    input: Input,
+    context: ToolRunContext,
+    capabilities: ToolCapabilityRequest,
+  ): Promise<ToolApprovalSandboxPolicy | undefined> |
+    ToolApprovalSandboxPolicy |
+    undefined;
   parse(input: UnknownRecord): ToolInputParseResult<Input>;
   execute(
     input: Input,
@@ -180,10 +191,18 @@ interface RegisteredCodingToolDefinition {
   readonly schema: JsonSchema;
   readonly riskLevel: ToolRiskLevel;
   readonly executionMode: ToolExecutionMode;
+  readonly recoveryPolicy?: ToolMetadata["recoveryPolicy"];
   resolveCapabilities?(
     input: unknown,
     context: ToolRunContext,
   ): ToolCapabilityRequest;
+  preflightAuthorization?(
+    input: unknown,
+    context: ToolRunContext,
+    capabilities: ToolCapabilityRequest,
+  ): Promise<ToolApprovalSandboxPolicy | undefined> |
+    ToolApprovalSandboxPolicy |
+    undefined;
   parse(input: UnknownRecord): ToolInputParseResult<unknown>;
   execute(
     input: unknown,
@@ -225,6 +244,9 @@ export class CodingToolRegistry {
       name: tool.name,
       riskLevel: tool.riskLevel,
       executionMode: tool.executionMode,
+      ...(tool.recoveryPolicy === undefined
+        ? {}
+        : { recoveryPolicy: tool.recoveryPolicy }),
     };
   }
 
@@ -287,6 +309,24 @@ export class CodingToolRegistry {
         error instanceof Error ? error.message : "Invalid capability request",
       );
     }
+  }
+
+  preflightAuthorization(
+    call: ToolCall,
+    context: ToolRunContext,
+    capabilities: ToolCapabilityRequest,
+  ): Promise<ToolApprovalSandboxPolicy | undefined> |
+    ToolApprovalSandboxPolicy |
+    undefined {
+    const definition = this.tools.get(call.name);
+    if (definition === undefined) {
+      throw toolError("invalid_input", `Tool "${call.name}" is not registered`);
+    }
+    return definition.preflightAuthorization?.(
+      call.input,
+      context,
+      capabilities,
+    );
   }
 
   concurrencyKey(call: ToolCall): string | undefined {
@@ -460,18 +500,34 @@ export class CodingToolExecutor implements ToolExecutor {
       if (initialModeDenial !== undefined) {
         return deniedToolResult(call, initialModeDenial);
       }
+      const sandbox = await this.registry.preflightAuthorization(
+        call,
+        this.context,
+        capabilities,
+      );
       const approvalStateVersion =
         snapshot?.runtimeStateVersion ?? this.context.runtime?.version;
+      let approvalRequest: ToolApprovalRequest | undefined;
+      let approvalDecision: ToolApprovalDecision | undefined;
       if (!isRuntimeControlCall(this.context.runtime, call.name)) {
         const risk = capabilityRequestRisk(capabilities);
-        const decision = await this.approvalGate.reviewToolCall({
+        approvalRequest = {
           call,
           risk,
           explanation: capabilityExplanation(call.name, capabilities),
           capabilities,
-        }, signal);
-        if (!decision.approved) {
-          return deniedToolResult(call, decision.reason);
+          ...(sandbox === undefined ? {} : { sandbox }),
+        };
+        approvalDecision = await this.approvalGate.reviewToolCall(
+          approvalRequest,
+          signal,
+        );
+        if (!approvalDecision.approved) {
+          await this.approvalGate.commitToolApproval?.(
+            approvalRequest,
+            approvalDecision,
+          );
+          return deniedToolResult(call, approvalDecision.reason);
         }
       }
 
@@ -493,6 +549,21 @@ export class CodingToolExecutor implements ToolExecutor {
         return deniedToolResult(
           call,
           `Tool "${call.name}" changed while approval was pending`,
+        );
+      }
+      if (
+        sandbox !== undefined &&
+        sandbox.policyVersion !== sandboxPolicyVersion(this.context.sandboxExecutor)
+      ) {
+        return deniedToolResult(
+          call,
+          `Tool "${call.name}" sandbox policy changed while approval was pending`,
+        );
+      }
+      if (approvalRequest !== undefined && approvalDecision !== undefined) {
+        await this.approvalGate.commitToolApproval?.(
+          approvalRequest,
+          approvalDecision,
         );
       }
 
@@ -913,3 +984,4 @@ export {
   tasksUpdateTool,
 } from "./tasks";
 export * from "./approval";
+export * from "./approval-rules";

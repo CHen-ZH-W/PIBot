@@ -12,6 +12,7 @@ import {
   type RuntimeControlMessage,
 } from "./control";
 import type { RuntimeTransition } from "./transitions";
+import type { DurableLifecycleAuthority } from "./durable-lifecycle";
 import {
   createAgentRuntimeState,
   type AgentRuntimeState,
@@ -25,6 +26,8 @@ export interface AgentRunContext {
   readonly state: AgentRuntimeState;
   readonly nextStepInbox: NextStepInbox;
   readonly stepSequence?: { nextStep: number };
+  readonly durability?: DurableLifecycleAuthority;
+  readonly durableScope?: string;
   readonly onTransition?: (
     transition: RuntimeTransition,
   ) => Promise<void> | void;
@@ -38,6 +41,8 @@ export function createAgentRunContext(options: {
   readonly state?: AgentRuntimeState;
   readonly nextStepInbox?: NextStepInbox;
   readonly stepSequence?: { nextStep: number };
+  readonly durability?: DurableLifecycleAuthority;
+  readonly durableScope?: string;
   readonly onTransition?: (
     transition: RuntimeTransition,
   ) => Promise<void> | void;
@@ -56,6 +61,12 @@ export function createAgentRunContext(options: {
     state: options.state ?? createAgentRuntimeState(),
     nextStepInbox,
     stepSequence: options.stepSequence ?? { nextStep: 1 },
+    ...(options.durability === undefined
+      ? {}
+      : { durability: options.durability }),
+    ...(options.durableScope === undefined
+      ? {}
+      : { durableScope: options.durableScope }),
     ...(options.onTransition === undefined
       ? {}
       : { onTransition: options.onTransition }),

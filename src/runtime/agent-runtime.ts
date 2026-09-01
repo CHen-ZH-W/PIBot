@@ -15,6 +15,11 @@ import {
   type AgentUserTurnDriverOptions,
 } from "./run-controller";
 import type { ModeSwitchRequest } from "./run-control";
+import type { DurableLifecycleAuthority } from "./durable-lifecycle";
+
+export interface AgentRuntimeOptions {
+  readonly durability?: DurableLifecycleAuthority;
+}
 
 export interface AgentRuntimeCreateRunOptions<FollowUp>
   extends AgentRunControllerOptions<FollowUp> {
@@ -45,6 +50,8 @@ export class AgentRuntime {
   private readonly runs = new Map<AgentRunId, RegisteredRun>();
   private readonly runIdByScope = new Map<string, AgentRunId>();
 
+  constructor(private readonly options: AgentRuntimeOptions = {}) {}
+
   createRun<FollowUp>(
     options: AgentRuntimeCreateRunOptions<FollowUp>,
   ): AgentRunController<FollowUp> {
@@ -56,7 +63,14 @@ export class AgentRuntime {
       throw new Error(`Agent Run ${options.runContext.runId} is already registered`);
     }
     const controller = new AgentRunController<FollowUp>({
-      runContext: options.runContext,
+      runContext: {
+        ...options.runContext,
+        durableScope: scope,
+        ...(options.runContext.durability === undefined &&
+            this.options.durability !== undefined
+          ? { durability: this.options.durability }
+          : {}),
+      },
       maxFollowUps: options.maxFollowUps,
       ...(options.maxFollowUpBytes === undefined
         ? {}

@@ -213,7 +213,12 @@ async function readDecisionIfExists(
     return deniedDecision("Invalid child approval decision file");
   }
   const approved = parsed.decision.approved;
-  const scope = parsed.decision.scope === "run" ? "run" as const : undefined;
+  const scope =
+    parsed.decision.scope === "run" ||
+      parsed.decision.scope === "session" ||
+      parsed.decision.scope === "repo"
+      ? parsed.decision.scope
+      : undefined;
   if (approved === true) {
     return { approved: true, ...(scope === undefined ? {} : { scope }) };
   }

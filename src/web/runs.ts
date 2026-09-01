@@ -72,6 +72,9 @@ export class DetachedWebRunService {
         const admission = await this.options.workflows.beginAttempt({
           runId: run.runId,
           stepId: "agent_run",
+          recoveryPolicy: completedToolCallFingerprints.length > 0
+            ? "resumable"
+            : "needs-reconciliation",
           strategy: recovery
             ? {
                 type: "resume_from_tool_checkpoint",
@@ -294,7 +297,7 @@ export class DetachedWebRunService {
     runId: string,
     event: WebAgentRunnerEvent | DetachedTerminalEvent,
   ): Promise<void> {
-    await this.checkpointCompletedTool(runId, event);
+    await this.checkpointToolLifecycle(runId, event);
     const stored = await this.options.workflows.store.appendEvent({
       runId,
       type: "web.event",
@@ -321,14 +324,13 @@ export class DetachedWebRunService {
     return (await this.readEvents(runId)).at(-1)?.seq ?? 0;
   }
 
-  private async checkpointCompletedTool(
+  private async checkpointToolLifecycle(
     runId: string,
     event: WebAgentRunnerEvent | DetachedTerminalEvent,
   ): Promise<void> {
     if (
       event.type !== "agent_event" ||
-      event.event.type !== "tool_end" ||
-      !event.event.result.ok
+      (event.event.type !== "tool_start" && event.event.type !== "tool_end")
     ) {
       return;
     }
@@ -338,21 +340,46 @@ export class DetachedWebRunService {
     if (step === undefined) {
       return;
     }
+    if (event.event.type === "tool_start") {
+      await this.options.workflows.recordStepCheckpoint({
+        runId,
+        stepId: step.stepId,
+        checkpoint: {
+          // tool_start is emitted before executor dispatch. Treat the whole
+          // window conservatively so a crash can never auto-replay a call whose
+          // side effect may already have crossed the boundary.
+          executionPhase: "dispatched",
+          inFlightTool: {
+            callId: event.event.call.id,
+            name: event.event.call.name,
+            fingerprint: event.event.call.fingerprint,
+          },
+        },
+      });
+      return;
+    }
     const completed = await this.completedToolFingerprints(runId, step.stepId);
-    const next = completed.includes(event.event.call.fingerprint)
-      ? completed
-      : [...completed, event.event.call.fingerprint];
+    const next = event.event.result.ok &&
+        !completed.includes(event.event.call.fingerprint)
+      ? [...completed, event.event.call.fingerprint]
+      : completed;
     await this.options.workflows.recordStepCheckpoint({
       runId,
       stepId: step.stepId,
       checkpoint: {
+        executionPhase: "committed",
+        inFlightTool: null,
         completedToolCallFingerprints: next,
-        lastCompletedTool: {
-          callId: event.event.call.id,
-          name: event.event.call.name,
-          fingerprint: event.event.call.fingerprint,
-          resultSummary: event.event.result.summary,
-        },
+        ...(event.event.result.ok
+          ? {
+              lastCompletedTool: {
+                callId: event.event.call.id,
+                name: event.event.call.name,
+                fingerprint: event.event.call.fingerprint,
+                resultSummary: event.event.result.summary,
+              },
+            }
+          : {}),
       },
     });
   }

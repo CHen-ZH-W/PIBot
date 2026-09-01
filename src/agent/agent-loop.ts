@@ -206,6 +206,12 @@ export class MinimalAgentLoop {
       }
 
       if (modelResult.aborted || isSignalAborted(signal)) {
+        await finishStepDurably(
+          run,
+          modelResult.stepContext,
+          "cancelled",
+          "agent_step_aborted",
+        );
         await emitStepEnd(
           input.onEvent,
           modelResult.stepContext.step,
@@ -225,6 +231,12 @@ export class MinimalAgentLoop {
       }
 
       if (modelResult.error !== undefined) {
+        await finishStepDurably(
+          run,
+          modelResult.stepContext,
+          "failed",
+          modelResult.error.message,
+        );
         await emitStepEnd(
           input.onEvent,
           modelResult.stepContext.step,
@@ -253,6 +265,12 @@ export class MinimalAgentLoop {
         );
         if (decision.type === "continue_with_steering") {
           emitTransition(run, decision);
+          await finishStepDurably(
+            run,
+            modelResult.stepContext,
+            "completed",
+            "steering_pending",
+          );
           await emitStepEnd(
             input.onEvent,
             modelResult.stepContext.step,
@@ -261,6 +279,12 @@ export class MinimalAgentLoop {
           );
           continue;
         }
+        await finishStepDurably(
+          run,
+          modelResult.stepContext,
+          "completed",
+          "model_completed",
+        );
         await emitStepEnd(
           input.onEvent,
           modelResult.stepContext.step,
@@ -283,6 +307,12 @@ export class MinimalAgentLoop {
       }
 
       if (isSignalAborted(signal)) {
+        await finishStepDurably(
+          run,
+          modelResult.stepContext,
+          "cancelled",
+          "agent_step_aborted",
+        );
         await emitStepEnd(
           input.onEvent,
           modelResult.stepContext.step,
@@ -318,6 +348,12 @@ export class MinimalAgentLoop {
           emitTransition(run, decision);
         }
       }
+      await finishStepDurably(
+        run,
+        modelResult.stepContext,
+        "completed",
+        "tool_batch_completed",
+      );
       await emitStepEnd(
         input.onEvent,
         modelResult.stepContext.step,
@@ -391,6 +427,7 @@ export class MinimalAgentLoop {
         stepContext,
         request.tools.map((tool) => tool.name),
       );
+      await run.durability?.openStep(stepContext);
       toolSession = toolScheduler.begin({
         run,
         stepContext,
@@ -811,6 +848,21 @@ async function emitStepEnd(
   assistantText: string,
 ): Promise<void> {
   await emit(handler, { type: "step_end", step, reason, assistantText });
+}
+
+async function finishStepDurably(
+  run: AgentRunContext,
+  stepContext: AgentStepContext,
+  status: "completed" | "failed" | "cancelled",
+  reason: string,
+): Promise<void> {
+  await run.durability?.finishStep({
+    runId: stepContext.runId,
+    userTurnId: stepContext.userTurnId,
+    stepId: stepContext.stepId,
+    status,
+    reason,
+  });
 }
 
 async function emit(

@@ -301,7 +301,15 @@ export function grantAllowsCapability(
   capability: ToolCapabilityKind,
   resource?: string,
 ): boolean {
-  return grant.request.requirements.some((requirement) => {
+  return capabilityRequestAllows(grant.request, capability, resource);
+}
+
+export function capabilityRequestAllows(
+  request: ToolCapabilityRequest,
+  capability: ToolCapabilityKind,
+  resource?: string,
+): boolean {
+  return request.requirements.some((requirement) => {
     if (requirement.capability !== capability) {
       return false;
     }

@@ -1,3 +1,5 @@
+import type { RecoveryDisposition } from "../core/recovery";
+
 export type WorkflowLifecycle = "connection_bound" | "detached";
 
 export type WorkflowRunStatus =
@@ -16,6 +18,7 @@ export type WorkflowStepStatus =
   | "running"
   | "succeeded"
   | "failed"
+  | "interrupted"
   | "blocked"
   | "skipped";
 
@@ -59,6 +62,8 @@ export interface WorkflowRunRecord {
   readonly startedAt?: string;
   readonly endedAt?: string;
   readonly terminalReason?: string;
+  readonly recoveryDisposition?: RecoveryDisposition;
+  readonly recoveryReason?: string;
 }
 
 export interface WorkflowStepRecord {
@@ -74,6 +79,8 @@ export interface WorkflowStepRecord {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly terminalReason?: string;
+  readonly recoveryDisposition?: RecoveryDisposition;
+  readonly recoveryReason?: string;
 }
 
 export interface WorkflowAttemptRecord {
@@ -89,6 +96,11 @@ export interface WorkflowAttemptRecord {
   readonly resultErrorFingerprint?: string;
   readonly diffFingerprint?: string;
   readonly idempotencyPrefix: string;
+  /** Declared replay/reconciliation contract, separate from lifecycle status. */
+  readonly recoveryPolicy?: RecoveryDisposition;
+  /** Decision recorded when a running attempt is found after a restart. */
+  readonly recoveryDisposition?: RecoveryDisposition;
+  readonly recoveryReason?: string;
   readonly circuitKey?: string;
   readonly execution?: {
     readonly kind: "child_agent";

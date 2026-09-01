@@ -16,6 +16,7 @@ import type { ToolApprovalContext } from "./core/tools";
 import type { AgentLoopEvent } from "./agent/events";
 import { createAgentRunContext } from "./runtime/context";
 import { AgentRuntime } from "./runtime/agent-runtime";
+import { FileDurableLifecycleAuthority } from "./runtime/durable-lifecycle";
 import { FileChildAgentApprovalPrompter } from "./runtime/child-agent-approvals";
 import {
   createAgentRuntimeState,
@@ -24,6 +25,7 @@ import {
 import {
   createCodingToolExecutor,
   createToolApprovalGate,
+  FileToolApprovalRuleStore,
   getCodingToolSchemas,
   type CodingToolExecutorOptions,
   type ToolApprovalMode,
@@ -99,7 +101,11 @@ async function main(): Promise<void> {
       agentId: env.agentId,
       state: runtimeState,
     });
-    const runtime = new AgentRuntime();
+    const durableLifecycle = new FileDurableLifecycleAuthority({
+      rootDir: path.join(env.runDir, "runtime-lifecycle"),
+    });
+    await durableLifecycle.recoverInterrupted("child_agent_restarted");
+    const runtime = new AgentRuntime({ durability: durableLifecycle });
     const control = runtime.createRun<void>({
       scope: `child:${env.childRunId}`,
       runContext,
@@ -295,6 +301,10 @@ function childToolApprovalGateOptions(env: ChildAgentEnv) {
         readPositiveIntegerEnv("CHILD_AGENT_APPROVAL_POLL_INTERVAL_MS") ?? 500,
     }),
     context: env.approvalContext,
+    persistentRules: new FileToolApprovalRuleStore({
+      rootDir: process.env.PIBOT_STORE_ROOT ?? path.join(env.workspaceRoot, ".pibot"),
+    }),
+    workspaceRoot: env.workspaceRoot,
     timeoutMs:
       readPositiveIntegerEnv("CHILD_AGENT_TOOL_APPROVAL_TIMEOUT_MS") ??
       readPositiveIntegerEnv("TOOL_APPROVAL_TIMEOUT_MS") ??

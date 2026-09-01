@@ -18,6 +18,14 @@ export const TOOL_APPROVAL_ALLOW_ACTION = "pibot_tool_approval_allow";
 export const TOOL_APPROVAL_DENY_ACTION = "pibot_tool_approval_deny";
 export const TOOL_APPROVAL_ALLOW_RUN_ACTION = "pibot_tool_approval_allow_run";
 export const TOOL_APPROVAL_DENY_RUN_ACTION = "pibot_tool_approval_deny_run";
+export const TOOL_APPROVAL_ALLOW_SESSION_ACTION =
+  "pibot_tool_approval_allow_session";
+export const TOOL_APPROVAL_DENY_SESSION_ACTION =
+  "pibot_tool_approval_deny_session";
+export const TOOL_APPROVAL_ALLOW_REPO_ACTION = "pibot_tool_approval_allow_repo";
+export const TOOL_APPROVAL_DENY_REPO_ACTION = "pibot_tool_approval_deny_repo";
+
+type ApprovalScope = "once" | "run" | "session" | "repo";
 
 interface PendingApproval {
   readonly request: ToolApprovalPromptRequest;
@@ -33,7 +41,7 @@ interface PendingApproval {
 interface ParsedApprovalAction {
   readonly approvalId: string;
   readonly approved: boolean;
-  readonly scope: "once" | "run";
+  readonly scope: ApprovalScope;
   readonly userId: SlackUserId;
 }
 
@@ -164,20 +172,24 @@ export class SlackToolApprovalBroker
     await this.finishApproval(
       action.approvalId,
       action.approved
-        ? (pending.request.runScopeAllowed === true && action.scope === "run"
-            ? { approved: true, scope: "run" }
+        ? (action.scope !== "once" &&
+            approvalScopeAllowed(pending.request, action.scope)
+            ? { approved: true, scope: action.scope }
             : { approved: true })
-        : (pending.request.runScopeAllowed === true && action.scope === "run"
+        : (action.scope !== "once" &&
+            approvalScopeAllowed(pending.request, action.scope)
             ? {
                 ...deniedDecision("Tool call was rejected in Slack"),
-                scope: "run",
+                scope: action.scope,
               }
             : deniedDecision("Tool call was rejected in Slack")),
       approvalDecisionStatus(
         pending.request.call,
         action.approved,
         action.userId,
-        pending.request.runScopeAllowed === true ? action.scope : "once",
+        approvalScopeAllowed(pending.request, action.scope)
+          ? action.scope
+          : "once",
       ),
     );
     return true;
@@ -259,6 +271,24 @@ function approvalBlocks(
           text: { type: "plain_text", text: "Allow for run" },
           value: approvalId,
         } as const] : []),
+        ...(request.sessionScopeAllowed === true ? [{
+          type: "button",
+          actionId: TOOL_APPROVAL_ALLOW_SESSION_ACTION,
+          text: { type: "plain_text", text: "Allow for session" },
+          value: approvalId,
+        } as const] : []),
+        ...(request.repoScopeAllowed === true ? [{
+          type: "button",
+          actionId: TOOL_APPROVAL_ALLOW_REPO_ACTION,
+          text: { type: "plain_text", text: "Allow for repo" },
+          value: approvalId,
+        } as const] : []),
+      ],
+    },
+    {
+      type: "actions",
+      blockId: `pibot_tool_approval_deny_${approvalId}`,
+      elements: [
         {
           type: "button",
           actionId: TOOL_APPROVAL_DENY_ACTION,
@@ -270,6 +300,18 @@ function approvalBlocks(
           type: "button",
           actionId: TOOL_APPROVAL_DENY_RUN_ACTION,
           text: { type: "plain_text", text: "Deny for run" },
+          value: approvalId,
+        } as const] : []),
+        ...(request.sessionScopeAllowed === true ? [{
+          type: "button",
+          actionId: TOOL_APPROVAL_DENY_SESSION_ACTION,
+          text: { type: "plain_text", text: "Deny for session" },
+          value: approvalId,
+        } as const] : []),
+        ...(request.repoScopeAllowed === true ? [{
+          type: "button",
+          actionId: TOOL_APPROVAL_DENY_REPO_ACTION,
+          text: { type: "plain_text", text: "Deny for repo" },
           value: approvalId,
         } as const] : []),
       ],
@@ -367,6 +409,11 @@ function formatCapabilityDetails(
     }
     return `Escalation: \`${inlineCode(requirement.capability)}(${inlineCode(requirement.resources.join(", "))})\``;
   });
+  if (request.sandbox !== undefined) {
+    details.unshift(
+      `Sandbox: \`${inlineCode(request.sandbox.backend)}\`; filesystem=\`${inlineCode(request.sandbox.filesystemEnforcement)}\`; network=\`${inlineCode(request.sandbox.networkEnforcement)}\`; policy=\`${inlineCode(request.sandbox.policyVersion)}\``,
+    );
+  }
   if (requested.effects?.destructive === true) {
     details.push("Escalation effect: `destructive`");
   }
@@ -446,7 +493,7 @@ function approvalDecisionStatus(
   call: ToolCall,
   approved: boolean,
   userId: SlackUserId,
-  scope: "once" | "run" = "once",
+  scope: ApprovalScope = "once",
 ): string {
   if (call.name === "enter_plan_mode") {
     return approved
@@ -459,7 +506,7 @@ function approvalDecisionStatus(
       : `Plan rejected by <@${userId}>.`;
   }
 
-  const suffix = scope === "run" ? " for this run" : " once";
+  const suffix = approvalScopeSuffix(scope);
   return approved
     ? `Approved${suffix} by <@${userId}>.`
     : `Rejected${suffix} by <@${userId}>.`;
@@ -514,7 +561,11 @@ function parseApprovalAction(body: UnknownRecord): ParsedApprovalAction | null {
     (actionId !== TOOL_APPROVAL_ALLOW_ACTION &&
       actionId !== TOOL_APPROVAL_DENY_ACTION &&
       actionId !== TOOL_APPROVAL_ALLOW_RUN_ACTION &&
-      actionId !== TOOL_APPROVAL_DENY_RUN_ACTION)
+      actionId !== TOOL_APPROVAL_DENY_RUN_ACTION &&
+      actionId !== TOOL_APPROVAL_ALLOW_SESSION_ACTION &&
+      actionId !== TOOL_APPROVAL_DENY_SESSION_ACTION &&
+      actionId !== TOOL_APPROVAL_ALLOW_REPO_ACTION &&
+      actionId !== TOOL_APPROVAL_DENY_REPO_ACTION)
   ) {
     return null;
   }
@@ -523,14 +574,63 @@ function parseApprovalAction(body: UnknownRecord): ParsedApprovalAction | null {
     approvalId,
     approved:
       actionId === TOOL_APPROVAL_ALLOW_ACTION ||
-      actionId === TOOL_APPROVAL_ALLOW_RUN_ACTION,
-    scope:
       actionId === TOOL_APPROVAL_ALLOW_RUN_ACTION ||
-        actionId === TOOL_APPROVAL_DENY_RUN_ACTION
-        ? "run"
-        : "once",
+      actionId === TOOL_APPROVAL_ALLOW_SESSION_ACTION ||
+      actionId === TOOL_APPROVAL_ALLOW_REPO_ACTION,
+    scope: approvalScopeForAction(actionId),
     userId: userId as SlackUserId,
   };
+}
+
+function approvalScopeAllowed(
+  request: ToolApprovalPromptRequest,
+  scope: ApprovalScope,
+): boolean {
+  if (scope === "once") {
+    return true;
+  }
+  if (scope === "run") {
+    return request.runScopeAllowed === true;
+  }
+  if (scope === "session") {
+    return request.sessionScopeAllowed === true;
+  }
+  return request.repoScopeAllowed === true;
+}
+
+function approvalScopeForAction(actionId: string): ApprovalScope {
+  if (
+    actionId === TOOL_APPROVAL_ALLOW_RUN_ACTION ||
+    actionId === TOOL_APPROVAL_DENY_RUN_ACTION
+  ) {
+    return "run";
+  }
+  if (
+    actionId === TOOL_APPROVAL_ALLOW_SESSION_ACTION ||
+    actionId === TOOL_APPROVAL_DENY_SESSION_ACTION
+  ) {
+    return "session";
+  }
+  if (
+    actionId === TOOL_APPROVAL_ALLOW_REPO_ACTION ||
+    actionId === TOOL_APPROVAL_DENY_REPO_ACTION
+  ) {
+    return "repo";
+  }
+  return "once";
+}
+
+function approvalScopeSuffix(scope: ApprovalScope): string {
+  if (scope === "run") {
+    return " for this run";
+  }
+  if (scope === "session") {
+    return " for this session";
+  }
+  if (scope === "repo") {
+    return " for this repo";
+  }
+  return " once";
 }
 
 function deniedDecision(reason: string): ToolApprovalDecision {

@@ -44,6 +44,7 @@ const {
   CodingToolRegistry,
   createCodingToolExecutor,
   createToolApprovalGate,
+  FileToolApprovalRuleStore,
   getCodingToolSchemas,
   toolApprovalRulesForRun,
 } = require("../dist/tools");
@@ -61,6 +62,7 @@ async function runAcceptance() {
   await runCase("inactive grants cannot be replayed", acceptsCapabilityGrantReplayDenial);
   await runCase("sandbox grants are bound to the approved command", acceptsCapabilityGrantCommandBinding);
   await runCase("run-scoped approval rules match exact capabilities", acceptsRunScopedApprovalRules);
+  await runCase("session and repo approval rules persist with exact identity", acceptsPersistentApprovalRules);
   await runCase("bash path scopes participate in approval rules", acceptsBashPathScopedApprovalRules);
   await runCase("direct file tools consume the executor sandbox policy", acceptsDirectFileToolSandboxPolicy);
   await runCase("tool execution rejects a stale Step authority snapshot", acceptsStaleStepAuthoritySnapshot);
@@ -154,7 +156,7 @@ async function acceptsWorldStateProjection() {
   assert.match(first.messages[1].content, /"branch": "context-test"/u);
   assert.match(first.messages[1].content, /"dirty": true/u);
   assert.match(first.messages[1].content, /linux-native\(test\)/u);
-  assert.match(first.messages[1].content, /sandbox-policy-v1/u);
+  assert.match(first.messages[1].content, new RegExp(defaultSandboxPolicy.version, "u"));
   assert.match(first.messages[1].content, /"filesystem": "path-scoped"/u);
   assert.match(first.messages[1].content, /"network": "per-call"/u);
   assert.match(first.messages[1].content, /"pending": 2/u);
@@ -572,6 +574,131 @@ async function acceptsRunScopedApprovalRules() {
   assert.match(deniedAgain.error.message, /run-scoped approval rule/u);
 }
 
+async function acceptsPersistentApprovalRules() {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pibot-runtime-persistent-rule-"));
+  const storeRoot = await mkdtemp(join(tmpdir(), "pibot-runtime-rule-store-"));
+  const actor = "U-persistent-rule";
+  const context = (channelId, requestedByUserId = actor) => ({
+    conversation: { teamId: "T-persistent-rule", channelId },
+    requestedByUserId,
+  });
+  const executeWrite = (gate, id, content) => createCodingToolExecutor({
+    workspaceRoot,
+    approvalGate: gate,
+  }).executeTool({
+    id,
+    name: "write",
+    input: { path: "same.txt", content, overwrite: true },
+  });
+
+  let sessionPrompts = 0;
+  const firstStore = new FileToolApprovalRuleStore({ rootDir: storeRoot });
+  const firstGate = createToolApprovalGate("approval-required", {
+    context: context("session-a"),
+    workspaceRoot,
+    persistentRules: firstStore,
+    prompter: {
+      async requestToolApproval(request) {
+        sessionPrompts += 1;
+        assert.equal(request.sessionScopeAllowed, true);
+        assert.equal(request.repoScopeAllowed, true);
+        return { approved: true, scope: "session" };
+      },
+    },
+  });
+  assert.equal((await executeWrite(firstGate, "persistent-session-first", "one")).ok, true);
+
+  const restartedStore = new FileToolApprovalRuleStore({ rootDir: storeRoot });
+  const restartedSessionGate = createToolApprovalGate("approval-required", {
+    context: context("session-a"),
+    workspaceRoot,
+    persistentRules: restartedStore,
+    prompter: {
+      async requestToolApproval() {
+        throw new Error("same session should reuse the persisted rule");
+      },
+    },
+  });
+  assert.equal(
+    (await executeWrite(restartedSessionGate, "persistent-session-restart", "two")).ok,
+    true,
+  );
+  assert.equal(sessionPrompts, 1);
+
+  let repoPrompts = 0;
+  const repoGate = createToolApprovalGate("approval-required", {
+    context: context("session-b"),
+    workspaceRoot,
+    persistentRules: restartedStore,
+    prompter: {
+      async requestToolApproval() {
+        repoPrompts += 1;
+        return { approved: true, scope: "repo" };
+      },
+    },
+  });
+  assert.equal((await executeWrite(repoGate, "persistent-repo-first", "three")).ok, true);
+  assert.equal(repoPrompts, 1);
+
+  const thirdSessionGate = createToolApprovalGate("approval-required", {
+    context: context("session-c"),
+    workspaceRoot,
+    persistentRules: new FileToolApprovalRuleStore({ rootDir: storeRoot }),
+    prompter: {
+      async requestToolApproval() {
+        throw new Error("same actor and repo should reuse the repo rule");
+      },
+    },
+  });
+  assert.equal((await executeWrite(thirdSessionGate, "persistent-repo-reuse", "four")).ok, true);
+
+  let otherActorPrompts = 0;
+  const otherActorGate = createToolApprovalGate("approval-required", {
+    context: context("session-c", "U-other-actor"),
+    workspaceRoot,
+    persistentRules: restartedStore,
+    prompter: {
+      async requestToolApproval() {
+        otherActorPrompts += 1;
+        return { approved: false, scope: "repo", reason: "actor-specific deny" };
+      },
+    },
+  });
+  assert.equal(
+    (await executeWrite(otherActorGate, "persistent-other-actor", "blocked")).ok,
+    false,
+  );
+  assert.equal(otherActorPrompts, 1);
+  const persistedDenyGate = createToolApprovalGate("approval-required", {
+    context: context("session-d", "U-other-actor"),
+    workspaceRoot,
+    persistentRules: new FileToolApprovalRuleStore({ rootDir: storeRoot }),
+    prompter: {
+      async requestToolApproval() {
+        throw new Error("repo deny should be reused without another prompt");
+      },
+    },
+  });
+  const persistedDeny = await executeWrite(
+    persistedDenyGate,
+    "persistent-other-actor-denied-again",
+    "blocked-again",
+  );
+  assert.equal(persistedDeny.ok, false);
+  assert.match(persistedDeny.error.message, /repo-scoped approval rule/u);
+
+  const activeRules = await restartedStore.list();
+  const repoAllow = activeRules.find((rule) =>
+    rule.scope === "repo" && rule.effect === "allow"
+  );
+  assert.ok(repoAllow);
+  assert.equal(await restartedStore.revoke(repoAllow.id, actor), true);
+  assert.equal(
+    (await restartedStore.list()).some((rule) => rule.id === repoAllow.id),
+    false,
+  );
+}
+
 async function acceptsBashPathScopedApprovalRules() {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "pibot-runtime-bash-path-rule-"));
   await writeFile(join(workspaceRoot, "a.txt"), "a", "utf8");
@@ -599,7 +726,8 @@ async function acceptsBashPathScopedApprovalRules() {
         network: "per-call",
       },
       assertWorkspaceAccess() {},
-      async execute() {
+      async execute(request) {
+        assert.equal(request.authorization.policyVersion, defaultSandboxPolicy.version);
         return {
           exitCode: 0,
           stdout: "",
@@ -639,6 +767,15 @@ async function acceptsBashPathScopedApprovalRules() {
     { capability: "process.exec", commands: ["true"] },
     { capability: "filesystem.read", paths: ["b.txt"] },
   ]);
+  assert.deepEqual(prompts[0].sandbox, {
+    policyVersion: defaultSandboxPolicy.version,
+    backend: "linux-native",
+    filesystemEnforcement: "path-scoped",
+    networkEnforcement: "per-call",
+    readPaths: ["a.txt"],
+    writePaths: [],
+    networkEnabled: false,
+  });
 }
 
 async function acceptsDirectFileToolSandboxPolicy() {
@@ -686,11 +823,56 @@ async function acceptsDirectFileToolSandboxPolicy() {
   assert.equal(ordinary.ok, true);
   assert.equal(protectedResult.ok, false);
   assert.match(protectedResult.error.message, /Path is protected/u);
+
+  let protectedWritePrompts = 0;
+  const protectedWriteExecutor = createCodingToolExecutor({
+    workspaceRoot,
+    sandboxExecutor: {
+      policy: customPolicy,
+      enforcement: {
+        backend: "linux-native",
+        filesystem: "path-scoped",
+        network: "per-call",
+      },
+      assertWorkspaceAccess() {},
+      async execute() {
+        throw new Error("sandbox execution is not expected");
+      },
+    },
+    approvalGate: createToolApprovalGate("approval-required", {
+      context: {
+        conversation: { teamId: "T-custom-policy", channelId: "D-custom-policy" },
+        requestedByUserId: "U-custom-policy",
+      },
+      prompter: {
+        async requestToolApproval() {
+          protectedWritePrompts += 1;
+          return { approved: true };
+        },
+      },
+    }),
+  });
+  const protectedWrite = await protectedWriteExecutor.executeTool({
+    id: "custom-policy-protected-write",
+    name: "write",
+    input: {
+      path: "custom-secret.txt",
+      content: "changed",
+      overwrite: true,
+    },
+  });
+  assert.equal(protectedWrite.ok, false);
+  assert.match(protectedWrite.error.message, /Path is protected/u);
+  assert.equal(protectedWritePrompts, 0);
 }
 
 async function acceptsApprovalModeTightening() {
   const state = createAgentRuntimeState();
   const registry = new CodingToolRegistry();
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pibot-runtime-approval-race-"));
+  const persistentRules = new FileToolApprovalRuleStore({
+    rootDir: await mkdtemp(join(tmpdir(), "pibot-runtime-approval-race-store-")),
+  });
   let executed = false;
   registry.registerTool({
     name: "approval-race-write",
@@ -708,16 +890,24 @@ async function acceptsApprovalModeTightening() {
     },
   });
   const executor = createCodingToolExecutor({
-    workspaceRoot: await mkdtemp(join(tmpdir(), "pibot-runtime-approval-race-")),
+    workspaceRoot,
     registry,
     runtime: state,
-    approvalGate: {
-      async reviewToolCall() {
-        enterPlanMode(state);
-        exitPlanMode(state, "Mode changed while approval was pending");
-        return { approved: true };
+    approvalGate: createToolApprovalGate("approval-required", {
+      context: {
+        conversation: { teamId: "T-race", channelId: "D-race" },
+        requestedByUserId: "U-race",
       },
-    },
+      workspaceRoot,
+      persistentRules,
+      prompter: {
+        async requestToolApproval() {
+          enterPlanMode(state);
+          exitPlanMode(state, "Mode changed while approval was pending");
+          return { approved: true, scope: "session" };
+        },
+      },
+    }),
   });
   const result = await executor.executeTool({
     id: "approval-race",
@@ -729,6 +919,7 @@ async function acceptsApprovalModeTightening() {
   assert.match(result.error.message, /approval became stale.*AgentMode=plan/u);
   assert.equal(state.mode, "execute");
   assert.equal(executed, false);
+  assert.deepEqual(await persistentRules.list(), []);
 }
 
 async function acceptsStaleStepAuthoritySnapshot() {

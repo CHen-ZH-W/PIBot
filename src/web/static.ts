@@ -3395,8 +3395,14 @@ function renderLiveApproval(approval) {
   var runActions = approval.runScopeAllowed
     ? '<button data-action="approve-web-approval" data-approval-scope="run" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Allow for run</button><button data-action="reject-web-approval" data-approval-scope="run" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Deny for run</button>'
     : '';
+  var sessionActions = approval.sessionScopeAllowed
+    ? '<button data-action="approve-web-approval" data-approval-scope="session" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Allow for session</button><button data-action="reject-web-approval" data-approval-scope="session" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Deny for session</button>'
+    : '';
+  var repoActions = approval.repoScopeAllowed
+    ? '<button data-action="approve-web-approval" data-approval-scope="repo" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Allow for repo</button><button data-action="reject-web-approval" data-approval-scope="repo" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Deny for repo</button>'
+    : '';
   var actions = pending
-    ? '<div class="toolbar"><button class="primary" data-action="approve-web-approval" data-approval-scope="once" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Allow once</button>' + runActions + '<button class="danger" data-action="reject-web-approval" data-approval-scope="once" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Reject once</button></div>'
+    ? '<div class="toolbar"><button class="primary" data-action="approve-web-approval" data-approval-scope="once" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Allow once</button>' + runActions + sessionActions + repoActions + '<button class="danger" data-action="reject-web-approval" data-approval-scope="once" data-approval-id="' + escapeHtml(approval.id) + '"' + disabledAttr(!!label) + '>Reject once</button></div>'
     : '<div class="approval-summary">' + escapeHtml(approval.resolvedMessage || approval.status) + '</div>';
   return '<div class="approval-request' + (pending ? '' : ' resolved') + '">' +
     '<div class="approval-head"><span class="approval-title">' + escapeHtml(approval.title || "Approval required") + '</span>' + status + '</div>' +
